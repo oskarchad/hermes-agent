@@ -10936,18 +10936,23 @@ def _notification_poller_loop(
                         )
                     except Exception as exc:
                         _kb_exc = exc
+                    if _kb_exc is not None:
+                        _settle_kanban_notification_claims(
+                            _kanban_claims, accepted=False
+                        )
+                        session["running"] = False
+                    elif not _kanban_texts:
+                        _settle_kanban_notification_claims(
+                            _kanban_claims, accepted=True
+                        )
+                        session["running"] = False
             if _reserved:
                 if _kb_exc is not None:
-                    _settle_kanban_notification_claims(
-                        _kanban_claims, accepted=False
-                    )
                     print(
                         f"[tui_gateway] kanban notification poll failed: "
                         f"{type(_kb_exc).__name__}: {_kb_exc}",
                         file=sys.stderr,
                     )
-                    with session["history_lock"]:
-                        session["running"] = False
                 else:
                     if _kanban_texts:
                         for _kb_text in _kanban_texts:
@@ -10975,16 +10980,11 @@ def _notification_poller_loop(
                             )
                             with session["history_lock"]:
                                 session["running"] = False
+                            _drain_queued_prompt(rid, sid, session)
                         else:
                             _settle_kanban_notification_claims(
                                 _kanban_claims, accepted=True
                             )
-                    else:
-                        _settle_kanban_notification_claims(
-                            _kanban_claims, accepted=True
-                        )
-                        with session["history_lock"]:
-                            session["running"] = False
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:

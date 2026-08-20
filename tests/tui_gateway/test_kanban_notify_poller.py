@@ -11,8 +11,11 @@ These tests cover the delivery half that now lives in tui_gateway/server.py:
 unsubscribe) and ``_format_kanban_event_text``.
 """
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
@@ -501,3 +504,137 @@ class TestNotificationPollerLoopKanbanWiring:
             submit=fail_once,
         )
         assert len(attempts) == 2
+
+    @pytest.mark.parametrize("outcome", ["empty", "error", "rejection"])
+    def test_no_turn_reservation_cannot_strand_waiting_user_prompt(
+        self, monkeypatch, outcome
+    ):
+        import tui_gateway.server as server
+        from tools.process_registry import process_registry
+
+        class _WaiterFirstLock:
+            """Lock whose queued waiter wins over a same-thread reacquire."""
+
+            def __init__(self):
+                self._condition = threading.Condition()
+                self._locked = False
+                self._waiters = 0
+                self.waiter_blocked = threading.Event()
+
+            def __enter__(self):
+                with self._condition:
+                    was_waiter = self._locked
+                    if was_waiter:
+                        self._waiters += 1
+                        self.waiter_blocked.set()
+                        while self._locked:
+                            self._condition.wait()
+                    else:
+                        while self._locked or self._waiters:
+                            self._condition.wait()
+                    if was_waiter:
+                        self._waiters -= 1
+                    self._locked = True
+                return self
+
+            def __exit__(self, *_args):
+                with self._condition:
+                    self._locked = False
+                    self._condition.notify_all()
+
+        class _StopAfterOnePoll(threading.Event):
+            def __init__(self):
+                super().__init__()
+                self._checks = 0
+
+            def is_set(self):
+                self._checks += 1
+                return self._checks > 1
+
+        class _EmptyCompletionQueue:
+            def get(self, timeout=None):
+                raise RuntimeError("empty")
+
+            def empty(self):
+                return True
+
+        history_lock = _WaiterFirstLock()
+        session = {
+            "agent": SimpleNamespace(),
+            "session_key": SESSION_KEY,
+            "history": [],
+            "history_lock": history_lock,
+            "history_version": 0,
+            "running": False,
+            "transport": None,
+            "attached_images": [],
+        }
+        collection_started = threading.Event()
+        release_collection = threading.Event()
+        prompt_returned = threading.Event()
+        user_prompt_started = threading.Event()
+        prompt_response: dict = {}
+
+        def collect(_session, *, claim_records):
+            collection_started.set()
+            assert release_collection.wait(2.0), "test did not release collection"
+            if outcome == "error":
+                raise RuntimeError("collection failed")
+            return ["kanban event"] if outcome == "rejection" else []
+
+        def run_prompt(_rid, _sid, _session, text, **_kwargs):
+            if text == "kanban event":
+                assert prompt_returned.wait(2.0), "user prompt never observed reservation"
+                raise RuntimeError("synthetic turn rejected")
+            user_prompt_started.set()
+            return True
+
+        monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
+        monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
+        monkeypatch.setattr(server, "_collect_kanban_notifications", collect)
+        monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_args: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda *_args: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+        monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
+        monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
+
+        def submit_user_prompt():
+            prompt_response.update(
+                server._methods["prompt.submit"](
+                    "user-rid",
+                    {"session_id": "sid-poller-test", "text": "user prompt"},
+                )
+            )
+            prompt_returned.set()
+
+        server._sessions["sid-poller-test"] = session
+        poller = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(_StopAfterOnePoll(), "sid-poller-test", session),
+            daemon=True,
+        )
+        prompt = threading.Thread(target=submit_user_prompt, daemon=True)
+        try:
+            poller.start()
+            assert collection_started.wait(2.0), "poller did not start collection"
+            prompt.start()
+            assert history_lock.waiter_blocked.wait(2.0), (
+                "prompt.submit did not wait on history_lock"
+            )
+            release_collection.set()
+            assert prompt_returned.wait(2.0), "prompt.submit did not return"
+            assert user_prompt_started.wait(2.0), (
+                "waiting user prompt was neither started normally nor drained"
+            )
+        finally:
+            release_collection.set()
+            prompt.join(timeout=2.0)
+            poller.join(timeout=2.0)
+            server._sessions.pop("sid-poller-test", None)
+
+        assert "error" not in prompt_response
+        assert session.get("queued_prompt") is None
