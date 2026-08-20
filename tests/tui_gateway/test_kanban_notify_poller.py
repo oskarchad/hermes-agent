@@ -267,8 +267,8 @@ class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.
 
     Covers the wiring above ``_collect_kanban_notifications``: status.update
-    emission, agent-turn dispatch when the session is idle, and the
-    busy-session pending buffer that flushes once the session goes idle.
+    emission, agent-turn dispatch when the session is idle, durable deferral
+    while it is busy, and cursor rewind when dispatch rejects a claimed turn.
     """
 
     def _start_poller(self, session: dict, monkeypatch):
@@ -315,6 +315,37 @@ class TestNotificationPollerLoopKanbanWiring:
             "running": running,
         }
 
+    @staticmethod
+    def _run_poller_once(session: dict, monkeypatch, *, emits: list, submit) -> None:
+        import threading
+
+        import tui_gateway.server as server
+        from tools.process_registry import process_registry
+
+        class _StopAfterOnePoll(threading.Event):
+            def __init__(self):
+                super().__init__()
+                self._checks = 0
+
+            def is_set(self):
+                self._checks += 1
+                return self._checks > 1
+
+        class _EmptyCompletionQueue:
+            def get(self, timeout=None):
+                raise RuntimeError("empty")
+
+            def empty(self):
+                return True
+
+        monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
+        monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
+        monkeypatch.setattr(
+            server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
+        )
+        monkeypatch.setattr(server, "_run_prompt_submit", submit)
+        server._notification_poller_loop(_StopAfterOnePoll(), "sid-poller-test", session)
+
     def test_idle_session_gets_status_update_and_agent_turn(self, monkeypatch):
         tid = _create_subscribed_task()
         _complete(tid, summary="poller e2e done")
@@ -334,29 +365,139 @@ class TestNotificationPollerLoopKanbanWiring:
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
-    def test_busy_session_buffers_then_flushes_when_idle(self, monkeypatch):
+    def test_busy_session_waits_then_dispatches_when_idle(self, monkeypatch):
+        import threading
+
+        import tui_gateway.server as server
+
         tid = _create_subscribed_task()
-        _complete(tid, summary="buffered while busy")
+        initial_cursor = _sub_rows(tid)[0]["last_event_id"]
+        _complete(tid, summary="waited while busy")
         session = self._poller_session(running=True)
+        busy_poll_seen = threading.Event()
+        monkeypatch.setattr(
+            server,
+            "_maybe_fire_tui_loop_tick",
+            lambda *_args: busy_poll_seen.set(),
+        )
 
         stop, thread, emits, submits = self._start_poller(session, monkeypatch)
         try:
-            # Busy: the status line appears and the event is buffered, but no
-            # agent turn is dispatched while another turn is running.
-            assert self._wait_for(
-                lambda: any(e == "status.update" for e, _ in emits)
-                and session.get("_kanban_pending")
-            )
-            assert not submits
+            assert busy_poll_seen.wait(2.0), "poller never observed the busy session"
+            assert _sub_rows(tid)[0]["last_event_id"] == initial_cursor
+            assert submits == []
+            assert emits == []
+            assert not session.get("_kanban_pending")
 
             with session["history_lock"]:
                 session["running"] = False
 
-            assert self._wait_for(lambda: submits), "pending batch never flushed"
+            assert self._wait_for(lambda: submits), "durable event was never dispatched"
         finally:
             stop.set()
             thread.join(timeout=5)
 
         assert any(tid in text for text in submits), submits
-        assert session["_kanban_pending"] == []
+        assert _sub_rows(tid)[0]["last_event_id"] > initial_cursor
+        assert not session.get("_kanban_pending")
         assert session["running"] is True
+
+    def test_busy_event_survives_poller_restart_and_delivers_once_when_idle(
+        self, monkeypatch
+    ):
+        tid = _create_subscribed_task()
+        initial_cursor = _sub_rows(tid)[0]["last_event_id"]
+        _complete(tid, summary="survives restart")
+        emits: list = []
+        submits: list[str] = []
+
+        busy_session = self._poller_session(running=True)
+        self._run_poller_once(
+            busy_session,
+            monkeypatch,
+            emits=emits,
+            submit=lambda _rid, _sid, _session, text: submits.append(text),
+        )
+
+        assert _sub_rows(tid)[0]["last_event_id"] == initial_cursor
+        assert submits == []
+        assert emits == []
+        assert not busy_session.get("_kanban_pending")
+
+        # A fresh session dict simulates the process-local poller buffer being
+        # discarded by stop/restart. The durable cursor must still expose the
+        # event to the same origin session and only that session.
+        restarted_session = self._poller_session(running=False)
+        self._run_poller_once(
+            restarted_session,
+            monkeypatch,
+            emits=emits,
+            submit=lambda _rid, _sid, _session, text: submits.append(text),
+        )
+
+        assert len(submits) == 1
+        assert tid in submits[0]
+        assert _sub_rows(tid)[0]["last_event_id"] > initial_cursor
+        status_updates = [payload for event, payload in emits if event == "status.update"]
+        assert len(status_updates) == 1
+
+        with restarted_session["history_lock"]:
+            restarted_session["running"] = False
+        self._run_poller_once(
+            restarted_session,
+            monkeypatch,
+            emits=emits,
+            submit=lambda _rid, _sid, _session, text: submits.append(text),
+        )
+        assert len(submits) == 1
+
+    def test_dispatch_failure_rewinds_cursor_for_one_retry(self, monkeypatch):
+        tid = _create_subscribed_task()
+        initial_cursor = _sub_rows(tid)[0]["last_event_id"]
+        _complete(tid, summary="retry after dispatch failure")
+        conn = kb.connect()
+        try:
+            assert kb.archive_task(conn, tid)
+        finally:
+            conn.close()
+        session = self._poller_session(running=False)
+        emits: list = []
+        attempts: list[str] = []
+
+        def fail_once(_rid, _sid, _session, text):
+            attempts.append(text)
+            if len(attempts) == 1:
+                raise RuntimeError("synthetic turn rejected")
+
+        self._run_poller_once(
+            session,
+            monkeypatch,
+            emits=emits,
+            submit=fail_once,
+        )
+
+        assert len(attempts) == 1
+        assert _sub_rows(tid)[0]["last_event_id"] == initial_cursor
+        assert session["running"] is False
+
+        self._run_poller_once(
+            session,
+            monkeypatch,
+            emits=emits,
+            submit=fail_once,
+        )
+
+        assert len(attempts) == 2
+        assert attempts[0] == attempts[1]
+        assert tid in attempts[1]
+        assert _sub_rows(tid) == [], "archive unsubscribe waits for accepted delivery"
+
+        with session["history_lock"]:
+            session["running"] = False
+        self._run_poller_once(
+            session,
+            monkeypatch,
+            emits=emits,
+            submit=fail_once,
+        )
+        assert len(attempts) == 2

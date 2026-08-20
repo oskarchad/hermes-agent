@@ -10697,7 +10697,9 @@ def _format_kanban_event_text(
     return None
 
 
-def _collect_kanban_notifications(session: dict) -> list:
+def _collect_kanban_notifications(
+    session: dict, *, claim_records: Optional[list[dict]] = None
+) -> list:
     """Claim unseen terminal kanban events for this TUI session's subscriptions.
 
     ``kanban_create`` auto-subscribes TUI/desktop sessions with
@@ -10709,7 +10711,10 @@ def _collect_kanban_notifications(session: dict) -> list:
     notifier, so a subscription is delivered exactly once even if a gateway
     and a TUI poll the same board DB.
 
-    Returns the list of formatted notification texts (may be empty).
+    Returns the list of formatted notification texts (may be empty). When
+    ``claim_records`` is provided, each durable claim is appended there so
+    the caller can either rewind it on rejection or finalize archive cleanup
+    after the synthetic turn has been accepted.
     """
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
@@ -10771,7 +10776,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
+                old_cursor, claimed_cursor, events = _kb.claim_unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -10781,8 +10786,22 @@ def _collect_kanban_notifications(session: dict) -> list:
                 )
                 if not events:
                     continue
+                claim_record = None
+                if claim_records is not None:
+                    claim_record = {
+                        "board": slug,
+                        "sub": sub,
+                        "old_cursor": old_cursor,
+                        "claimed_cursor": claimed_cursor,
+                        "unsubscribe": False,
+                    }
+                    claim_records.append(claim_record)
                 task = _kb.get_task(conn, sub["task_id"])
                 latest_run = _kb.latest_run(conn, sub["task_id"])
+                if claim_record is not None:
+                    claim_record["unsubscribe"] = bool(
+                        task and getattr(task, "status", "") == "archived"
+                    )
                 for ev in events:
                     text = _format_kanban_event_text(
                         sub, task, ev, slug, latest_run,
@@ -10793,7 +10812,11 @@ def _collect_kanban_notifications(session: dict) -> list:
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop
                 # session. The claimed cursor prevents historical replay.
-                if task and getattr(task, "status", "") == "archived":
+                if (
+                    claim_records is None
+                    and task
+                    and getattr(task, "status", "") == "archived"
+                ):
                     try:
                         _kb.remove_notify_sub(
                             conn,
@@ -10807,6 +10830,49 @@ def _collect_kanban_notifications(session: dict) -> list:
         finally:
             conn.close()
     return texts
+
+
+def _settle_kanban_notification_claims(
+    claim_records: list[dict], *, accepted: bool
+) -> None:
+    """Rewind rejected claims or finalize archive cleanup after acceptance."""
+    from hermes_cli import kanban_db as _kb
+
+    for record in claim_records:
+        if accepted and not record["unsubscribe"]:
+            continue
+        sub = record["sub"]
+        conn = None
+        try:
+            conn = _kb.connect(board=record["board"])
+            if accepted:
+                _kb.remove_notify_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                )
+            else:
+                _kb.rewind_notify_cursor(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    claimed_cursor=record["claimed_cursor"],
+                    old_cursor=record["old_cursor"],
+                )
+        except Exception as exc:
+            action = "archive cleanup" if accepted else "rewind"
+            print(
+                f"[tui_gateway] kanban notification {action} failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def _notification_poller_loop(
@@ -10826,6 +10892,8 @@ def _notification_poller_loop(
     session's TUI kanban subscriptions and delivers terminal task events the
     same way (status.update + agent turn) — the delivery path
     tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
+    The poller reserves an idle turn before claiming the durable cursor; a
+    rejected dispatch rewinds that claim, so RAM is never the sole copy.
     """
     from tools.process_registry import process_registry, format_process_notification
 
@@ -10850,39 +10918,70 @@ def _notification_poller_loop(
                 )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
-            try:
-                _kanban_texts = _collect_kanban_notifications(session)
-            except Exception as _kb_exc:
-                print(
-                    f"[tui_gateway] kanban notification poll failed: "
-                    f"{type(_kb_exc).__name__}: {_kb_exc}",
-                    file=sys.stderr,
-                )
-                _kanban_texts = []
-            if _kanban_texts:
-                for _kb_text in _kanban_texts:
-                    _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
-            _pending = session.get("_kanban_pending") or []
-            if _pending:
-                _batch: list = []
-                with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
-                        _batch = list(_pending)
-                        session["_kanban_pending"] = []
-                if _batch:
-                    rid = f"__notif__{int(time.time() * 1000)}"
+            _reserved = False
+            _kanban_claims: list[dict] = []
+            _kanban_texts: list[str] = []
+            _kb_exc = None
+            with session["history_lock"]:
+                if not session.get("running"):
+                    # Hold the lock through the DB claim. A concurrent user
+                    # submit waits here instead of observing a transient busy
+                    # state on empty polls; when events exist, running=True is
+                    # already reserved before their cursor advances.
+                    session["running"] = True
+                    _reserved = True
                     try:
-                        _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _kanban_texts = _collect_kanban_notifications(
+                            session, claim_records=_kanban_claims
+                        )
                     except Exception as exc:
-                        print(
-                            f"[tui_gateway] kanban notification dispatch failed: "
-                            f"{type(exc).__name__}: {exc}",
-                            file=sys.stderr,
+                        _kb_exc = exc
+            if _reserved:
+                if _kb_exc is not None:
+                    _settle_kanban_notification_claims(
+                        _kanban_claims, accepted=False
+                    )
+                    print(
+                        f"[tui_gateway] kanban notification poll failed: "
+                        f"{type(_kb_exc).__name__}: {_kb_exc}",
+                        file=sys.stderr,
+                    )
+                    with session["history_lock"]:
+                        session["running"] = False
+                else:
+                    if _kanban_texts:
+                        for _kb_text in _kanban_texts:
+                            _emit(
+                                "status.update",
+                                sid,
+                                {"kind": "process", "text": _kb_text},
+                            )
+                        rid = f"__notif__{int(time.time() * 1000)}"
+                        try:
+                            _emit("message.start", sid)
+                            accepted = _run_prompt_submit(
+                                rid, sid, session, "\n".join(_kanban_texts)
+                            )
+                            if accepted is False:
+                                raise RuntimeError("synthetic turn was not accepted")
+                        except Exception as exc:
+                            _settle_kanban_notification_claims(
+                                _kanban_claims, accepted=False
+                            )
+                            print(
+                                f"[tui_gateway] kanban notification dispatch failed: "
+                                f"{type(exc).__name__}: {exc}",
+                                file=sys.stderr,
+                            )
+                            with session["history_lock"]:
+                                session["running"] = False
+                        else:
+                            _settle_kanban_notification_claims(
+                                _kanban_claims, accepted=True
+                            )
+                    else:
+                        _settle_kanban_notification_claims(
+                            _kanban_claims, accepted=True
                         )
                         with session["history_lock"]:
                             session["running"] = False
