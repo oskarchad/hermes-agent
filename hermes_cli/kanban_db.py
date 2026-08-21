@@ -1658,6 +1658,40 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Captain reporting registry (durable, profile-scoped). One explicit owner
+-- profile per task, plus an OPTIONAL exact TUI/Desktop origin session key.
+-- A row is inserted AFTER create (see register_captain_owner) so the task's
+-- own ``created`` event never materializes a reportable inbox row. Unlike
+-- kanban_notify_subs, this carries no platform/chat/human destination — it is
+-- the internal ledger the TUI/Desktop poller drains for its profile.
+CREATE TABLE IF NOT EXISTS kanban_captain_registry (
+    task_id            TEXT PRIMARY KEY,
+    profile            TEXT NOT NULL,
+    origin_session_key TEXT,
+    created_at         INTEGER NOT NULL
+);
+
+-- Captain reporting inbox: the durable event/profile ledger of reportable
+-- terminal task events. Materialized transactionally from _append_event for
+-- registered tasks. State machine per row: ``pending`` -> ``leased`` ->
+-- ``acked``. A lease carries an opaque token/owner/expiry so exactly one
+-- same-profile TUI/Desktop session reports each event; a failed delivery
+-- releases the lease back to ``pending`` and an expired lease is reclaimable
+-- after a process restart. Unique identity is (event_id, profile).
+CREATE TABLE IF NOT EXISTS kanban_captain_inbox (
+    event_id      INTEGER NOT NULL,
+    profile       TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    state         TEXT NOT NULL DEFAULT 'pending',
+    lease_token   TEXT,
+    lease_owner   TEXT,
+    lease_expires INTEGER,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (event_id, profile)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1668,7 +1702,23 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_captain_inbox_profile ON kanban_captain_inbox(profile, state);
+CREATE INDEX IF NOT EXISTS idx_captain_registry_prof ON kanban_captain_registry(profile);
 """
+
+
+# Terminal task-event kinds that produce a Captain report. Kept in sync with
+# what :func:`tui_gateway.server._format_kanban_event_text` renders — silent
+# kinds (``archived``, ``unblocked``) and ``created`` never materialize an
+# inbox row so the unreported backlog stays meaningful.
+CAPTAIN_REPORT_KINDS: frozenset[str] = frozenset({
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+})
+
+# Max per-profile rows in the ``board_stats`` Captain diagnostics breakdown.
+# Beyond this the count is truncated (reported as ``profiles_truncated``) so
+# the diagnostic stays bounded on installs with many profiles.
+CAPTAIN_STATS_PROFILE_CAP = 20
 
 
 # ---------------------------------------------------------------------------
@@ -4613,21 +4663,40 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
+
+    Returns the new ``task_events.id``. For a reportable terminal kind on a
+    task registered in the Captain ledger (see :func:`register_captain_owner`),
+    a matching ``pending`` :data:`kanban_captain_inbox` row is materialized in
+    the SAME transaction, so the report is durable the instant the event is.
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    event_id = int(cur.lastrowid)
+    if kind in CAPTAIN_REPORT_KINDS:
+        reg = conn.execute(
+            "SELECT profile FROM kanban_captain_registry WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if reg is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO kanban_captain_inbox "
+                "(event_id, profile, task_id, kind, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                (event_id, reg["profile"], task_id, kind, now, now),
+            )
+    return event_id
 
 
 def _end_run(
@@ -8302,6 +8371,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
+    # Purge the Captain ledger only when nothing is left to report; a still
+    # pending completion must survive archive until the poller accepts it
+    # (the poller runs the same gc after ack).
+    captain_gc_task_if_settled(conn, task_id)
     return True
 
 
@@ -8327,6 +8400,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_captain_inbox WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_captain_registry WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -8382,6 +8457,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_captain_inbox WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_captain_registry WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -13095,10 +13172,50 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    # Captain reporting backlog: terminal events that materialized a report
+    # but have not yet been acked by any TUI/Desktop session. A growing count
+    # or an old oldest-age means reports are stranded (no live session for the
+    # owning profile). Bounded to a count + oldest age; never leaks payloads.
+    cap_row = conn.execute(
+        "SELECT COUNT(*) AS n, MIN(created_at) AS oldest "
+        "FROM kanban_captain_inbox WHERE state != 'acked'"
+    ).fetchone()
+    cap_count = int(cap_row["n"]) if cap_row and cap_row["n"] is not None else 0
+    cap_oldest = (
+        (now - int(cap_row["oldest"]))
+        if cap_row and cap_row["oldest"] is not None else None
+    )
+
+    # Bounded per-profile breakdown so an operator can see WHICH profile's
+    # reports are stranded, not just a global total. Ordered by backlog size
+    # then age; capped at CAPTAIN_STATS_PROFILE_CAP rows with an explicit
+    # truncated-profile count. Ownership only — never task/event payloads.
+    per_profile: list[dict] = []
+    for row in conn.execute(
+        "SELECT profile, COUNT(*) AS n, MIN(created_at) AS oldest "
+        "FROM kanban_captain_inbox WHERE state != 'acked' "
+        "GROUP BY profile ORDER BY n DESC, oldest ASC, profile ASC"
+    ):
+        per_profile.append({
+            "profile": row["profile"],
+            "count": int(row["n"]),
+            "oldest_age_seconds": (
+                now - int(row["oldest"]) if row["oldest"] is not None else None
+            ),
+        })
+    profiles_truncated = max(0, len(per_profile) - CAPTAIN_STATS_PROFILE_CAP)
+    by_profile = per_profile[:CAPTAIN_STATS_PROFILE_CAP]
+
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "captain_unreported": {
+            "count": cap_count,
+            "oldest_age_seconds": cap_oldest,
+            "by_profile": by_profile,
+            "profiles_truncated": profiles_truncated,
+        },
         "now": now,
     }
 
@@ -13675,6 +13792,251 @@ def rewind_notify_cursor(
 
 
 # ---------------------------------------------------------------------------
+# Captain reporting inbox (durable, profile-scoped)
+# ---------------------------------------------------------------------------
+#
+# The exact-origin ``kanban_notify_subs`` route delivers a terminal event to
+# the one TUI/Desktop session that created the task. When that session is gone
+# the event is stranded. The Captain inbox is the durable fallback: a task is
+# registered to its creator *profile* (and, when the creator is a TUI/Desktop
+# session, its exact origin session key), and every reportable terminal event
+# materializes a ``pending`` inbox row. The poller leases -> acks a row so
+# exactly one same-profile session reports it, with the live origin session
+# owning delivery while present.
+
+
+def _normalize_captain_profile(profile: Optional[str]) -> str:
+    """Canonicalize a Captain owner profile.
+
+    Uses the same :func:`hermes_cli.profiles.normalize_profile_name` canonical
+    id used on disk and in ``-p`` argv, so mixed-case / title-cased inputs
+    (``Otto``, ``Default``) resolve to one owner (``otto``, ``default``) across
+    registration, materialization, lease/read, filters, and probes. An empty
+    profile maps to ``default``.
+    """
+    name = str(profile or "").strip()
+    if not name:
+        return "default"
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+        return normalize_profile_name(name)
+    except Exception:
+        return name.lower()
+
+
+def register_captain_owner(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile: str,
+    origin_session_key: Optional[str] = None,
+) -> None:
+    """Register ``task_id`` in the Captain ledger owned by ``profile``.
+
+    Called AFTER create so the task's ``created`` event (already appended)
+    never materializes a reportable row. ``origin_session_key`` is the exact
+    TUI/Desktop session key when the creator is such a session; ``None`` for
+    gateway/CLI/cron/unattached creators (any active same-profile TUI/Desktop
+    session may then claim). Idempotent on ``task_id``: the owner profile is
+    fixed at first registration; a later call only refreshes an
+    origin_session_key that was previously unset.
+    """
+    prof = _normalize_captain_profile(profile)
+    origin = str(origin_session_key).strip() if origin_session_key else None
+    now = int(time.time())
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "INSERT OR IGNORE INTO kanban_captain_registry "
+            "(task_id, profile, origin_session_key, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, prof, origin, now),
+        )
+        if origin:
+            conn.execute(
+                "UPDATE kanban_captain_registry SET origin_session_key = ? "
+                "WHERE task_id = ? "
+                "AND (origin_session_key IS NULL OR origin_session_key = '')",
+                (origin, task_id),
+            )
+
+
+def read_captain_candidates(
+    conn: sqlite3.Connection, *, profile: str, now: Optional[int] = None,
+) -> list[dict]:
+    """Return claimable Captain rows for ``profile`` (pending or lease-expired).
+
+    Each row carries the registered ``origin_session_key`` so the caller can
+    apply in-process liveness eligibility (the live origin session owns
+    delivery) before taking the durable lease.
+    """
+    prof = _normalize_captain_profile(profile)
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT i.event_id, i.task_id, i.kind, i.state, i.lease_expires, "
+        "       r.origin_session_key "
+        "FROM kanban_captain_inbox i "
+        "LEFT JOIN kanban_captain_registry r ON r.task_id = i.task_id "
+        "WHERE i.profile = ? AND ("
+        "  i.state = 'pending' OR "
+        "  (i.state = 'leased' AND (i.lease_expires IS NULL OR i.lease_expires < ?))"
+        ")",
+        (prof, now),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def lease_captain_reports(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    owner: str,
+    event_ids: Iterable[int],
+    now: Optional[int] = None,
+    lease_seconds: int = 120,
+) -> tuple[str, list[Event]]:
+    """Atomically lease the given ``event_ids`` for ``profile`` under ``owner``.
+
+    Returns ``(token, events)``. Only rows currently ``pending`` or holding an
+    expired lease flip to ``leased`` under a freshly minted opaque token, so
+    concurrent same-profile pollers never both win the same row. The returned
+    events are joined against ``task_events`` so the caller can format them.
+    """
+    prof = _normalize_captain_profile(profile)
+    ids = [int(e) for e in event_ids]
+    token = secrets.token_hex(16)
+    if not ids:
+        return token, []
+    now = int(time.time()) if now is None else int(now)
+    expires = now + int(lease_seconds)
+    placeholders = ",".join("?" * len(ids))
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_captain_inbox "
+            "SET state = 'leased', lease_token = ?, lease_owner = ?, "
+            "    lease_expires = ?, updated_at = ? "
+            f"WHERE profile = ? AND event_id IN ({placeholders}) AND ("
+            "  state = 'pending' OR "
+            "  (state = 'leased' AND (lease_expires IS NULL OR lease_expires < ?))"
+            ")",
+            (token, owner, expires, now, prof, *ids, now),
+        )
+        rows = conn.execute(
+            "SELECT i.event_id, e.task_id, e.kind, e.payload, e.created_at, e.run_id "
+            "FROM kanban_captain_inbox i "
+            "JOIN task_events e ON e.id = i.event_id "
+            "WHERE i.lease_token = ? ORDER BY i.event_id ASC",
+            (token,),
+        ).fetchall()
+    events: list[Event] = []
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"]) if r["payload"] else None
+        except Exception:
+            payload = None
+        events.append(Event(
+            id=int(r["event_id"]), task_id=r["task_id"], kind=r["kind"],
+            payload=payload, created_at=r["created_at"],
+            run_id=(int(r["run_id"]) if r["run_id"] is not None else None),
+        ))
+    return token, events
+
+
+def ack_captain_reports(conn: sqlite3.Connection, *, token: str) -> int:
+    """Mark a leased batch ``acked`` after the synthetic turn was accepted."""
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_captain_inbox SET state = 'acked', updated_at = ? "
+            "WHERE lease_token = ? AND state = 'leased'",
+            (now, token),
+        )
+    return int(cur.rowcount or 0)
+
+
+def release_captain_reports(conn: sqlite3.Connection, *, token: str) -> int:
+    """Release a leased batch back to ``pending`` after a failed delivery."""
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_captain_inbox "
+            "SET state = 'pending', lease_token = NULL, lease_owner = NULL, "
+            "    lease_expires = NULL, updated_at = ? "
+            "WHERE lease_token = ? AND state = 'leased'",
+            (now, token),
+        )
+    return int(cur.rowcount or 0)
+
+
+def captain_unreported_for_task(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count not-yet-acked (pending or leased) Captain rows for a task."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM kanban_captain_inbox "
+        "WHERE task_id = ? AND state != 'acked'",
+        (task_id,),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def purge_captain_task(conn: sqlite3.Connection, task_id: str) -> None:
+    """Drop a task's Captain registration and all its inbox rows."""
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "DELETE FROM kanban_captain_inbox WHERE task_id = ?", (task_id,)
+        )
+        conn.execute(
+            "DELETE FROM kanban_captain_registry WHERE task_id = ?", (task_id,)
+        )
+
+
+def captain_gc_task_if_settled(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Purge a task's Captain rows once it is archived AND fully reported.
+
+    Archive must not discard an earlier pending completion: while unreported
+    work remains the registration/inbox rows are kept so the poller can still
+    deliver them. Returns True when a purge happened.
+    """
+    task = get_task(conn, task_id)
+    if task is None or getattr(task, "status", "") != "archived":
+        return False
+    if captain_unreported_for_task(conn, task_id) > 0:
+        return False
+    purge_captain_task(conn, task_id)
+    return True
+
+
+def count_captain_pending(
+    db_path: Optional[Path] = None, *, board: Optional[str] = None,
+    profile: str,
+) -> int:
+    """Read-only probe: not-yet-acked Captain rows for ``profile`` on a board.
+
+    Mirrors :func:`count_notify_subs` — never creates the DB, never opens it
+    writable, and treats a missing DB or legacy schema (no inbox table) as
+    zero. Lets the TUI poller skip opening a board writable when its profile
+    has no Captain work waiting there.
+    """
+    prof = _normalize_captain_profile(profile)
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    if not path.exists():
+        return 0
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM kanban_captain_inbox "
+                "WHERE profile = ? AND state != 'acked'",
+                (prof,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return 0
+            raise
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Retention + garbage collection
 # ---------------------------------------------------------------------------
 
@@ -13689,7 +14051,9 @@ def gc_events(
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND id NOT IN (SELECT event_id FROM kanban_captain_inbox "
+            "               WHERE state != 'acked')",
             (cutoff,),
         )
     return int(cur.rowcount or 0)

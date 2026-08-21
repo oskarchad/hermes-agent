@@ -1,0 +1,746 @@
+"""Behavioral tests for the durable profile-scoped Captain reporting inbox.
+
+The existing ``kanban_notify_subs`` route delivers a terminal task event to the
+*exact* origin TUI/Desktop session (``platform="tui"`` / ``chat_id=session_key``).
+When that session is gone, the event is stranded. The Captain inbox is a durable,
+profile-scoped ledger that guarantees *exactly one* Captain report across a
+profile's TUI/Desktop sessions: the live origin session owns delivery, and if it
+is absent/finalized the next active same-profile session may claim.
+
+These tests drive the real DB (temp SQLite from the autouse hermetic HERMES_HOME)
+and the real poller collector path in ``tui_gateway/server.py``.
+"""
+
+import threading
+import time
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+import tui_gateway.server as server
+from tui_gateway.server import _collect_kanban_notifications
+
+ORIGIN_KEY = "captain-origin-session"
+SIBLING_KEY = "captain-sibling-session"
+
+
+@pytest.fixture(autouse=True)
+def _clear_sessions():
+    server._sessions.clear()
+    yield
+    server._sessions.clear()
+
+
+def _session(key, profile_home=None):
+    s = {"session_key": key}
+    if profile_home:
+        s["profile_home"] = profile_home
+    return s
+
+
+def _register_live(sid, session):
+    server._sessions[sid] = session
+
+
+def _profile_for(session):
+    return server._session_captain_profile(session)
+
+
+def _inbox_states():
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT state, COUNT(*) AS n FROM kanban_captain_inbox GROUP BY state"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {r["state"]: int(r["n"]) for r in rows}
+
+
+# ── requirement 1: two live same-profile sessions ──────────────────────────
+def test_live_origin_owns_report_sibling_gets_none():
+    origin = _session(ORIGIN_KEY)
+    sibling = _session(SIBLING_KEY)
+    _register_live("sid-origin", origin)
+    _register_live("sid-sibling", sibling)
+    profile = _profile_for(origin)
+    assert _profile_for(sibling) == profile  # same profile
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap1", assignee="worker")
+        kb.register_captain_owner(
+            conn, tid, profile=profile, origin_session_key=ORIGIN_KEY
+        )
+        kb.complete_task(conn, tid, summary="done work")
+    finally:
+        conn.close()
+
+    # Sibling must not claim while the exact origin is live.
+    sib_claims = []
+    assert _collect_kanban_notifications(sibling, claim_records=sib_claims) == []
+    assert sib_claims == []
+
+    orig_claims = []
+    texts = _collect_kanban_notifications(origin, claim_records=orig_claims)
+    assert len(texts) == 1
+    assert tid in texts[0]
+    server._settle_kanban_notification_claims(orig_claims, accepted=True)
+
+    # No replay once acked.
+    assert _collect_kanban_notifications(origin, claim_records=[]) == []
+    assert _inbox_states() == {"acked": 1}
+
+
+# ── requirement 2: origin gone → another same-profile session claims once ──
+def test_origin_gone_sibling_claims_exactly_once():
+    profile = _profile_for(_session(ORIGIN_KEY))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap2", assignee="worker")
+        kb.register_captain_owner(
+            conn, tid, profile=profile, origin_session_key=ORIGIN_KEY
+        )
+        kb.complete_task(conn, tid, summary="finished")
+    finally:
+        conn.close()
+
+    # Origin is NOT live. Two live same-profile siblings both poll.
+    s1 = _session("live-a")
+    s2 = _session("live-b")
+    _register_live("sid-a", s1)
+    _register_live("sid-b", s2)
+
+    c1, c2 = [], []
+    t1 = _collect_kanban_notifications(s1, claim_records=c1)
+    t2 = _collect_kanban_notifications(s2, claim_records=c2)
+    total = t1 + t2
+    assert len(total) == 1
+    assert tid in total[0]
+
+    server._settle_kanban_notification_claims(c1, accepted=True)
+    server._settle_kanban_notification_claims(c2, accepted=True)
+    assert _collect_kanban_notifications(s1, claim_records=[]) == []
+    assert _collect_kanban_notifications(s2, claim_records=[]) == []
+
+
+# ── requirement 3: different profile cannot claim ──────────────────────────
+def test_different_profile_cannot_claim():
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap3", assignee="worker")
+        kb.register_captain_owner(
+            conn, tid, profile="a-totally-other-profile", origin_session_key=None
+        )
+        kb.complete_task(conn, tid, summary="foreign")
+    finally:
+        conn.close()
+
+    s = _session("live-x")
+    _register_live("sid-x", s)
+    assert _profile_for(s) != "a-totally-other-profile"
+    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    # The row stays pending for its own profile — never consumed by another.
+    assert _inbox_states() == {"pending": 1}
+
+
+# ── requirement 4: restart between lease and ack → expired lease reclaimed ──
+def test_expired_lease_is_reclaimed_and_acked_once():
+    profile = _profile_for(_session("live-r"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap4", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="lease-test")
+    finally:
+        conn.close()
+
+    s = _session("live-r")
+    _register_live("sid-r", s)
+
+    c1 = []
+    t1 = _collect_kanban_notifications(s, claim_records=c1)
+    assert len(t1) == 1  # leased
+
+    # Simulate a crash BEFORE ack: never settle. A fresh poll must not
+    # re-claim the still-valid lease.
+    assert _collect_kanban_notifications(s, claim_records=[]) == []
+
+    # Simulate a process restart past the lease expiry.
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_captain_inbox SET lease_expires = ? "
+                "WHERE state = 'leased'",
+                (int(time.time()) - 1,),
+            )
+    finally:
+        conn.close()
+
+    c2 = []
+    t2 = _collect_kanban_notifications(s, claim_records=c2)
+    assert len(t2) == 1  # reclaimed
+    assert t2[0] == t1[0]
+    server._settle_kanban_notification_claims(c2, accepted=True)
+
+    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    assert _inbox_states() == {"acked": 1}
+
+
+# ── requirement 5: synthetic turn rejection releases and retries ───────────
+def test_dispatch_failure_releases_then_accepted_retry_no_replay():
+    profile = _profile_for(_session("live-f"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap5", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="retry-me")
+    finally:
+        conn.close()
+
+    s = _session("live-f")
+    _register_live("sid-f", s)
+
+    c1 = []
+    t1 = _collect_kanban_notifications(s, claim_records=c1)
+    assert len(t1) == 1
+    server._settle_kanban_notification_claims(c1, accepted=False)  # rejected
+    assert _inbox_states() == {"pending": 1}  # released
+
+    c2 = []
+    t2 = _collect_kanban_notifications(s, claim_records=c2)
+    assert len(t2) == 1
+    assert t2[0] == t1[0]
+    server._settle_kanban_notification_claims(c2, accepted=True)
+
+    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    assert _inbox_states() == {"acked": 1}
+
+
+# ── requirement 6: no duplicate when both routes see the same event ────────
+def test_no_duplicate_across_exact_origin_and_captain_routes():
+    origin = _session(ORIGIN_KEY)
+    _register_live("sid-o", origin)
+    profile = _profile_for(origin)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap6", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="tui", chat_id=ORIGIN_KEY,
+            notifier_profile=profile,
+        )
+        kb.register_captain_owner(
+            conn, tid, profile=profile, origin_session_key=ORIGIN_KEY
+        )
+        kb.complete_task(conn, tid, summary="single report")
+    finally:
+        conn.close()
+
+    claims = []
+    texts = _collect_kanban_notifications(origin, claim_records=claims)
+    assert len(texts) == 1  # deduplicated across both routes
+    assert tid in texts[0]
+    server._settle_kanban_notification_claims(claims, accepted=True)
+
+    assert _collect_kanban_notifications(origin, claim_records=[]) == []
+    # Captain row acked; the exact-origin sub is retained (done is reversible).
+    assert _inbox_states() == {"acked": 1}
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, task_id=tid)) == 1
+    finally:
+        conn.close()
+
+
+# ── requirement 7: unattached orchestrator card → inbox, no invented sub ───
+def test_unattached_orchestrator_registers_without_notify_sub():
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap7", assignee="worker")
+        kb.register_captain_owner(
+            conn, tid, profile="orchestrator", origin_session_key=None
+        )
+        assert kb.list_notify_subs(conn, task_id=tid) == []
+        kb.complete_task(conn, tid, summary="cron done")
+        rows = conn.execute(
+            "SELECT i.profile, i.state, r.origin_session_key "
+            "FROM kanban_captain_inbox i "
+            "JOIN kanban_captain_registry r ON r.task_id = i.task_id "
+            "WHERE i.task_id = ?",
+            (tid,),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["profile"] == "orchestrator"
+        assert rows[0]["state"] == "pending"
+        assert rows[0]["origin_session_key"] is None
+        # No guessed platform/chat destination was invented.
+        assert kb.list_notify_subs(conn, task_id=tid) == []
+    finally:
+        conn.close()
+
+
+# ── requirement 8: reopen/new completion → new event, no acked replay ──────
+def test_reopen_creates_new_report_without_replaying_acked():
+    profile = _profile_for(_session("live-re"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap8", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="first pass")
+    finally:
+        conn.close()
+
+    s = _session("live-re")
+    _register_live("sid-re", s)
+
+    c1 = []
+    t1 = _collect_kanban_notifications(s, claim_records=c1)
+    assert len(t1) == 1 and "first pass" in t1[0]
+    server._settle_kanban_notification_claims(c1, accepted=True)
+    assert _collect_kanban_notifications(s, claim_records=[]) == []
+
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+            kb._append_event(conn, tid, "status", {"status": "ready"})
+        assert kb.complete_task(conn, tid, summary="second pass")
+    finally:
+        conn.close()
+
+    c2 = []
+    t2 = _collect_kanban_notifications(s, claim_records=c2)
+    joined = "\n".join(t2)
+    assert "second pass" in joined
+    assert "first pass" not in joined  # acked cycle never replays
+    server._settle_kanban_notification_claims(c2, accepted=True)
+    assert _collect_kanban_notifications(s, claim_records=[]) == []
+
+
+# ── migration / backward compatibility ─────────────────────────────────────
+def test_missing_captain_tables_are_recreated_on_connect():
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute("DROP TABLE kanban_captain_inbox")
+            conn.execute("DROP TABLE kanban_captain_registry")
+    finally:
+        conn.close()
+
+    # Force the next connect to re-run the idempotent schema init (as a fresh
+    # process would after an upgrade).
+    kb._INITIALIZED_PATHS.clear()
+    conn = kb.connect()
+    try:
+        names = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "kanban_captain_inbox" in names
+        assert "kanban_captain_registry" in names
+        # A pre-existing task with no registry row is unaffected.
+        tid = kb.create_task(conn, title="legacy", assignee="worker")
+        kb.complete_task(conn, tid, summary="ok")
+    finally:
+        conn.close()
+
+
+# ── archive cleanup must not drop an unreported pending completion ──────────
+def test_archive_keeps_pending_then_purges_after_accepted_report():
+    profile = _profile_for(_session("live-arc"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-arc", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="before archive")
+        assert kb.archive_task(conn, tid)
+        # Archive with unreported work retains the pending row + registration.
+        unreported = conn.execute(
+            "SELECT COUNT(*) FROM kanban_captain_inbox WHERE state != 'acked'"
+        ).fetchone()[0]
+        assert unreported == 1
+        reg = conn.execute(
+            "SELECT COUNT(*) FROM kanban_captain_registry WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0]
+        assert reg == 1
+    finally:
+        conn.close()
+
+    s = _session("live-arc")
+    _register_live("sid-arc", s)
+    claims = []
+    texts = _collect_kanban_notifications(s, claim_records=claims)
+    assert len(texts) == 1
+    assert "before archive" in texts[0]
+    server._settle_kanban_notification_claims(claims, accepted=True)
+
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_captain_inbox WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_captain_registry WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_archive_with_no_unreported_work_purges_directly():
+    profile = _profile_for(_session("live-arc2"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-arc2", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="clean")
+    finally:
+        conn.close()
+
+    s = _session("live-arc2")
+    _register_live("sid-arc2", s)
+    claims = []
+    assert len(_collect_kanban_notifications(s, claim_records=claims)) == 1
+    server._settle_kanban_notification_claims(claims, accepted=True)
+
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, tid)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_captain_registry WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_captain_inbox WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+# ── bounded / privacy-safe formatting ──────────────────────────────────────
+def test_captain_report_is_bounded_and_privacy_safe():
+    profile = _profile_for(_session("live-p"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="cap-priv", assignee="worker",
+            body="SECRET BODY LINE\nmore secret material",
+        )
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="visible first\nhidden second line")
+    finally:
+        conn.close()
+
+    s = _session("live-p")
+    _register_live("sid-p", s)
+    texts = _collect_kanban_notifications(s, claim_records=[])
+    assert len(texts) == 1
+    text = texts[0]
+    assert tid in text
+    assert "visible first" in text
+    assert "hidden second" not in text  # only the first handoff line
+    assert "SECRET BODY" not in text  # never the task body
+
+
+def test_captain_report_omits_raw_error_and_force_redacts_secrets():
+    profile = _profile_for(_session("live-secret"))
+    fake_secret = "sk-" + "A" * 48
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-secret", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                tid,
+                "gave_up",
+                {"error": f"RAW_TOOL_OUTPUT_SHOULD_NOT_SURFACE {fake_secret}"},
+            )
+    finally:
+        conn.close()
+
+    s = _session("live-secret")
+    _register_live("sid-secret", s)
+    claims = []
+    texts = _collect_kanban_notifications(s, claim_records=claims)
+    assert len(texts) == 1
+    assert "gave up" in texts[0]
+    assert "RAW_TOOL_OUTPUT_SHOULD_NOT_SURFACE" not in texts[0]
+    assert fake_secret not in texts[0]
+    server._settle_kanban_notification_claims(claims, accepted=True)
+
+
+def test_event_gc_preserves_unreported_captain_source_until_ack():
+    profile = _profile_for(_session("live-gc"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-gc", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        assert kb.complete_task(conn, tid, summary="survives event gc")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ?",
+                (int(time.time()) - 3600, tid),
+            )
+
+        kb.gc_events(conn, older_than_seconds=60)
+        pending_event = conn.execute(
+            "SELECT event_id FROM kanban_captain_inbox "
+            "WHERE task_id = ? AND state = 'pending'",
+            (tid,),
+        ).fetchone()
+        assert pending_event is not None
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE id = ?", (pending_event["event_id"],)
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+    s = _session("live-gc")
+    _register_live("sid-gc", s)
+    claims = []
+    texts = _collect_kanban_notifications(s, claim_records=claims)
+    assert len(texts) == 1
+    assert "survives event gc" in texts[0]
+    server._settle_kanban_notification_claims(claims, accepted=True)
+
+    conn = kb.connect()
+    try:
+        assert kb.gc_events(conn, older_than_seconds=60) >= 1
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE id = ?", (pending_event["event_id"],)
+        ).fetchone() is None
+    finally:
+        conn.close()
+
+
+# ── stats diagnostics for unreported Captain rows ──────────────────────────
+def test_board_stats_reports_unreported_captain_backlog():
+    conn = kb.connect()
+    try:
+        stats0 = kb.board_stats(conn)
+        assert stats0["captain_unreported"]["count"] == 0
+
+        tid = kb.create_task(conn, title="cap-stats", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile="default", origin_session_key=None)
+        kb.complete_task(conn, tid, summary="pending report")
+        stats = kb.board_stats(conn)
+    finally:
+        conn.close()
+
+    cap = stats["captain_unreported"]
+    assert cap["count"] == 1
+    assert cap["oldest_age_seconds"] is not None
+    assert cap["oldest_age_seconds"] >= 0
+
+
+# ── repair 1: canonical profile normalization (mixed case) ─────────────────
+def test_captain_profile_is_canonically_normalized_mixed_case():
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-norm", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile="Otto", origin_session_key=None)
+        kb.complete_task(conn, tid, summary="norm test")
+
+        reg = conn.execute(
+            "SELECT profile FROM kanban_captain_registry WHERE task_id = ?", (tid,)
+        ).fetchone()
+        assert reg["profile"] == "otto"  # normalize_profile_name canonicalization
+        inbox = conn.execute(
+            "SELECT profile FROM kanban_captain_inbox WHERE task_id = ?", (tid,)
+        ).fetchone()
+        assert inbox["profile"] == "otto"
+
+        # A differently-cased lookup still resolves to the same owner.
+        assert len(kb.read_captain_candidates(conn, profile="OTTO")) == 1
+        assert kb.count_captain_pending(board=None, profile="Otto") == 1
+    finally:
+        conn.close()
+
+
+def test_mixed_case_profile_session_claims_its_own_rows():
+    """A session whose profile differs only in case still claims its reports."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-norm2", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile="otto", origin_session_key=None)
+        kb.complete_task(conn, tid, summary="cross-case claim")
+    finally:
+        conn.close()
+
+    session = _session("live-otto", profile_home=None)
+    # Force a mixed-case bound profile via profile_home dir name.
+    import tempfile
+    home = tempfile.mkdtemp()
+    import os
+    otto_home = os.path.join(home, "Otto")
+    os.makedirs(otto_home)
+    session["profile_home"] = otto_home
+    _register_live("sid-otto", session)
+
+    assert _profile_for(session) == "Otto"  # raw bound name is mixed case
+    claims = []
+    texts = _collect_kanban_notifications(session, claim_records=claims)
+    assert len(texts) == 1
+    server._settle_kanban_notification_claims(claims, accepted=True)
+    assert _inbox_states() == {"acked": 1}
+
+
+# ── repair 2: bounded per-profile stats breakdown ──────────────────────────
+def test_board_stats_captain_per_profile_breakdown():
+    conn = kb.connect()
+    try:
+        for i, prof in enumerate(["alpha", "beta", "beta"]):
+            tid = kb.create_task(conn, title=f"s{i}", assignee="worker")
+            kb.register_captain_owner(conn, tid, profile=prof, origin_session_key=None)
+            kb.complete_task(conn, tid, summary="x")
+        stats = kb.board_stats(conn)
+    finally:
+        conn.close()
+
+    cap = stats["captain_unreported"]
+    assert cap["count"] == 3
+    assert cap["oldest_age_seconds"] is not None
+    by = cap["by_profile"]
+    assert isinstance(by, list)
+    assert len(by) <= 20
+    profiles = {r["profile"]: r for r in by}
+    assert profiles["beta"]["count"] == 2
+    assert profiles["alpha"]["count"] == 1
+    for r in by:
+        # Bounded, ownership-only shape — never task/event payloads.
+        assert set(r.keys()) == {"profile", "count", "oldest_age_seconds"}
+        assert r["oldest_age_seconds"] is not None and r["oldest_age_seconds"] >= 0
+    assert cap["profiles_truncated"] == 0
+
+
+def test_board_stats_captain_per_profile_truncates_at_20():
+    conn = kb.connect()
+    try:
+        for i in range(23):
+            tid = kb.create_task(conn, title=f"t{i}", assignee="worker")
+            kb.register_captain_owner(
+                conn, tid, profile=f"prof{i:02d}", origin_session_key=None
+            )
+            kb.complete_task(conn, tid, summary="x")
+        stats = kb.board_stats(conn)
+    finally:
+        conn.close()
+
+    cap = stats["captain_unreported"]
+    assert cap["count"] == 23
+    assert len(cap["by_profile"]) == 20
+    assert cap["profiles_truncated"] == 3
+
+
+# ── repair 3: no ack without a settlement handshake ────────────────────────
+def test_collector_without_claim_records_never_consumes_pending():
+    profile = _profile_for(_session("live-none"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-none", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="must stay pending")
+    finally:
+        conn.close()
+
+    s = _session("live-none")
+    _register_live("sid-none", s)
+
+    # No settlement list supplied → the helper must not lease/ack the row.
+    _collect_kanban_notifications(s)  # claim_records defaults to None
+    assert _inbox_states() == {"pending": 1}
+
+    # Direct helper call with claim_records=None is likewise inert.
+    conn = kb.connect()
+    try:
+        server._collect_captain_reports(
+            conn, kb.DEFAULT_BOARD, s, profile, set(), None, []
+        )
+    finally:
+        conn.close()
+    assert _inbox_states() == {"pending": 1}
+
+    # A properly settled poll still delivers exactly once afterwards.
+    claims = []
+    texts = _collect_kanban_notifications(s, claim_records=claims)
+    assert len(texts) == 1
+    server._settle_kanban_notification_claims(claims, accepted=True)
+    assert _inbox_states() == {"acked": 1}
+
+
+# ── repair 4: loop-level reject→release→accept→ack→no-replay ────────────────
+class _StopAfterOnePoll(threading.Event):
+    def __init__(self):
+        super().__init__()
+        self._checks = 0
+
+    def is_set(self):
+        self._checks += 1
+        return self._checks > 1
+
+
+class _EmptyCompletionQueue:
+    def get(self, timeout=None):
+        raise RuntimeError("empty")
+
+    def empty(self):
+        return True
+
+
+def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
+    from tools.process_registry import process_registry
+
+    loop_key = "captain-loop-session"
+    session = {
+        "session_key": loop_key,
+        "history_lock": threading.Lock(),
+        "running": False,
+    }
+    profile = _profile_for(session)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-loop", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="loop delivery")
+    finally:
+        conn.close()
+
+    attempts: list[str] = []
+
+    def submit(_rid, _sid, _session, text):
+        attempts.append(text)
+        return len(attempts) != 1  # first attempt rejected, later accepted
+
+    def run_once():
+        monkeypatch.setattr(
+            process_registry, "completion_queue", _EmptyCompletionQueue()
+        )
+        monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
+        monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_run_prompt_submit", submit)
+        server._notification_poller_loop(_StopAfterOnePoll(), "sid-loop", session)
+
+    # Poll 1 — rejection releases the row to pending and clears the reservation.
+    run_once()
+    assert len(attempts) == 1
+    assert tid in attempts[0]
+    assert _inbox_states() == {"pending": 1}
+    assert session["running"] is False
+
+    # Poll 2 — accepted retry acks the same event (no new/replayed event).
+    run_once()
+    assert len(attempts) == 2
+    assert attempts[1] == attempts[0]
+    assert _inbox_states() == {"acked": 1}
+
+    # Turn finishes; a later idle poll must not replay the acked report.
+    with session["history_lock"]:
+        session["running"] = False
+    run_once()
+    assert len(attempts) == 2
+    assert _inbox_states() == {"acked": 1}

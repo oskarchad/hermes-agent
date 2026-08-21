@@ -57,6 +57,83 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_slash_create_registers_session_profile_not_author(kanban_home, monkeypatch):
+    """Gateway `/kanban create` must register the Captain owner to the
+    session-bound profile (normalized), separate from task authorship. The
+    `--created-by` author label ('user' by default) must never own Captain
+    rows."""
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "Otto")
+
+    out = kc.run_slash("create 'session-owned card' --assignee peer")
+    assert "Created" in out
+
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT profile FROM kanban_captain_registry"
+        ).fetchall()
+        authors = conn.execute("SELECT created_by FROM tasks").fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["profile"] == "otto"  # session profile, normalized — not 'user'
+    # Task authorship is unchanged (default author label), proving the two
+    # concerns are decoupled.
+    assert authors[0]["created_by"] == "user"
+
+
+def test_cli_create_registers_active_profile_when_no_session_profile(
+    kanban_home, monkeypatch
+):
+    """A plain CLI create with no session env still owns Captain rows under the
+    real active/launch profile, never the `--created-by` author string."""
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "Reviewer")
+
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args(
+        ["kanban", "create", "cli card", "--assignee", "peer", "--created-by", "user"]
+    )
+    assert kc.kanban_command(args) == 0
+
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT profile FROM kanban_captain_registry"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["profile"] == "reviewer"  # HERMES_PROFILE, normalized
+
+
+def test_slash_create_prefers_context_bound_profile_over_process_env(
+    kanban_home, monkeypatch
+):
+    """Gateway session ContextVars are authoritative in multiplexed processes.
+
+    ``/kanban create`` runs in ``asyncio.to_thread``, which copies ContextVars;
+    reading only ``os.environ`` would instead stamp the process launch profile
+    and leak the report into the wrong Captain inbox.
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setenv("HERMES_PROFILE", "Default")
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    tokens = set_session_vars(profile="Otto")
+    try:
+        out = kc.run_slash("create 'context-owned card' --assignee peer")
+    finally:
+        clear_session_vars(tokens)
+
+    assert "Created" in out
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT profile FROM kanban_captain_registry"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["profile"] == "otto"
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

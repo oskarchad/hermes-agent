@@ -921,6 +921,50 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_create_registers_captain_owner_without_notify_sub_when_unattached(
+    monkeypatch, worker_env
+):
+    """An unattached orchestrator/CLI/cron create has no persistent chat
+    channel, so it must NOT invent a notify subscription — but it MUST still
+    register its creator profile in the durable Captain inbox so a same-profile
+    TUI/Desktop session can report the terminal event later (requirement 7)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    # worker_env pins HERMES_PROFILE=test-worker → that is the creator profile.
+
+    out = kt._handle_create({"title": "orchestrator card", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is False, d
+    tid = d["task_id"]
+
+    # No guessed platform/chat destination.
+    assert _list_subs_for_task(tid) == []
+
+    conn = kb.connect()
+    try:
+        reg = conn.execute(
+            "SELECT profile, origin_session_key FROM kanban_captain_registry "
+            "WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert reg is not None
+        assert reg["profile"] == "test-worker"
+        assert reg["origin_session_key"] is None
+        # The 'created' event predates registration → it never materializes.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_captain_inbox WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery

@@ -10524,6 +10524,147 @@ _KANBAN_NOTIFY_KINDS = (
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
+# How long a Captain inbox lease is held before it is reclaimable. A crash
+# between lease and ack strands the row only until this elapses; the next
+# poll after a restart reclaims it (see hermes_cli/kanban_db.py).
+_CAPTAIN_LEASE_SECONDS = 120
+
+
+def _session_captain_profile(session: dict) -> str:
+    """Resolve the profile that owns this session's Captain reports.
+
+    Bound to the session's own profile — ``profile_home`` for a multiplexed
+    Desktop session, otherwise the process launch profile — never a
+    process-global env guess, so a Desktop session pinned to another profile
+    reads that profile's ledger.
+    """
+    try:
+        if isinstance(session, dict) and session.get("profile_home"):
+            return Path(session["profile_home"]).name
+    except Exception:
+        pass
+    return _current_profile_name()
+
+
+def _session_key_is_live(session_key: str) -> bool:
+    """True when some non-finalized in-process session carries ``session_key``.
+
+    ``_sessions`` is the source of TUI/Desktop liveness. Used to decide Captain
+    eligibility: a non-origin session may only claim a task's report while its
+    registered origin session is absent/finalized.
+    """
+    if not session_key:
+        return False
+    key = str(session_key)
+    with _sessions_lock:
+        for sess in _sessions.values():
+            if not isinstance(sess, dict) or sess.get("_finalized"):
+                continue
+            if str(sess.get("session_key") or "") == key:
+                return True
+    return False
+
+
+def _captain_row_eligible(this_key: str, origin_key) -> bool:
+    """Whether this session may claim a Captain row with the given origin.
+
+    - No origin (gateway/CLI/cron/unattached) → any same-profile session.
+    - We ARE the origin → always ours while live.
+    - A different origin → only if that origin is not currently live.
+    """
+    origin = str(origin_key).strip() if origin_key else ""
+    if not origin:
+        return True
+    if origin == str(this_key or ""):
+        return True
+    return not _session_key_is_live(origin)
+
+
+def _collect_captain_reports(
+    conn,
+    slug: str,
+    session: dict,
+    captain_profile: str,
+    claimed_event_ids: set,
+    claim_records: Optional[list[dict]],
+    texts: list,
+) -> None:
+    """Claim eligible Captain inbox rows for this session's profile.
+
+    Runs alongside the exact-origin ``kanban_notify_subs`` route on the same
+    board connection. Rows whose ``task_event.id`` was already turned into text
+    by the exact-origin route are settled but not re-rendered (dedup); the rest
+    are formatted. Leases are recorded in ``claim_records`` so the caller acks
+    them on an accepted turn or releases them on rejection.
+
+    A Captain row is acked ONLY after ``_run_prompt_submit`` accepts the
+    synthetic turn, so leasing is meaningless without a settlement handshake.
+    When ``claim_records`` is ``None`` (a probe-style call with no way to
+    ack/release), this helper is a no-op and leaves every row ``pending`` —
+    it never leases or acks merely because it was invoked.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    if claim_records is None:
+        return
+
+    this_key = str(session.get("session_key") or "")
+    now = int(time.time())
+    try:
+        candidates = _kb.read_captain_candidates(
+            conn, profile=captain_profile, now=now
+        )
+    except Exception:
+        return
+    eligible = [
+        int(c["event_id"])
+        for c in candidates
+        if _captain_row_eligible(this_key, c.get("origin_session_key"))
+    ]
+    if not eligible:
+        return
+    token, events = _kb.lease_captain_reports(
+        conn,
+        profile=captain_profile,
+        owner=this_key or captain_profile,
+        event_ids=eligible,
+        now=now,
+        lease_seconds=_CAPTAIN_LEASE_SECONDS,
+    )
+    if not events:
+        return
+    task_ids: set = set()
+    task_cache: dict = {}
+    for ev in events:
+        task_ids.add(ev.task_id)
+        if ev.id in claimed_event_ids:
+            continue  # already delivered via the exact-origin route this batch
+        task = task_cache.get(ev.task_id)
+        if task is None:
+            task = _kb.get_task(conn, ev.task_id)
+            task_cache[ev.task_id] = task
+        # Captain payloads are a stricter privacy boundary than the existing
+        # exact-origin notification: never copy the raw spawn/tool error, and
+        # force-redact credential-shaped text even when global redaction is off.
+        text = _format_kanban_event_text(
+            {"task_id": ev.task_id},
+            task,
+            ev,
+            slug,
+            include_error_detail=False,
+        )
+        if text:
+            from agent.redact import redact_sensitive_text
+
+            text = redact_sensitive_text(text, force=True)
+            claimed_event_ids.add(ev.id)
+            texts.append(text)
+    claim_records.append({
+        "route": "captain",
+        "board": slug,
+        "token": token,
+        "task_ids": task_ids,
+    })
 
 
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
@@ -10626,6 +10767,8 @@ def _format_kanban_event_text(
     ev,
     board_slug: str,
     latest_run=None,
+    *,
+    include_error_detail: bool = True,
 ) -> Optional[str]:
     """Single-line notification text for one kanban event.
 
@@ -10661,7 +10804,11 @@ def _format_kanban_event_text(
         )
     if kind == "gave_up":
         lineage = project_kanban_event_lineage(task, ev, latest_run)
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
+        err = (
+            f"\n{str(payload.get('error'))[:200]}"
+            if include_error_detail and payload.get("error")
+            else ""
+        )
         blocked = "; task is blocked" if lineage.block_is_current else ""
         return render_kanban_alert(
             f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated "
@@ -10723,6 +10870,7 @@ def _collect_kanban_notifications(
         from hermes_cli import kanban_db as _kb
     except Exception:
         return []
+    captain_profile = _session_captain_profile(session)
     texts: list = []
     try:
         boards = _kb.list_boards(include_archived=False)
@@ -10749,28 +10897,39 @@ def _collect_kanban_notifications(
             continue
         seen_db_paths.add(resolved)
         # A poller runs per live TUI/Desktop session. Avoid opening this board
-        # writable unless it has a subscription owned by this exact session;
-        # subscriptions for gateways or other sessions are not actionable here.
+        # writable unless it has an exact-origin subscription owned by this
+        # session OR a Captain report waiting for this session's profile;
+        # everything else is not actionable here.
+        open_writable = False
         try:
-            if _kb.count_notify_subs(
+            open_writable = _kb.count_notify_subs(
                 board=slug,
                 platform="tui",
                 chat_id=session_key,
-            ) == 0:
-                continue
+            ) > 0
         except Exception:
             # Preserve delivery if the read-only probe cannot inspect a
             # locked, corrupt, or otherwise unusual database.
-            pass
+            open_writable = True
+        if not open_writable:
+            try:
+                open_writable = _kb.count_captain_pending(
+                    board=slug, profile=captain_profile
+                ) > 0
+            except Exception:
+                open_writable = True
+        if not open_writable:
+            continue
         try:
             conn = _kb.connect(board=slug)
         except Exception:
             continue
         try:
+            claimed_event_ids: set = set()
             try:
                 subs = _kb.list_notify_subs(conn)
             except Exception:
-                continue
+                subs = []
             for sub in subs:
                 if (sub.get("platform") or "").lower() != "tui":
                     continue
@@ -10803,6 +10962,10 @@ def _collect_kanban_notifications(
                         task and getattr(task, "status", "") == "archived"
                     )
                 for ev in events:
+                    # Record every event id the exact-origin route claimed so
+                    # the Captain route can settle-but-not-duplicate the same
+                    # task_event.id (both routes may see it for the origin).
+                    claimed_event_ids.add(ev.id)
                     text = _format_kanban_event_text(
                         sub, task, ev, slug, latest_run,
                     )
@@ -10827,6 +10990,21 @@ def _collect_kanban_notifications(
                         )
                     except Exception:
                         pass
+            # Durable, profile-scoped Captain route (fallback + generalization
+            # of the exact-origin route above). Claims reportable terminal
+            # events for this session's profile, deduplicating any already
+            # rendered by the exact-origin route on this board.
+            try:
+                _collect_captain_reports(
+                    conn, slug, session, captain_profile,
+                    claimed_event_ids, claim_records, texts,
+                )
+            except Exception as exc:
+                print(
+                    f"[tui_gateway] captain report collection failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
         finally:
             conn.close()
     return texts
@@ -10839,6 +11017,29 @@ def _settle_kanban_notification_claims(
     from hermes_cli import kanban_db as _kb
 
     for record in claim_records:
+        if record.get("route") == "captain":
+            conn = None
+            try:
+                conn = _kb.connect(board=record["board"])
+                if accepted:
+                    _kb.ack_captain_reports(conn, token=record["token"])
+                    # Once an archived task's report is accepted and nothing
+                    # else is pending, drop its registration + settled rows.
+                    for tid in record.get("task_ids") or ():
+                        _kb.captain_gc_task_if_settled(conn, tid)
+                else:
+                    _kb.release_captain_reports(conn, token=record["token"])
+            except Exception as exc:
+                action = "ack" if accepted else "release"
+                print(
+                    f"[tui_gateway] captain report {action} failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+            finally:
+                if conn is not None:
+                    conn.close()
+            continue
         if accepted and not record["unsubscribe"]:
             continue
         sub = record["sub"]

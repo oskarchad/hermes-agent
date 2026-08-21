@@ -1192,6 +1192,47 @@ def kanban_command(args: argparse.Namespace) -> int:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _captain_owner_profile() -> str:
+    """Resolve the Captain-owner profile for a CLI / ``/kanban`` create.
+
+    This is the owning Hermes **profile**, distinct from task authorship
+    (``--created-by`` / :func:`_profile_author`, which may be an arbitrary human
+    label like ``user``). Precedence: the exact session-bound
+    ``HERMES_SESSION_PROFILE`` first (set by the gateway/session for
+    ``/kanban create``), then the launch ``HERMES_PROFILE``, then the active
+    profile — canonicalized with ``normalize_profile_name`` so ``Otto`` and
+    ``otto`` are one owner. Never routes to an author label.
+    """
+    from hermes_cli.profiles import normalize_profile_name
+
+    # Gateway multiplexing binds the profile in a ContextVar and then runs the
+    # slash handler through ``asyncio.to_thread`` (which copies that context).
+    # Once session context has been engaged, process-global env belongs to the
+    # launch/default profile and must not be borrowed for another session.
+    try:
+        from gateway.session_context import get_session_env, session_context_engaged
+
+        raw = get_session_env("HERMES_SESSION_PROFILE", "").strip()
+        if not raw and not session_context_engaged():
+            raw = (os.environ.get("HERMES_PROFILE") or "").strip()
+    except Exception:
+        raw = (
+            os.environ.get("HERMES_SESSION_PROFILE")
+            or os.environ.get("HERMES_PROFILE")
+            or ""
+        ).strip()
+    if not raw:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            raw = get_active_profile_name() or "default"
+        except Exception:
+            raw = "default"
+    try:
+        return normalize_profile_name(raw)
+    except Exception:
+        return "default"
+
+
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
     for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
@@ -1615,6 +1656,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
+        # Register the OWNING PROFILE (not the author label) in the durable
+        # Captain ledger so a same-profile TUI/Desktop session can report the
+        # terminal event. A CLI/`/kanban` create has no origin session and
+        # invents no chat destination.
+        try:
+            kb.register_captain_owner(
+                conn, task_id,
+                profile=_captain_owner_profile(),
+                origin_session_key=None,
+            )
+        except Exception:
+            pass
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
@@ -2980,6 +3033,22 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    cap = stats.get("captain_unreported") or {}
+    cap_count = int(cap.get("count") or 0)
+    if cap_count:
+        cap_age = cap.get("oldest_age_seconds")
+        suffix = f" (oldest {int(cap_age)}s)" if cap_age is not None else ""
+        print(f"\nUnreported Captain reports: {cap_count}{suffix}")
+        for row in cap.get("by_profile") or []:
+            row_age = row.get("oldest_age_seconds")
+            row_suffix = f", oldest {int(row_age)}s" if row_age is not None else ""
+            print(
+                f"  {str(row.get('profile') or '-'):20s}  "
+                f"{int(row.get('count') or 0)}{row_suffix}"
+            )
+        truncated = int(cap.get("profiles_truncated") or 0)
+        if truncated:
+            print(f"  … {truncated} more profile(s) not shown")
     return 0
 
 

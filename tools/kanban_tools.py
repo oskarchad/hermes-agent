@@ -1468,6 +1468,7 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            _maybe_register_captain(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1484,6 +1485,76 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _resolve_creator_profile() -> str:
+    """Resolve the normalized creator profile for the Captain ledger.
+
+    Same source of truth as the auto-subscribe ``notifier_profile`` stamp:
+    the session's bound profile env, else the active profile, else default.
+    """
+    try:
+        from gateway.session_context import get_session_env, session_context_engaged
+        profile = get_session_env("HERMES_SESSION_PROFILE", "")
+        if not profile and not session_context_engaged():
+            profile = os.environ.get("HERMES_PROFILE") or ""
+    except Exception:
+        profile = (
+            os.environ.get("HERMES_SESSION_PROFILE")
+            or os.environ.get("HERMES_PROFILE")
+            or ""
+        )
+    if not profile:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name() or "default"
+        except Exception:
+            profile = "default"
+    # Canonicalize so mixed-case / title-cased inputs resolve to one owner,
+    # matching kanban_db's ownership filters (see _normalize_captain_profile).
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+        return normalize_profile_name(profile)
+    except Exception:
+        return (profile or "default").strip().lower() or "default"
+
+
+def _maybe_register_captain(conn: Any, task_id: str) -> None:
+    """Register the new task in the durable, profile-scoped Captain ledger.
+
+    Runs unconditionally (no config gate — this is a separate mechanism from
+    the exact-origin notify subscription). The creator profile always owns the
+    task; the exact TUI/Desktop origin session key is recorded only when the
+    creator IS such a session, so a live origin session owns delivery while
+    present. Gateway/CLI/cron/unattached creators register with no origin
+    session and invent NO platform/chat destination. Best-effort: a bookkeeping
+    failure must never fail the kanban_create the agent is mid-conversation on.
+    """
+    try:
+        origin_session_key: Optional[str] = None
+        platform = ""
+        try:
+            from gateway.session_context import get_session_env
+            platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            session_key = (
+                get_session_env("HERMES_SESSION_KEY", "")
+                or os.environ.get("HERMES_SESSION_KEY", "")
+            )
+        except Exception:
+            chat_id = ""
+            session_key = os.environ.get("HERMES_SESSION_KEY", "")
+        # A TUI/Desktop session has a session key but no gateway platform/chat.
+        if session_key and not (platform and chat_id):
+            origin_session_key = session_key
+        from hermes_cli import kanban_db as _kb
+        _kb.register_captain_owner(
+            conn, task_id,
+            profile=_resolve_creator_profile(),
+            origin_session_key=origin_session_key,
+        )
+    except Exception as _exc:
+        logger.warning("_maybe_register_captain failed: %r", _exc)
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:

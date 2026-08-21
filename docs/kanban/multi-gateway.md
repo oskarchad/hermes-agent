@@ -38,3 +38,20 @@ Or set the env var: `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`
 Non-dispatch gateways still deliver messages for their own platform adapters
 (Telegram, Discord, etc.). They do not dispatch tasks, and they skip boards
 that have no subscriptions owned by their profiles.
+
+## Captain reporting is a separate TUI/Desktop path (not a relay)
+
+Everything above is about **gateway** processes delivering chat messages for
+their owned profiles. The TUI/Desktop **Captain reporting inbox** (see the
+[Kanban feature guide](../../website/docs/user-guide/features/kanban.md), "TUI &
+Desktop Captain reports") is a different, local mechanism: it durably reports a
+task's terminal event to an active TUI/Desktop session bound to the
+**same normalized profile**, exactly once, with the live origin session
+preferred and another same-profile session claiming only when the origin is
+gone.
+
+It is **not a cross-gateway relay**. A Captain report is never routed across
+gateways, profiles, tenants, boards, or accounts, and it invents no chat/human
+destination. A gateway subscription and a Captain report are independent paths
+that never duplicate each other — a task can notify its gateway chat *and*
+report to its local Captain without either standing in for the other.
