@@ -37,6 +37,7 @@ import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import {
+  attachPrematureResponseGuard,
   isReauthRequiredError,
   makeNousCloudBackendDownError,
   makeUnsignedOauthError,
@@ -4921,6 +4922,7 @@ function fetchJson(url, token, options: any = {}) {
           },
           res => {
             const chunks = []
+            attachPrematureResponseGuard(res, reject, url)
             res.on('error', reject)
             res.on('data', chunk => chunks.push(chunk))
             res.on('end', () => {

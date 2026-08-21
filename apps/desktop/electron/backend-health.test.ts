@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 
 import { test } from 'vitest'
 
 import {
+  attachPrematureResponseGuard,
   DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
   isAuthRejectionError,
   isGatedMissingHealthError,
@@ -16,6 +18,30 @@ import {
 } from './backend-health'
 
 const GATE_401 = '401: {"error":"unauthenticated","detail":"Unauthorized","reason":"no_cookie","login_url":"/login"}'
+
+test('rejects an HTTP probe whose response closes before completion', () => {
+  const response = Object.assign(new EventEmitter(), { complete: false })
+  let failure: Error | null = null
+
+  attachPrematureResponseGuard(response, error => {
+    failure = error
+  }, 'http://127.0.0.1:9119/api/health')
+  response.emit('close')
+
+  assert.match(failure?.message || '', /closed before the response completed/i)
+})
+
+test('does not reject a fully completed HTTP response when its socket closes', () => {
+  const response = Object.assign(new EventEmitter(), { complete: true })
+  let rejected = false
+
+  attachPrematureResponseGuard(response, () => {
+    rejected = true
+  }, 'http://127.0.0.1:9119/api/health')
+  response.emit('close')
+
+  assert.equal(rejected, false)
+})
 
 test('uses lightweight /api/health for current backends', async () => {
   const calls: string[][] = []

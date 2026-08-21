@@ -10,6 +10,31 @@ export const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 5_000
 type FetchPublicJson = (url: string, options?: { timeoutMs?: number }) => Promise<unknown>
 type FetchJson = (url: string, token?: string | null, options?: { timeoutMs?: number }) => Promise<unknown>
 
+interface ResponseLifecycle {
+  complete: boolean
+  once(event: 'aborted' | 'close', listener: () => void): unknown
+}
+
+export function attachPrematureResponseGuard(
+  response: ResponseLifecycle,
+  reject: (error: Error) => void,
+  url: string
+): void {
+  let rejected = false
+
+  const rejectIfIncomplete = () => {
+    if (rejected || response.complete) {
+      return
+    }
+
+    rejected = true
+    reject(new Error(`Connection to ${url} closed before the response completed.`))
+  }
+
+  response.once('aborted', rejectIfIncomplete)
+  response.once('close', rejectIfIncomplete)
+}
+
 export interface HermesReadyOptions {
   fetchPublicJson: FetchPublicJson
   fetchJson: FetchJson
