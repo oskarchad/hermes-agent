@@ -6487,6 +6487,44 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _decode_task_skills(value: Any) -> Optional[list[str]]:
+    """Decode the task's persisted forced-skill list without profile lookup."""
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return [str(skill) for skill in parsed if skill]
+
+
+def _implementation_skill_provenance(
+    payload: Any,
+) -> tuple[bool, Optional[list[str]], Optional[str]]:
+    """Read implementation skills from a review event.
+
+    The boolean distinguishes legacy events (no provenance key, so callers
+    preserve the task's current skills) from a recorded ``None`` skillset
+    (which callers must restore as SQL NULL). New payloads fail closed when
+    their provenance field is malformed instead of routing guessed skills.
+    """
+    if not isinstance(payload, dict) or "implementation_skills" not in payload:
+        return False, None, None
+    raw = payload["implementation_skills"]
+    if raw is None:
+        return True, None, None
+    if not isinstance(raw, list):
+        return True, None, "review handoff has malformed skill provenance"
+    skills: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            return True, None, "review handoff has malformed skill provenance"
+        skills.append(value.strip())
+    return True, skills, None
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6503,9 +6541,12 @@ def request_review(
     Unlike :func:`block_task`, this transition never touches block recurrence
     accounting.  The current implementer and resolved reviewer are recorded on
     the event so an autonomous reviewer can route requested changes back to the
-    right profile.  Supplying ``reviewer`` reassigns the task before it is
-    exposed to the review dispatcher.  On re-review, omitting it reuses the
-    reviewer provenance persisted by the latest ``changes_requested`` event.
+    right profile. Supplying a different ``reviewer`` reassigns the task and
+    isolates that review phase from the implementer's forced skills; the exact
+    implementation skillset is stored on the event for repair restoration.
+    Keeping the same profile is the explicit contract for sharing forced skills
+    across implementation and review. On re-review, omitting ``reviewer``
+    reuses the provenance persisted by the latest ``changes_requested`` event.
 
     When the task is ``running`` under a live claim, a caller that supplies no
     ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
@@ -6527,7 +6568,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, skills "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6586,17 +6627,22 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        implementation_skills = _decode_task_skills(trow["skills"])
+        # Task-forced skills are phase-owned. Keeping the same profile is the
+        # explicit shared-skill contract; routing to another profile isolates
+        # review from implementation-only, profile-local skill names. The
+        # original list rides the handoff event for exact repair restoration.
+        cross_profile_review = reviewer is not None and reviewer != implementer
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
-        params: tuple[Any, ...]
+        skills_sql = ", skills = NULL" if cross_profile_review else ""
+        params: list[Any] = []
+        if reviewer is not None:
+            params.append(reviewer)
         if expected_run_id is None:
-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            params.append(task_id)
             run_guard = ""
         else:
-            params = (
-                (reviewer, task_id, int(expected_run_id))
-                if reviewer is not None
-                else (task_id, int(expected_run_id))
-            )
+            params.extend((task_id, int(expected_run_id)))
             run_guard = " AND current_run_id = ?"
         cur = conn.execute(
             """
@@ -6605,11 +6651,11 @@ def request_review(
                    claim_lock    = NULL,
                    claim_expires = NULL,
                    worker_pid    = NULL
-            """ + assignee_sql + """
+            """ + assignee_sql + skills_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
             """ + run_guard,
-            params,
+            tuple(params),
         )
         if cur.rowcount != 1:
             return _ret(
@@ -6635,15 +6681,23 @@ def request_review(
             )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
+        event_payload: dict[str, Any] = {
+            "summary": event_summary or None,
+            "implementer": implementer,
+            "reviewer": reviewer,
+        }
+        if cross_profile_review:
+            event_payload.update(
+                {
+                    "implementation_skills": implementation_skills,
+                    "review_skills": None,
+                }
+            )
         _append_event(
             conn,
             task_id,
             "review_requested",
-            {
-                "summary": event_summary or None,
-                "implementer": implementer,
-                "reviewer": reviewer,
-            },
+            event_payload,
             run_id=run_id,
         )
     return _ret(True)
@@ -6660,9 +6714,11 @@ def request_changes(
 
     The transition is valid only for a run claimed from ``review``.  It closes
     that reviewer run, restores the implementer recorded by the latest
-    ``review_requested`` event, reapplies parent gating, and emits an auditable
-    ``changes_requested`` event.  The second tuple item is the implementer on
-    success or a diagnostic reason on failure.
+    ``review_requested`` event, restores that handoff's implementation skillset,
+    reapplies parent gating, and emits an auditable ``changes_requested`` event.
+    Legacy review events without skill provenance preserve the task's current
+    skills. The second tuple item is the implementer on success or a diagnostic
+    reason on failure.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
@@ -6721,6 +6777,11 @@ def request_changes(
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             return False, "review handoff has no valid implementer provenance"
+        has_skill_provenance, implementation_skills, skill_error = (
+            _implementation_skill_provenance(requested_payload)
+        )
+        if skill_error is not None:
+            return False, skill_error
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)
@@ -6732,6 +6793,15 @@ def request_changes(
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
         # breaker counter (mirrors unblock_task, #35072).
+        skills_sql = ", skills = ?" if has_skill_provenance else ""
+        params: list[Any] = [new_status, implementer]
+        if has_skill_provenance:
+            params.append(
+                json.dumps(implementation_skills)
+                if implementation_skills is not None
+                else None
+            )
+        params.extend((task_id, int(current_run_id)))
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6740,9 +6810,10 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL
+            """ + skills_sql + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            tuple(params),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
@@ -6753,16 +6824,19 @@ def request_changes(
             status=new_status,
             summary=reason,
         )
+        event_payload: dict[str, Any] = {
+            "reason": reason,
+            "implementer": implementer,
+            "reviewer": reviewer,
+            "status": new_status,
+        }
+        if has_skill_provenance:
+            event_payload["implementation_skills"] = implementation_skills
         _append_event(
             conn,
             task_id,
             "changes_requested",
-            {
-                "reason": reason,
-                "implementer": implementer,
-                "reviewer": reviewer,
-                "status": new_status,
-            },
+            event_payload,
             run_id=run_id,
         )
     return True, implementer
@@ -6986,12 +7060,23 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         implementer = handoff.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             implementer = None
-        assignee_sql = ", assignee = ?" if implementer else ""
-        params: tuple[Any, ...] = (
-            (new_status, implementer, task_id)
-            if implementer
-            else (new_status, task_id)
+        has_skill_provenance, implementation_skills, skill_error = (
+            _implementation_skill_provenance(handoff)
         )
+        if skill_error is not None:
+            return False
+        assignee_sql = ", assignee = ?" if implementer else ""
+        skills_sql = ", skills = ?" if has_skill_provenance else ""
+        params: list[Any] = [new_status]
+        if implementer:
+            params.append(implementer)
+        if has_skill_provenance:
+            params.append(
+                json.dumps(implementation_skills)
+                if implementation_skills is not None
+                else None
+            )
+        params.append(task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -6999,14 +7084,17 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
             + assignee_sql
+            + skills_sql
             + " WHERE id = ? AND status = 'review'",
-            params,
+            tuple(params),
         )
         if cur.rowcount != 1:
             return False
         payload: dict[str, Any] = {"status": new_status}
         if implementer:
             payload["implementer"] = implementer
+        if has_skill_provenance:
+            payload["implementation_skills"] = implementation_skills
         _append_event(
             conn,
             task_id,

@@ -463,6 +463,8 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+Task-forced skills are phase-owned during same-card review. If `kanban_request_review` routes the card to a different reviewer profile, Hermes records the exact implementation skillset in the review handoff and removes those flags from the reviewer spawn; the reviewer gets its own profile context plus the bundled `sdlc-review` skill. `kanban_request_changes` restores the implementation flags exactly, and re-review repeats the same stable routing. Omitting the reviewer (or keeping the same profile) explicitly shares the task-forced skills across both phases.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:

@@ -11,6 +11,7 @@ These tests cover the two review models that must coexist:
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -147,6 +148,82 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert completed is not None
     assert completed.status == "done"
     assert completed.block_recurrences == 0
+
+
+def test_legacy_review_event_without_skill_provenance_preserves_current_skills(conn):
+    """Pre-fix in-flight reviews keep their task skills instead of guessing."""
+    implementation_skills = ["repo-context-gate", "test-driven-development"]
+    task_id = kb.create_task(
+        conn,
+        title="Legacy review handoff",
+        assignee="builder",
+        skills=implementation_skills,
+    )
+    implementation = kb.claim_task(conn, task_id, claimer="builder:legacy")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        summary="Ready.",
+        expected_run_id=implementation.current_run_id,
+    )
+    with kb.write_txn(conn):
+        event = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        payload.pop("implementation_skills", None)
+        payload.pop("review_skills", None)
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload), event["id"]),
+        )
+        conn.execute(
+            "UPDATE tasks SET skills = ? WHERE id = ?",
+            (json.dumps(implementation_skills), task_id),
+        )
+
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:legacy")
+    assert review is not None
+    assert kb.request_changes(
+        conn,
+        task_id,
+        reason="Repair it.",
+        expected_run_id=review.current_run_id,
+    ) == (True, "builder")
+    repaired = kb.get_task(conn, task_id)
+    assert repaired is not None
+    assert repaired.skills == implementation_skills
+
+
+def test_request_changes_rejects_malformed_skill_provenance(conn):
+    task_id, review = _claimed_review(conn, "Malformed skill provenance")
+    with kb.write_txn(conn):
+        event = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        payload["implementation_skills"] = {"not": "a list"}
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps(payload), event["id"]),
+        )
+
+    ok, detail = kb.request_changes(
+        conn,
+        task_id,
+        reason="Repair it.",
+        expected_run_id=review.current_run_id,
+    )
+    assert ok is False
+    assert detail == "review handoff has malformed skill provenance"
 
 
 @pytest.mark.parametrize("bad_payload", [None, "{not-json", "{}"])

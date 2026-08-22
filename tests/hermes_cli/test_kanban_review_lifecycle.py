@@ -39,6 +39,25 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+@pytest.fixture
+def disjoint_phase_skill_profiles(kanban_home: Path) -> dict[str, list[str]]:
+    """Patch/Gauge-shaped profiles with intentionally disjoint skill sets."""
+    inventories = {
+        "patch": ["repo-context-gate", "test-driven-development"],
+        "gauge": ["code-change-auditing", "sdlc-review"],
+    }
+    profiles_root = kanban_home / "profiles"
+    for profile, skills in inventories.items():
+        for skill in skills:
+            skill_dir = profiles_root / profile / "skills" / skill
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {skill}\ndescription: Test fixture.\n---\n",
+                encoding="utf-8",
+            )
+    return inventories
+
+
 def _row(conn, tid):
     return conn.execute(
         "SELECT status, block_kind, block_recurrences, current_run_id "
@@ -475,8 +494,11 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
-def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("reviewer", [None, "reviewer"])
+def test_same_profile_review_preserves_task_skills_and_adds_reviewer_skill(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reviewer: str | None,
 ) -> None:
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
@@ -506,6 +528,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             conn,
             task_id,
             summary="ready",
+            reviewer=reviewer,
             expected_run_id=implementation.current_run_id,
         )
         monkeypatch.setattr(
@@ -525,6 +548,116 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
 
     assert task_id in [task[0] for task in result.spawned]
     assert captured == [["domain-specific-review", "sdlc-review"]]
+
+
+def test_cross_profile_review_cycle_routes_only_phase_owned_skill_flags(
+    kanban_home: Path,
+    disjoint_phase_skill_profiles: dict[str, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-profile review must not leak forced skills between phases."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name in {"patch", "gauge"})
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+
+    commands: list[list[str]] = []
+
+    class FakeProc:
+        pid = 98765
+
+    def fake_popen(cmd, **kwargs):
+        commands.append(list(cmd))
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    def skill_flags(command: list[str]) -> list[str]:
+        return [
+            command[index + 1]
+            for index, arg in enumerate(command[:-1])
+            if arg == "--skills"
+        ]
+
+    implementation_skills = disjoint_phase_skill_profiles["patch"]
+    reviewer_inventory = set(disjoint_phase_skill_profiles["gauge"])
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="OAuth implementation",
+            assignee="patch",
+            skills=implementation_skills,
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="patch:implementation")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready for Gauge",
+            reviewer="gauge",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        awaiting_review = kb.get_task(conn, task_id)
+        assert awaiting_review is not None
+        assert awaiting_review.assignee == "gauge"
+        assert awaiting_review.skills is None
+        review_event = _events(conn, task_id, kind="review_requested")[-1][1]
+        assert isinstance(review_event, dict)
+        assert review_event["implementation_skills"] == implementation_skills
+        assert review_event["review_skills"] is None
+
+        first_review_dispatch = kb.dispatch_once(conn)
+        assert task_id in [item[0] for item in first_review_dispatch.spawned]
+        assert skill_flags(commands[-1]) == ["sdlc-review"]
+        assert set(skill_flags(commands[-1])) <= reviewer_inventory
+        assert not (set(skill_flags(commands[-1])) & set(implementation_skills))
+
+        review = kb.get_task(conn, task_id)
+        assert review is not None and review.current_run_id is not None
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Add a regression test.",
+            expected_run_id=review.current_run_id,
+        ) == (True, "patch")
+
+        repair = kb.get_task(conn, task_id)
+        assert repair is not None
+        assert repair.assignee == "patch"
+        assert repair.skills == implementation_skills
+        changes_event = _events(conn, task_id, kind="changes_requested")[-1][1]
+        assert isinstance(changes_event, dict)
+        assert changes_event["implementation_skills"] == implementation_skills
+
+        repair_dispatch = kb.dispatch_once(conn)
+        assert task_id in [item[0] for item in repair_dispatch.spawned]
+        assert skill_flags(commands[-1]) == implementation_skills
+
+        repair_run = kb.get_task(conn, task_id)
+        assert repair_run is not None and repair_run.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="regression added",
+            expected_run_id=repair_run.current_run_id,
+        )
+        awaiting_rereview = kb.get_task(conn, task_id)
+        assert awaiting_rereview is not None
+        assert awaiting_rereview.assignee == "gauge"
+        assert awaiting_rereview.skills is None
+
+        second_review_dispatch = kb.dispatch_once(conn)
+        assert task_id in [item[0] for item in second_review_dispatch.spawned]
+        assert skill_flags(commands[-1]) == ["sdlc-review"]
+
+    assert len(commands) == 3
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(
@@ -606,7 +739,13 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
     goes back to ``ready`` so the dispatcher re-runs the implementer. It must
     NOT touch ``block_recurrences`` (review was never a block)."""
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="reopen me", assignee="worker")
+        implementation_skills = ["repo-context-gate", "test-driven-development"]
+        tid = kb.create_task(
+            conn,
+            title="reopen me",
+            assignee="worker",
+            skills=implementation_skills,
+        )
         kb.claim_task(conn, tid)
         kb.request_review(
             conn, tid, summary="v1", reviewer="reviewer",
@@ -616,6 +755,7 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
         assert reviewing is not None
         assert reviewing.status == "review"
         assert reviewing.assignee == "reviewer"
+        assert reviewing.skills is None
 
         ok = kb.reopen_review_task(conn, tid)
         assert ok is True
@@ -624,6 +764,7 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
         reopened = kb.get_task(conn, tid)
         assert reopened is not None
         assert reopened.assignee == "worker"
+        assert reopened.skills == implementation_skills
         assert row["current_run_id"] is None
         assert (row["block_recurrences"] or 0) == 0
         assert _events(conn, tid, kind="review_reopened")
