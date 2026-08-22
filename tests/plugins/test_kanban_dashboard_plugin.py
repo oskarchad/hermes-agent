@@ -273,6 +273,58 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
         )
 
 
+def test_dashboard_two_step_review_assignment_isolates_and_restores_skills(client):
+    """A parked review reassigned later must become a cross-profile handoff."""
+    implementation_skills = ["repo-context-gate", "test-driven-development"]
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "two-step review",
+            "assignee": "builder",
+            "skills": implementation_skills,
+        },
+    ).json()["task"]
+
+    parked = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "review", "summary": "ready"},
+    )
+    assert parked.status_code == 200, parked.text
+    assert parked.json()["task"]["assignee"] == "builder"
+    assert parked.json()["task"]["skills"] == implementation_skills
+
+    routed = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"assignee": "reviewer"},
+    )
+    assert routed.status_code == 200, routed.text
+    assert routed.json()["task"]["assignee"] == "reviewer"
+    assert routed.json()["task"]["skills"] is None
+
+    with kb.connect() as conn:
+        assigned = [
+            event for event in kb.list_events(conn, task["id"])
+            if event.kind == "assigned"
+        ][-1]
+        assert assigned.payload is not None
+        assert assigned.payload["phase"] == "review"
+        assert assigned.payload["implementer"] == "builder"
+        assert assigned.payload["implementation_skills"] == implementation_skills
+
+        review = kb.claim_review_task(conn, task["id"], claimer="reviewer:1")
+        assert review is not None
+        assert kb.request_changes(
+            conn,
+            task["id"],
+            reason="Add the missing regression.",
+            expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+        repair = kb.get_task(conn, task["id"])
+        assert repair is not None
+        assert repair.assignee == "builder"
+        assert repair.skills == implementation_skills
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 

@@ -150,9 +150,16 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert completed.block_recurrences == 0
 
 
-def test_legacy_review_event_without_skill_provenance_preserves_current_skills(conn):
-    """Pre-fix in-flight reviews keep their task skills instead of guessing."""
+def test_legacy_review_recovery_restores_creation_skill_provenance(conn):
+    """A pre-fix review recovers implementation skills from task creation.
+
+    Production-shaped legacy handoffs have no ``implementation_skills`` on
+    ``review_requested`` and an operator may already have replaced the task's
+    current skills with reviewer-only recovery skills. The durable ``created``
+    event remains the source for the original implementation flags.
+    """
     implementation_skills = ["repo-context-gate", "test-driven-development"]
+    reviewer_skills = ["code-change-auditing"]
     task_id = kb.create_task(
         conn,
         title="Legacy review handoff",
@@ -184,7 +191,7 @@ def test_legacy_review_event_without_skill_provenance_preserves_current_skills(c
         )
         conn.execute(
             "UPDATE tasks SET skills = ? WHERE id = ?",
-            (json.dumps(implementation_skills), task_id),
+            (json.dumps(reviewer_skills), task_id),
         )
 
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:legacy")
@@ -198,6 +205,43 @@ def test_legacy_review_event_without_skill_provenance_preserves_current_skills(c
     repaired = kb.get_task(conn, task_id)
     assert repaired is not None
     assert repaired.skills == implementation_skills
+
+
+def test_truly_old_review_without_any_skill_provenance_preserves_current_skills(conn):
+    """Rows predating ``created.skills`` keep the compatibility fallback."""
+    current_skills = ["legacy-shared-review-skill"]
+    task_id = kb.create_task(
+        conn,
+        title="Truly old review handoff",
+        assignee="builder",
+        skills=current_skills,
+    )
+    implementation = kb.claim_task(conn, task_id, claimer="builder:old")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary="Ready.",
+        expected_run_id=implementation.current_run_id,
+    )
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET payload = json_remove(payload, '$.skills') "
+            "WHERE task_id = ? AND kind = 'created'",
+            (task_id,),
+        )
+
+    review = kb.claim_review_task(conn, task_id, claimer="builder:old-review")
+    assert review is not None
+    assert kb.request_changes(
+        conn,
+        task_id,
+        reason="Repair it.",
+        expected_run_id=review.current_run_id,
+    ) == (True, "builder")
+    repaired = kb.get_task(conn, task_id)
+    assert repaired is not None
+    assert repaired.skills == current_skills
 
 
 def test_request_changes_rejects_malformed_skill_provenance(conn):
