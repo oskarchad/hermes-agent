@@ -840,6 +840,71 @@ def test_reopen_review_rejects_malformed_skills_without_reclaiming_dangling_run(
         assert _events(conn, tid, kind="review_reopened") == []
 
 
+def test_reopen_review_rejects_phase_skills_without_implementer_atomically(
+    kanban_home: Path,
+) -> None:
+    """Cross-profile phase skills must never route to an unknown implementer."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="missing implementer reopen",
+            assignee="builder",
+            skills=["implementation-only"],
+        )
+        implementation = kb.claim_task(conn, tid, claimer="builder:1")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            reviewer="gauge",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid, claimer="gauge:1")
+        assert review is not None
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
+            event = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            payload = json.loads(event["payload"])
+            assert payload["implementation_skills"] == ["implementation-only"]
+            payload.pop("implementer")
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), event["id"]),
+            )
+
+        task_before = conn.execute(
+            "SELECT status, assignee, skills, current_run_id, claim_lock, "
+            "claim_expires, worker_pid FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        run_before = conn.execute(
+            "SELECT status, outcome, ended_at, claim_lock, claim_expires, worker_pid "
+            "FROM task_runs WHERE id = ?",
+            (review.current_run_id,),
+        ).fetchone()
+
+        assert kb.reopen_review_task(conn, tid) is False
+
+        task_after = conn.execute(
+            "SELECT status, assignee, skills, current_run_id, claim_lock, "
+            "claim_expires, worker_pid FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        run_after = conn.execute(
+            "SELECT status, outcome, ended_at, claim_lock, claim_expires, worker_pid "
+            "FROM task_runs WHERE id = ?",
+            (review.current_run_id,),
+        ).fetchone()
+        assert dict(task_after) == dict(task_before)
+        assert dict(run_after) == dict(run_before)
+        assert _events(conn, tid, kind="review_reopened") == []
+
+
 def test_review_cycle_end_to_end(kanban_home: Path) -> None:
     """Full loop: run -> review -> follow-up reopen -> re-run -> review ->
     approve -> done. Never blocks, never triages, and stays wake-subscribed

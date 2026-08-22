@@ -69,6 +69,34 @@ def _claimed_review(
     return task_id, review
 
 
+def _claimed_same_profile_review_with_skills(
+    conn,
+    title: str,
+    *,
+    parents: list[str] | None = None,
+):
+    implementation_skills = ["repo-context-gate", "implementation-only"]
+    task_id = kb.create_task(
+        conn,
+        title=title,
+        assignee="builder",
+        skills=implementation_skills,
+        parents=parents or (),
+    )
+    implementation = kb.claim_task(conn, task_id, claimer="builder:implementation")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary="ready for same-profile review",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="builder:review")
+    assert review is not None
+    assert review.skills == implementation_skills
+    return task_id, review, implementation_skills
+
+
 def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
     task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
@@ -537,6 +565,42 @@ def test_review_escalation_unblocks_back_to_review(conn) -> None:
     assert resumed.status == "review"
 
 
+def test_blocked_review_reassignment_isolates_skills_before_unblock(conn) -> None:
+    task_id, review, implementation_skills = _claimed_same_profile_review_with_skills(
+        conn,
+        "Blocked review reassignment",
+    )
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="needs_input: route to an independent reviewer",
+        kind="needs_input",
+        expected_run_id=review.current_run_id,
+    )
+
+    assert kb.assign_task(conn, task_id, "gauge")
+    parked = kb.get_task(conn, task_id)
+    assert parked is not None
+    assert parked.status == "blocked"
+    assert parked.assignee == "gauge"
+    assert parked.skills is None
+    assigned = _event(kb.list_events(conn, task_id), "assigned")
+    assert assigned.payload == {
+        "assignee": "gauge",
+        "phase": "review",
+        "implementer": "builder",
+        "reviewer": "gauge",
+        "implementation_skills": implementation_skills,
+    }
+
+    assert kb.unblock_task(conn, task_id)
+    resumed = kb.get_task(conn, task_id)
+    assert resumed is not None
+    assert resumed.status == "review"
+    assert resumed.assignee == "gauge"
+    assert resumed.skills is None
+
+
 def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> None:
     parent_id = kb.create_task(conn, title="Parent", assignee="planner")
     assert kb.complete_task(conn, parent_id)
@@ -573,6 +637,76 @@ def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> N
     resumed = kb.get_task(conn, task_id)
     assert resumed is not None
     assert resumed.status == "review"
+
+
+def test_dependency_wait_review_reassignment_isolates_skills_through_recompute(
+    conn,
+) -> None:
+    parent_id = kb.create_task(conn, title="Parent refresh", assignee="planner")
+    assert kb.complete_task(conn, parent_id)
+    task_id, review, implementation_skills = _claimed_same_profile_review_with_skills(
+        conn,
+        "Dependency-wait review reassignment",
+        parents=[parent_id],
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (parent_id,))
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="dependency: parent contract is being refreshed",
+        kind="dependency",
+        expected_run_id=review.current_run_id,
+    )
+
+    assert kb.assign_task(conn, task_id, "gauge")
+    waiting = kb.get_task(conn, task_id)
+    assert waiting is not None
+    assert waiting.status == "todo"
+    assert waiting.assignee == "gauge"
+    assert waiting.skills is None
+    assigned = _event(kb.list_events(conn, task_id), "assigned")
+    assert assigned.payload is not None
+    assert assigned.payload["phase"] == "review"
+    assert assigned.payload["implementation_skills"] == implementation_skills
+
+    assert kb.complete_task(conn, parent_id)
+    resumed = kb.get_task(conn, task_id)
+    assert resumed is not None
+    assert resumed.status == "review"
+    assert resumed.assignee == "gauge"
+    assert resumed.skills is None
+
+
+def test_scheduled_review_reassignment_isolates_skills_and_resumes_review(conn) -> None:
+    task_id, review, implementation_skills = _claimed_same_profile_review_with_skills(
+        conn,
+        "Scheduled review reassignment",
+    )
+    assert kb.schedule_task(
+        conn,
+        task_id,
+        reason="wait for a maintenance window",
+        expected_run_id=review.current_run_id,
+    )
+
+    assert kb.assign_task(conn, task_id, "gauge")
+    scheduled = kb.get_task(conn, task_id)
+    assert scheduled is not None
+    assert scheduled.status == "scheduled"
+    assert scheduled.assignee == "gauge"
+    assert scheduled.skills is None
+    assigned = _event(kb.list_events(conn, task_id), "assigned")
+    assert assigned.payload is not None
+    assert assigned.payload["phase"] == "review"
+    assert assigned.payload["implementation_skills"] == implementation_skills
+
+    assert kb.unblock_task(conn, task_id)
+    resumed = kb.get_task(conn, task_id)
+    assert resumed is not None
+    assert resumed.status == "review"
+    assert resumed.assignee == "gauge"
+    assert resumed.skills is None
 
 
 def test_crashed_and_timed_out_review_runs_retry_in_review_phase(

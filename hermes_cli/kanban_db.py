@@ -3722,7 +3722,11 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         assignment_payload: dict[str, Any] = {"assignee": profile}
         phase_skills_changed = False
-        if row["assignee"] != profile and row["status"] == "review":
+        review_phase = row["status"] == "review" or (
+            row["status"] in {"blocked", "todo", "scheduled"}
+            and _resume_status_from_events(conn, task_id) == "review"
+        )
+        if row["assignee"] != profile and review_phase:
             review_event = conn.execute(
                 "SELECT id, payload FROM task_events "
                 "WHERE task_id = ? AND kind = 'review_requested' "
@@ -4562,7 +4566,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+        "'scheduled', 'unblocked', 'changes_requested', 'review_reopened', "
+        "'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
@@ -7118,7 +7123,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if current and current["status"] == "blocked"
+            if current and current["status"] in {"blocked", "scheduled"}
             else "ready"
         )
         _reclaim_dangling_run(
@@ -7192,9 +7197,13 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             )
         except (json.JSONDecodeError, TypeError):
             handoff = {}
+        if not isinstance(handoff, dict):
+            handoff = {}
         implementer = handoff.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             implementer = None
+        else:
+            implementer = _canonical_assignee(implementer)
         has_skill_provenance, implementation_skills, skill_error = (
             _resolved_implementation_skill_provenance(
                 conn,
@@ -7204,6 +7213,12 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             )
         )
         if skill_error is not None:
+            return False
+        if has_skill_provenance and implementer is None:
+            # A phase-owned skillset without implementer provenance cannot be
+            # routed safely: leaving the reviewer assigned would recreate the
+            # cross-profile unavailable-skill crash. Truly old handoffs with
+            # no skill provenance retain the historical compatibility path.
             return False
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
@@ -8158,6 +8173,19 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
+        source_status = (
+            _retry_status_for_run(conn, task_id)
+            if current["status"] == "running"
+            else _resume_status_from_events(conn, task_id)
+            if current["status"] in {"blocked", "todo"}
+            else "ready"
+        )
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -8185,7 +8213,10 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        event_payload = {"reason": reason}
+        if source_status != "ready":
+            event_payload["source_status"] = source_status
+        _append_event(conn, task_id, "scheduled", event_payload, run_id=run_id)
         return True
 
 
