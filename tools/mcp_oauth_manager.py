@@ -156,6 +156,17 @@ def _make_hermes_provider_class() -> Optional[type]:
                 request.headers["User-Agent"] = ua
             return request
 
+        async def _perform_authorization(self):
+            """Redact callback state before the SDK logs a mismatch failure."""
+            from mcp.client.auth import OAuthFlowError
+
+            try:
+                return await super()._perform_authorization()
+            except OAuthFlowError as exc:
+                if str(exc).startswith("State parameter mismatch:"):
+                    raise OAuthFlowError("OAuth state parameter mismatch") from None
+                raise
+
         def _coerce_client_secret_post(self) -> None:
             """Use client_secret_post when dynamic registration returned a secret.
 

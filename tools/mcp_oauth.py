@@ -765,6 +765,40 @@ def _authorization_code_result(code: str, state: "str | None", iss: "str | None"
     return AuthorizationCodeResult(code=code, state=state, iss=iss)
 
 
+def _try_set_callback_result(
+    result: dict[str, Any],
+    *,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    iss: str | None = None,
+) -> bool:
+    """Atomically latch the first terminal callback result."""
+    if code is None and error is None:
+        return False
+
+    lock = result.get("_lock")
+    if lock is None:
+        if result.get("auth_code") is not None or result.get("error") is not None:
+            return False
+        result.update(auth_code=code, state=state, error=error, iss=iss)
+        return True
+
+    with lock:
+        if result.get("auth_code") is not None or result.get("error") is not None:
+            return False
+        result.update(auth_code=code, state=state, error=error, iss=iss)
+        return True
+
+
+def _callback_result_is_terminal(result: dict[str, Any]) -> bool:
+    lock = result.get("_lock")
+    if lock is None:
+        return result.get("auth_code") is not None or result.get("error") is not None
+    with lock:
+        return result.get("auth_code") is not None or result.get("error") is not None
+
+
 def _make_callback_handler() -> tuple[type, dict]:
     """Create a per-flow callback HTTP handler class with its own result dict.
 
@@ -775,6 +809,7 @@ def _make_callback_handler() -> tuple[type, dict]:
     """
     result: dict[str, Any] = {
         "auth_code": None, "state": None, "error": None, "iss": None,
+        "_lock": threading.Lock(),
     }
 
     class _Handler(BaseHTTPRequestHandler):
@@ -797,10 +832,12 @@ def _make_callback_handler() -> tuple[type, dict]:
             # here would break login against those providers.
             iss = params.get("iss", [None])[0]
 
-            result["auth_code"] = code
-            result["state"] = state
-            result["error"] = error
-            result["iss"] = iss
+            # Browsers commonly follow the callback with /favicon.ico. Only a
+            # real terminal response may win, and the first code/error stays
+            # latched so a later request cannot erase or replace it.
+            _try_set_callback_result(
+                result, code=code, state=state, error=error, iss=iss
+            )
 
             body = (
                 "<html><body><h2>Authorization Successful</h2>"
@@ -1079,7 +1116,7 @@ def _make_callback_waiter(
         elapsed = 0.0
         try:
             while elapsed < timeout:
-                if result["auth_code"] is not None or result["error"] is not None:
+                if _callback_result_is_terminal(result):
                     break
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
@@ -1142,18 +1179,13 @@ def _paste_callback_reader(result: dict) -> None:
     if not line:
         return
 
-    # Skip if HTTP listener already won.
-    if result.get("auth_code") is not None or result.get("error") is not None:
-        return
-
     # Skip token: user explicitly opted out of authorization. Mark the
     # result with a sentinel error string that _wait_for_callback maps
     # to OAuthNonInteractiveError (already handled by mcp_tool.py as a
     # non-fatal "skip this server and continue startup" path).
     if line.lower() in _SKIP_TOKENS:
-        if result.get("auth_code") is not None or result.get("error") is not None:
+        if not _try_set_callback_result(result, error=_USER_SKIPPED_SENTINEL):
             return
-        result["error"] = _USER_SKIPPED_SENTINEL
         print(
             "  OAuth skipped. Run `hermes mcp login <server>` later to "
             "authenticate, or set ``enabled: false`` on that server in "
@@ -1191,14 +1223,10 @@ def _paste_callback_reader(result: dict) -> None:
         )
         return
 
-    # One more race-check before writing.
-    if result.get("auth_code") is not None or result.get("error") is not None:
+    if not _try_set_callback_result(
+        result, code=code, state=state, error=error, iss=iss
+    ):
         return
-
-    result["auth_code"] = code
-    result["state"] = state
-    result["error"] = error
-    result["iss"] = iss
     if code:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 
@@ -1242,6 +1270,17 @@ def _get_hermes_oauth_provider_class() -> type | None:
             if ua:
                 request.headers["User-Agent"] = ua
             return request
+
+        async def _perform_authorization(self):
+            """Redact callback state before the SDK logs a mismatch failure."""
+            from mcp.client.auth import OAuthFlowError
+
+            try:
+                return await super()._perform_authorization()
+            except OAuthFlowError as exc:
+                if str(exc).startswith("State parameter mismatch:"):
+                    raise OAuthFlowError("OAuth state parameter mismatch") from None
+                raise
 
         def _coerce_client_secret_post(self) -> None:
             info = getattr(self.context, "client_info", None)

@@ -22,6 +22,11 @@ def _send_callback_when_ready(url: str) -> None:
     raise AssertionError(f"callback listener never became ready: {url}")
 
 
+def _send_callback_then_secondary_get(callback_url: str, secondary_url: str) -> None:
+    _send_callback_when_ready(callback_url)
+    urllib.request.urlopen(secondary_url, timeout=1).close()
+
+
 def _assert_port_released(port: int) -> None:
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -130,6 +135,36 @@ async def test_forced_headless_loopback_callback_completes_without_paste(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_loopback_callback_result_survives_secondary_get(monkeypatch):
+    """A browser follow-up request must not erase the terminal callback result."""
+    import tools.mcp_oauth as oauth
+
+    stdin = MagicMock()
+    stdin.isatty.return_value = False
+    monkeypatch.setattr(oauth.sys, "stdin", stdin)
+    port = oauth._find_free_port()
+    callback = (
+        f"http://127.0.0.1:{port}/callback"
+        "?code=fake-latched-code&state=fake-latched-state"
+    )
+    secondary = f"http://127.0.0.1:{port}/favicon.ico"
+
+    with oauth.force_interactive_oauth():
+        sender = threading.Thread(
+            target=_send_callback_then_secondary_get,
+            args=(callback, secondary),
+            daemon=True,
+        )
+        sender.start()
+        result = await oauth._make_callback_waiter(port, timeout=1.0)()
+        sender.join(timeout=5)
+
+    assert not sender.is_alive()
+    assert _callback_pair(result) == ("fake-latched-code", "fake-latched-state")
+    _assert_port_released(port)
+
+
+@pytest.mark.asyncio
 async def test_loopback_callback_does_not_log_code_or_state(monkeypatch, caplog):
     """HTTP request logging must not expose OAuth callback credentials."""
     import tools.mcp_oauth as oauth
@@ -159,6 +194,63 @@ async def test_loopback_callback_does_not_log_code_or_state(monkeypatch, caplog)
     assert code not in caplog.text
     assert state not in caplog.text
     _assert_port_released(port)
+
+
+@pytest.mark.asyncio
+async def test_state_mismatch_is_redacted_before_sdk_and_application_logs(
+    monkeypatch, caplog
+):
+    """A mismatched callback must not expose either OAuth state in any logger."""
+    from mcp.client.auth import OAuthFlowError
+
+    import tools.mcp_oauth as oauth
+    import tools.mcp_oauth_manager as oauth_manager
+
+    provider_classes = [
+        provider_class
+        for provider_class in (
+            oauth._get_hermes_oauth_provider_class(),
+            oauth_manager._HERMES_PROVIDER_CLS,
+        )
+        if provider_class is not None
+    ]
+    assert len(provider_classes) == 2
+    upstream_provider = provider_classes[0].__bases__[0]
+    received_state = "fake-received-secret-state"
+    expected_state = "fake-expected-secret-state"
+
+    async def raise_state_mismatch(_self):
+        raise OAuthFlowError(
+            f"State parameter mismatch: {received_state} != {expected_state}"
+        )
+
+    monkeypatch.setattr(
+        upstream_provider,
+        "_perform_authorization",
+        raise_state_mismatch,
+    )
+    with caplog.at_level(logging.DEBUG):
+        caught_errors = []
+        for provider_class in provider_classes:
+            provider = object.__new__(provider_class)
+            with pytest.raises(OAuthFlowError) as caught:
+                await provider._perform_authorization()
+            caught_errors.append(caught.value)
+
+            try:
+                raise caught.value
+            except OAuthFlowError:
+                logging.getLogger("mcp.client.auth.oauth2").exception("OAuth flow error")
+            logging.getLogger("tools.mcp_tool").warning(
+                "MCP initial authentication failed: %s", caught.value
+            )
+
+    assert [str(error) for error in caught_errors] == [
+        "OAuth state parameter mismatch",
+        "OAuth state parameter mismatch",
+    ]
+    assert received_state not in caplog.text
+    assert expected_state not in caplog.text
 
 
 @pytest.mark.asyncio
