@@ -165,10 +165,11 @@ _oauth_interactive_enabled: "contextvars.ContextVar[bool]" = contextvars.Context
 )
 
 # Forces _is_interactive() past the stdin-TTY check for flows driven from a
-# GUI (dashboard/desktop REST): the browser + localhost callback server do all
-# the work there, and the stdin paste fallback degrades harmlessly (EOF is
-# swallowed by _paste_callback_reader). Suppression still wins — background
-# discovery must never start a browser flow.
+# GUI (dashboard/desktop REST) or an explicit ``hermes mcp login`` command:
+# the browser + localhost callback server do all the work there. This permits
+# the authorization flow; it does NOT make stdin a usable paste channel (see
+# _paste_callback_available). Suppression still wins — background discovery
+# must never start a browser flow.
 _oauth_interactive_forced: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "_oauth_interactive_forced", default=False
 )
@@ -328,6 +329,24 @@ def _is_interactive() -> bool:
         return False
     if _oauth_interactive_forced.get():
         return True
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _paste_callback_available() -> bool:
+    """Return True only when stdin itself can accept paste-back input.
+
+    ``force_interactive_oauth`` means a user explicitly authorized a browser
+    flow even though the process may have pipe/FIFO stdin (desktop, TUI, or a
+    background terminal). Treating that override as proof of a readable TTY
+    starts a competing ``readline()`` which immediately sees EOF and can race
+    the launcher's own stdin lifecycle. Keep the loopback listener available
+    in those flows, but offer paste-back only for a real terminal stdin.
+    """
+    if not _oauth_interactive_enabled.get():
+        return False
     try:
         return sys.stdin.isatty()
     except (AttributeError, ValueError):
@@ -1010,7 +1029,18 @@ def _make_callback_waiter(
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        # Keep accepting until the async waiter has a terminal result. A
+        # one-shot ``handle_request`` thread can stay blocked in accept/select
+        # after paste, skip, EOF-driven cancellation, or timeout wins; merely
+        # closing the server socket from another thread does not synchronously
+        # reap that waiter and the callback port can still be owned when the
+        # surrounding MCP transport retries. ``serve_forever`` + ``shutdown``
+        # gives this listener an explicit, joinable lifecycle.
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+        )
         server_thread.start()
 
         # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -1018,7 +1048,7 @@ def _make_callback_waiter(
         # result dict. The HTTP listener and this thread race for the result;
         # whichever fills it first wins.
         paste_thread: threading.Thread | None = None
-        if _is_interactive():
+        if _paste_callback_available():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
                 "portion) and press Enter. Type ``skip`` + Enter to continue "
@@ -1040,7 +1070,9 @@ def _make_callback_waiter(
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
+            server.shutdown()
             server.server_close()
+            server_thread.join()
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
