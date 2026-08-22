@@ -66,6 +66,8 @@ logger = logging.getLogger(__name__)
 
 _CALLBACK_REQUEST_TIMEOUT_SECONDS = 0.5
 _CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
+_PASTE_READER_POLL_INTERVAL_SECONDS = 0.05
+_PASTE_READER_JOIN_TIMEOUT_SECONDS = 1.0
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- MCP SDK with OAuth support is optional
@@ -1099,6 +1101,7 @@ def _make_callback_waiter(
         # result dict. The HTTP listener and this thread race for the result;
         # whichever fills it first wins.
         paste_thread: threading.Thread | None = None
+        paste_stop = threading.Event()
         if _paste_callback_available():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
@@ -1108,7 +1111,10 @@ def _make_callback_waiter(
                 flush=True,
             )
             paste_thread = threading.Thread(
-                target=_paste_callback_reader, args=(result,), daemon=True
+                target=_paste_callback_reader,
+                args=(result, paste_stop),
+                name=f"mcp-oauth-paste-{port}",
+                daemon=True,
             )
             paste_thread.start()
 
@@ -1121,6 +1127,11 @@ def _make_callback_waiter(
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
+            paste_stop.set()
+            if paste_thread is not None:
+                paste_thread.join(timeout=_PASTE_READER_JOIN_TIMEOUT_SECONDS)
+                if paste_thread.is_alive():
+                    logger.warning("OAuth paste reader did not stop promptly")
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS)
@@ -1154,7 +1165,83 @@ def _make_callback_waiter(
     return _wait
 
 
-def _paste_callback_reader(result: dict) -> None:
+def _read_windows_paste_line(stop_event: threading.Event) -> str | None:
+    """Poll a Windows console for one line without an uncancellable read."""
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:  # pragma: no cover - only reachable on Windows
+        return None
+    msvcrt: Any = _msvcrt
+
+    chars: list[str] = []
+    while not stop_event.wait(_PASTE_READER_POLL_INTERVAL_SECONDS):
+        while msvcrt.kbhit():
+            if stop_event.is_set():
+                return None
+            char = msvcrt.getwch()
+            if char in {"\r", "\n"}:
+                return "".join(chars) + "\n"
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == "\x1a":
+                return ""
+            if char in {"\x00", "\xe0"}:
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
+            if char == "\b":
+                if chars:
+                    chars.pop()
+                continue
+            chars.append(char)
+    return None
+
+
+def _read_paste_line(stop_event: threading.Event) -> str | None:
+    """Wait for one TTY line while remaining responsive to cancellation."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        return _read_windows_paste_line(stop_event)
+
+    try:
+        import select
+
+        stdin_fd = sys.stdin.fileno()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+    line = bytearray()
+    while not stop_event.is_set():
+        try:
+            readable, _, _ = select.select(
+                [stdin_fd], [], [], _PASTE_READER_POLL_INTERVAL_SECONDS
+            )
+        except (OSError, TypeError, ValueError):
+            return None
+        if stop_event.is_set():
+            return None
+        if readable:
+            # Read one byte at a time instead of entering TextIOWrapper.readline:
+            # on a raw or otherwise unusual TTY, readiness may mean only one
+            # character is available, and readline would become uncancellable
+            # again while waiting for the newline.
+            try:
+                char = os.read(stdin_fd, 1)
+            except OSError:
+                return None
+            if not char:
+                return ""
+            line.extend(char)
+            if char in {b"\r", b"\n"}:
+                return line.decode(
+                    getattr(sys.stdin, "encoding", None) or "utf-8",
+                    errors="replace",
+                )
+    return None
+
+
+def _paste_callback_reader(
+    result: dict, stop_event: threading.Event | None = None
+) -> None:
     """Read one line from stdin, parse it as an OAuth redirect, write to result.
 
     Accepts any of:
@@ -1170,7 +1257,11 @@ def _paste_callback_reader(result: dict) -> None:
     fallback alongside the HTTP listener, which remains the primary path.
     """
     try:
-        line = sys.stdin.readline()
+        line = (
+            sys.stdin.readline()
+            if stop_event is None
+            else _read_paste_line(stop_event)
+        )
     except (KeyboardInterrupt, OSError, ValueError):
         return
     if not line:

@@ -253,23 +253,81 @@ async def test_state_mismatch_is_redacted_before_sdk_and_application_logs(
     assert expected_state not in caplog.text
 
 
+@pytest.mark.linux_only
 @pytest.mark.asyncio
 async def test_tty_paste_callback_completes_and_releases_listener(monkeypatch):
     """Usable paste-back remains supported and closes its loopback listener."""
+    import os
+    import pty
+
     import tools.mcp_oauth as oauth
 
-    stdin = MagicMock()
-    stdin.isatty.return_value = True
-    stdin.readline.return_value = (
-        "https://mcp.example.test/callback"
-        "?code=fake-paste-code&state=fake-paste-state\n"
-    )
+    master_fd, slave_fd = pty.openpty()
+    stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
     port = oauth._find_free_port()
 
-    result = await oauth._make_callback_waiter(port, timeout=5.0)()
+    try:
+        os.write(
+            master_fd,
+            b"https://mcp.example.test/callback"
+            b"?code=fake-paste-code&state=fake-paste-state\n",
+        )
+        result = await oauth._make_callback_waiter(port, timeout=5.0)()
+    finally:
+        stdin.close()
+        os.close(master_fd)
+        os.close(slave_fd)
 
     assert _callback_pair(result) == ("fake-paste-code", "fake-paste-state")
+    _assert_port_released(port)
+
+
+@pytest.mark.linux_only
+@pytest.mark.asyncio
+async def test_loopback_callback_stops_tty_reader_before_next_flow_input(monkeypatch):
+    """Loopback completion must leave later TTY input for the next flow."""
+    import os
+    import pty
+    import select
+
+    import tools.mcp_oauth as oauth
+
+    master_fd, slave_fd = pty.openpty()
+    stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
+    monkeypatch.setattr(oauth.sys, "stdin", stdin)
+    port = oauth._find_free_port()
+    callback = (
+        f"http://127.0.0.1:{port}/callback"
+        "?code=fake-loopback-code&state=fake-loopback-state"
+    )
+
+    try:
+        sender = threading.Thread(
+            target=_send_callback_when_ready,
+            args=(callback,),
+            daemon=True,
+        )
+        sender.start()
+        result = await oauth._make_callback_waiter(port, timeout=5.0)()
+        sender.join(timeout=5)
+
+        assert not sender.is_alive()
+        assert _callback_pair(result) == (
+            "fake-loopback-code",
+            "fake-loopback-state",
+        )
+
+        os.write(master_fd, b"next-flow-input\n")
+        await asyncio.sleep(0.1)
+        readable, _, _ = select.select([stdin], [], [], 1.0)
+        assert readable, "the completed OAuth flow consumed the next flow's TTY input"
+        assert stdin.readline() == "next-flow-input\n"
+    finally:
+        stdin.close()
+        os.close(master_fd)
+        os.close(slave_fd)
+
     _assert_port_released(port)
 
 
@@ -283,6 +341,11 @@ async def test_tty_skip_or_cancel_releases_listener(monkeypatch, decision):
     stdin.isatty.return_value = True
     stdin.readline.return_value = decision + "\n"
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
+    monkeypatch.setattr(
+        oauth,
+        "_read_paste_line",
+        lambda _stop: stdin.readline(),
+    )
     port = oauth._find_free_port()
 
     with pytest.raises(oauth.OAuthNonInteractiveError, match="user_skipped"):

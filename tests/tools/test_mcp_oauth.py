@@ -1027,9 +1027,11 @@ class TestWaitForCallbackSkipIntegration:
         mod._oauth_port = _find_free_port()
         monkeypatch.setattr(mod, "_is_interactive", lambda: True)
         monkeypatch.setattr("sys.stdin", MagicMock(readline=lambda: "skip\n"))
+        monkeypatch.setattr(mod, "_read_paste_line", lambda _stop: "skip\n")
 
         async def instant_sleep(_):
             pass
+
         with patch.object(mod.asyncio, "sleep", instant_sleep):
             with pytest.raises(OAuthNonInteractiveError, match="user_skipped"):
                 asyncio.run(_wait_for_callback())
