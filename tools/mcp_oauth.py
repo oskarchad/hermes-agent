@@ -56,13 +56,16 @@ import threading
 import time
 import webbrowser
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
+
+_CALLBACK_REQUEST_TIMEOUT_SECONDS = 0.5
+_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- MCP SDK with OAuth support is optional
@@ -775,6 +778,13 @@ def _make_callback_handler() -> tuple[type, dict]:
     }
 
     class _Handler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            # A browser/probe can connect and then never finish its request.
+            # Bound reads so that accepted callback connections cannot retain
+            # handler resources indefinitely after the listener shuts down.
+            self.request.settimeout(_CALLBACK_REQUEST_TIMEOUT_SECONDS)
+            super().setup()
+
         def do_GET(self) -> None:  # noqa: N802
             params = parse_qs(urlparse(self.path).query)
             code = params.get("code", [None])[0]
@@ -805,7 +815,10 @@ def _make_callback_handler() -> tuple[type, dict]:
             self.wfile.write(body.encode())
 
         def log_message(self, fmt: str, *args: Any) -> None:
-            logger.debug("OAuth callback: %s", fmt % args)
+            # BaseHTTPRequestHandler includes the full request target in its
+            # default message. OAuth callback targets contain the code and
+            # state, so never forward the formatted request line to logs.
+            logger.debug("OAuth callback HTTP request handled")
 
     return _Handler, result
 
@@ -1003,7 +1016,7 @@ def _make_callback_waiter(
         # TIME_WAIT socket from a previous flow cannot block the next one
         # (#44590).
         try:
-            server = HTTPServer(
+            server = ThreadingHTTPServer(
                 ("127.0.0.1", port), handler_cls, bind_and_activate=False
             )
             reserved = _reserved_sockets.pop(port, None)
@@ -1034,8 +1047,9 @@ def _make_callback_waiter(
         # after paste, skip, EOF-driven cancellation, or timeout wins; merely
         # closing the server socket from another thread does not synchronously
         # reap that waiter and the callback port can still be owned when the
-        # surrounding MCP transport retries. ``serve_forever`` + ``shutdown``
-        # gives this listener an explicit, joinable lifecycle.
+        # surrounding MCP transport retries. The threaded server also keeps
+        # ``serve_forever`` responsive when a client connects but never sends a
+        # complete request; each bounded handler runs independently.
         server_thread = threading.Thread(
             target=server.serve_forever,
             kwargs={"poll_interval": 0.1},
@@ -1072,7 +1086,9 @@ def _make_callback_waiter(
         finally:
             server.shutdown()
             server.server_close()
-            server_thread.join()
+            server_thread.join(timeout=_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS)
+            if server_thread.is_alive():
+                logger.warning("OAuth callback listener did not stop promptly")
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
