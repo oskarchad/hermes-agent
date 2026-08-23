@@ -418,6 +418,11 @@ const normalizeSubagentStatus = (status: unknown, fallback: SubagentStatus): Sub
 export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev: GatewayEvent) => void {
   syncThemeToTerminalBackground()
 
+  // Survives gateway reconnects for the life of this UI handler. Captain
+  // retries intentionally reuse the event-derived receipt id, so a server
+  // crash between external emission and DB ack cannot paint the report twice.
+  const statusReceiptIds = new Set<string>()
+
   const { rpc } = ctx.gateway
   const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
   const { bellOnComplete, stdout, sys } = ctx.system
@@ -828,6 +833,22 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (!p?.text) {
           return
+        }
+
+        if (p.id) {
+          if (statusReceiptIds.has(p.id)) {
+            return
+          }
+
+          if (statusReceiptIds.size >= 1024) {
+            const oldest = statusReceiptIds.values().next().value
+
+            if (oldest) {
+              statusReceiptIds.delete(oldest)
+            }
+          }
+
+          statusReceiptIds.add(p.id)
         }
 
         if (p.kind === 'goal') {

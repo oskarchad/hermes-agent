@@ -965,6 +965,34 @@ def test_create_registers_captain_owner_without_notify_sub_when_unattached(
         conn.close()
 
 
+def test_create_reports_atomic_captain_registration(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({"title": "atomic captain", "assignee": "peer"})
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["captain_registered"] is True
+
+
+def test_create_registration_failure_rolls_back_instead_of_silent_success(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    def fail_registration(*_args, **_kwargs):
+        raise RuntimeError("captain registry unavailable")
+
+    monkeypatch.setattr(kb, "register_captain_owner", fail_registration)
+    out = kt._handle_create({"title": "must rollback", "assignee": "peer"})
+    payload = json.loads(out)
+    assert "captain registry unavailable" in payload["error"]
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'must rollback'"
+        ).fetchone()[0] == 0
+
+
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery

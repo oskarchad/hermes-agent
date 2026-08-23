@@ -617,7 +617,7 @@ export type GatewayEvent =
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
-  | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
+  | { payload?: { id?: string; kind?: string; text?: string }; session_id?: string; type: 'status.update' }
   | {
       payload?: {
         id?: string

@@ -67,6 +67,25 @@ describe('createGatewayEventHandler', () => {
     patchUiState({ showReasoning: true })
   })
 
+  it('deduplicates replayed process receipts by stable id across intervening status', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
+      payload: { id: 'kanban:board:42', kind: 'process', text: 'Task finished' },
+      type: 'status.update'
+    } as any)
+    onEvent({
+      payload: { kind: 'process', text: 'Unrelated process status' },
+      type: 'status.update'
+    } as any)
+    onEvent({
+      payload: { id: 'kanban:board:42', kind: 'process', text: 'Task finished' },
+      type: 'status.update'
+    } as any)
+
+    expect(getTurnState().activity.filter(item => item.text === 'Task finished')).toHaveLength(1)
+  })
+
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {
     const appended: Msg[] = []
 

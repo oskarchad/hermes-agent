@@ -10528,6 +10528,11 @@ _LOOP_POLL_SECONDS = 5.0
 # between lease and ack strands the row only until this elapses; the next
 # poll after a restart reclaims it (see hermes_cli/kanban_db.py).
 _CAPTAIN_LEASE_SECONDS = 120
+_CAPTAIN_RECEIVER_TTL_SECONDS = 15
+# Hard context/SQLite guards. One poll leases at most this many event rows and
+# the joined synthetic prompt never exceeds this UTF-8 byte budget.
+_CAPTAIN_POLL_ROW_CAP = 16
+_CAPTAIN_POLL_BYTE_CAP = 8 * 1024
 
 
 def _session_captain_profile(session: dict) -> str:
@@ -10565,7 +10570,22 @@ def _session_key_is_live(session_key: str) -> bool:
     return False
 
 
-def _captain_row_eligible(this_key: str, origin_key) -> bool:
+def _session_captain_tenant(session: dict) -> Optional[str]:
+    """Return an explicitly bound tenant; missing identity stays unscoped."""
+    value = session.get("tenant") if isinstance(session, dict) else None
+    return str(value).strip() if value else None
+
+
+def _captain_row_eligible(
+    conn,
+    *,
+    profile: str,
+    this_key: str,
+    receiver_tenant: Optional[str],
+    origin_key,
+    row_tenant,
+    now: int,
+) -> bool:
     """Whether this session may claim a Captain row with the given origin.
 
     - No origin (gateway/CLI/cron/unattached) → any same-profile session.
@@ -10574,10 +10594,20 @@ def _captain_row_eligible(this_key: str, origin_key) -> bool:
     """
     origin = str(origin_key).strip() if origin_key else ""
     if not origin:
-        return True
+        return not row_tenant or receiver_tenant == str(row_tenant)
     if origin == str(this_key or ""):
         return True
-    return not _session_key_is_live(origin)
+    if row_tenant and receiver_tenant != str(row_tenant):
+        return False
+    from hermes_cli import kanban_db as _kb
+
+    return not _kb.captain_receiver_is_live(
+        conn,
+        profile=profile,
+        session_key=origin,
+        now=now,
+        max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
+    )
 
 
 def _collect_captain_reports(
@@ -10595,10 +10625,10 @@ def _collect_captain_reports(
     board connection. Rows whose ``task_event.id`` was already turned into text
     by the exact-origin route are settled but not re-rendered (dedup); the rest
     are formatted. Leases are recorded in ``claim_records`` so the caller acks
-    them on an accepted turn or releases them on rejection.
+    them on a successful terminal turn or releases them on rejection/failure.
 
-    A Captain row is acked ONLY after ``_run_prompt_submit`` accepts the
-    synthetic turn, so leasing is meaningless without a settlement handshake.
+    A Captain row is acked ONLY after the synthetic turn reaches a successful
+    terminal outcome, so leasing is meaningless without a settlement callback.
     When ``claim_records`` is ``None`` (a probe-style call with no way to
     ack/release), this helper is a no-op and leaves every row ``pending`` —
     it never leases or acks merely because it was invoked.
@@ -10609,35 +10639,63 @@ def _collect_captain_reports(
         return
 
     this_key = str(session.get("session_key") or "")
+    receiver_tenant = _session_captain_tenant(session)
     now = int(time.time())
     try:
         candidates = _kb.read_captain_candidates(
-            conn, profile=captain_profile, now=now
+            conn,
+            profile=captain_profile,
+            now=now,
+            limit=_CAPTAIN_POLL_ROW_CAP,
+            receiver_session_key=this_key,
+            receiver_tenant=receiver_tenant,
+            receiver_max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
         )
     except Exception:
         return
     eligible = [
         int(c["event_id"])
         for c in candidates
-        if _captain_row_eligible(this_key, c.get("origin_session_key"))
+        if _captain_row_eligible(
+            conn,
+            profile=captain_profile,
+            this_key=this_key,
+            receiver_tenant=receiver_tenant,
+            origin_key=c.get("origin_session_key"),
+            row_tenant=c.get("tenant"),
+            now=now,
+        )
     ]
     if not eligible:
         return
-    token, events = _kb.lease_captain_reports(
-        conn,
-        profile=captain_profile,
-        owner=this_key or captain_profile,
-        event_ids=eligible,
-        now=now,
-        lease_seconds=_CAPTAIN_LEASE_SECONDS,
-    )
-    if not events:
-        return
-    task_ids: set = set()
     task_cache: dict = {}
-    for ev in events:
-        task_ids.add(ev.task_id)
+    used_bytes = sum(len(t.encode("utf-8")) + 1 for t in texts)
+    for event_id in eligible:
+        if used_bytes >= _CAPTAIN_POLL_BYTE_CAP:
+            break
+        # One event per lease token makes byte paging lossless: rows that do
+        # not fit this prompt remain pending/unleased for the next poll instead
+        # of sharing an ack token with the visible prefix.
+        token, events = _kb.lease_captain_reports(
+            conn,
+            profile=captain_profile,
+            owner=this_key or captain_profile,
+            event_ids=[event_id],
+            now=now,
+            lease_seconds=_CAPTAIN_LEASE_SECONDS,
+        )
+        if not events:
+            continue
+        ev = events[0]
+        deliveries: list[dict] = []
         if ev.id in claimed_event_ids:
+            claim_records.append({
+                "route": "captain",
+                "board": slug,
+                "token": token,
+                "task_ids": {ev.task_id},
+                "deliveries": deliveries,
+            })
             continue  # already delivered via the exact-origin route this batch
         task = task_cache.get(ev.task_id)
         if task is None:
@@ -10657,14 +10715,37 @@ def _collect_captain_reports(
             from agent.redact import redact_sensitive_text
 
             text = redact_sensitive_text(text, force=True)
+            remaining = _CAPTAIN_POLL_BYTE_CAP - used_bytes
+            if remaining <= 0:
+                _kb.release_captain_reports(conn, token=token)
+                break
+            encoded = text.encode("utf-8")
+            if len(encoded) > remaining:
+                encoded = encoded[:remaining]
+                while encoded:
+                    try:
+                        text = encoded.decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        encoded = encoded[:-1]
+                if not encoded:
+                    _kb.release_captain_reports(conn, token=token)
+                    break
             claimed_event_ids.add(ev.id)
             texts.append(text)
-    claim_records.append({
-        "route": "captain",
-        "board": slug,
-        "token": token,
-        "task_ids": task_ids,
-    })
+            used_bytes += len(text.encode("utf-8")) + 1
+            deliveries.append({
+                "id": f"kanban:{slug}:{ev.id}",
+                "event_id": ev.id,
+                "text": text,
+            })
+        claim_records.append({
+            "route": "captain",
+            "board": slug,
+            "token": token,
+            "task_ids": {ev.task_id},
+            "deliveries": deliveries,
+        })
 
 
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
@@ -10925,6 +11006,17 @@ def _collect_kanban_notifications(
         except Exception:
             continue
         try:
+            try:
+                _kb.touch_captain_receiver(
+                    conn,
+                    profile=captain_profile,
+                    session_key=session_key,
+                    tenant=_session_captain_tenant(session),
+                )
+            except Exception:
+                # Receiver publication is required only for fallback liveness;
+                # exact-origin delivery and durable leasing remain available.
+                pass
             claimed_event_ids: set = set()
             try:
                 subs = _kb.list_notify_subs(conn)
@@ -10953,6 +11045,7 @@ def _collect_kanban_notifications(
                         "old_cursor": old_cursor,
                         "claimed_cursor": claimed_cursor,
                         "unsubscribe": False,
+                        "deliveries": [],
                     }
                     claim_records.append(claim_record)
                 task = _kb.get_task(conn, sub["task_id"])
@@ -10962,6 +11055,15 @@ def _collect_kanban_notifications(
                         task and getattr(task, "status", "") == "archived"
                     )
                 for ev in events:
+                    captain_backed = conn.execute(
+                        "SELECT 1 FROM kanban_captain_inbox WHERE event_id = ?",
+                        (ev.id,),
+                    ).fetchone() is not None
+                    if captain_backed:
+                        # Registered events have ONE shared durable claim: the
+                        # Captain lease. The exact cursor may advance, but it
+                        # never renders a second external delivery.
+                        continue
                     # Record every event id the exact-origin route claimed so
                     # the Captain route can settle-but-not-duplicate the same
                     # task_event.id (both routes may see it for the origin).
@@ -10971,6 +11073,12 @@ def _collect_kanban_notifications(
                     )
                     if text:
                         texts.append(text)
+                        if claim_record is not None:
+                            claim_record["deliveries"].append({
+                                "id": f"kanban:{slug}:{ev.id}",
+                                "event_id": ev.id,
+                                "text": text,
+                            })
                 # Unsubscribe only on archive. ``done`` is reversible in
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop
@@ -11076,14 +11184,33 @@ def _settle_kanban_notification_claims(
                 conn.close()
 
 
+def _emit_kanban_notification_receipts(
+    sid: str, claim_records: list[dict]
+) -> None:
+    """Emit stable-id external receipts after a successful synthetic turn."""
+    seen: set[str] = set()
+    for record in claim_records:
+        for delivery in record.get("deliveries") or ():
+            receipt_id = str(delivery.get("id") or "")
+            text = str(delivery.get("text") or "")
+            if not receipt_id or not text or receipt_id in seen:
+                continue
+            seen.add(receipt_id)
+            _emit(
+                "status.update",
+                sid,
+                {"kind": "process", "text": text, "id": receipt_id},
+            )
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
     """Poll completion_queue and dispatch notifications autonomously.
 
-    Runs in a daemon thread started by _init_session(). Emits a
-    status.update (kind=process) for user visibility, then chains an
-    agent turn via _run_prompt_submit if the session is idle.
+    Runs in a daemon thread started by _init_session(). Chains an agent turn via
+    _run_prompt_submit when idle, then emits stable-id process receipts and acks
+    the claims only after that turn reports successful terminal completion.
 
     The completion_queue is process-global. In multi-session Desktop each
     poller requeues events owned by another live session and drops addressed
@@ -11091,7 +11218,7 @@ def _notification_poller_loop(
 
     Also polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` for this
     session's TUI kanban subscriptions and delivers terminal task events the
-    same way (status.update + agent turn) — the delivery path
+    same way (agent turn + terminal receipt) — the delivery path
     tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
     The poller reserves an idle turn before claiming the durable cursor; a
     rejected dispatch rewinds that claim, so RAM is never the sole copy.
@@ -11156,24 +11283,38 @@ def _notification_poller_loop(
                     )
                 else:
                     if _kanban_texts:
-                        for _kb_text in _kanban_texts:
-                            _emit(
-                                "status.update",
-                                sid,
-                                {"kind": "process", "text": _kb_text},
-                            )
                         rid = f"__notif__{int(time.time() * 1000)}"
+                        _settled = threading.Event()
+
+                        def _settle_after_terminal(succeeded: bool) -> None:
+                            if _settled.is_set():
+                                return
+                            _settled.set()
+                            accepted = bool(succeeded)
+                            if accepted:
+                                try:
+                                    _emit_kanban_notification_receipts(
+                                        sid, _kanban_claims
+                                    )
+                                except Exception:
+                                    accepted = False
+                            _settle_kanban_notification_claims(
+                                _kanban_claims, accepted=accepted
+                            )
+
                         try:
                             _emit("message.start", sid)
                             accepted = _run_prompt_submit(
-                                rid, sid, session, "\n".join(_kanban_texts)
+                                rid,
+                                sid,
+                                session,
+                                "\n".join(_kanban_texts),
+                                on_terminal=_settle_after_terminal,
                             )
                             if accepted is False:
                                 raise RuntimeError("synthetic turn was not accepted")
                         except Exception as exc:
-                            _settle_kanban_notification_claims(
-                                _kanban_claims, accepted=False
-                            )
+                            _settle_after_terminal(False)
                             print(
                                 f"[tui_gateway] kanban notification dispatch failed: "
                                 f"{type(exc).__name__}: {exc}",
@@ -11182,10 +11323,7 @@ def _notification_poller_loop(
                             with session["history_lock"]:
                                 session["running"] = False
                             _drain_queued_prompt(rid, sid, session)
-                        else:
-                            _settle_kanban_notification_claims(
-                                _kanban_claims, accepted=True
-                            )
+
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -11689,6 +11827,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    on_terminal: Optional[Callable[[bool], None]] = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -11760,6 +11899,7 @@ def _run_prompt_submit(
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
+        turn_succeeded = False
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -12219,6 +12359,7 @@ def _run_prompt_submit(
             else:
                 raw = str(result)
                 status = "complete"
+            turn_succeeded = status == "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
@@ -12437,6 +12578,7 @@ def _run_prompt_submit(
         except Exception as e:
             import traceback
 
+            turn_succeeded = False
             trace = traceback.format_exc()
             try:
                 os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
@@ -12559,6 +12701,11 @@ def _run_prompt_submit(
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
+            if on_terminal is not None:
+                try:
+                    on_terminal(turn_succeeded)
+                except Exception:
+                    logger.exception("TUI turn terminal callback failed")
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;

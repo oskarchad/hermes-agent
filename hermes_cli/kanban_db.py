@@ -1668,6 +1668,7 @@ CREATE TABLE IF NOT EXISTS kanban_captain_registry (
     task_id            TEXT PRIMARY KEY,
     profile            TEXT NOT NULL,
     origin_session_key TEXT,
+    tenant             TEXT,
     created_at         INTEGER NOT NULL
 );
 
@@ -1683,6 +1684,7 @@ CREATE TABLE IF NOT EXISTS kanban_captain_inbox (
     profile       TEXT NOT NULL,
     task_id       TEXT NOT NULL,
     kind          TEXT NOT NULL,
+    tenant        TEXT,
     state         TEXT NOT NULL DEFAULT 'pending',
     lease_token   TEXT,
     lease_owner   TEXT,
@@ -1690,6 +1692,16 @@ CREATE TABLE IF NOT EXISTS kanban_captain_inbox (
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL,
     PRIMARY KEY (event_id, profile)
+);
+
+-- Cross-process receiver liveness. The per-session poller refreshes this
+-- heartbeat; fallback receivers consult it instead of process-local memory.
+CREATE TABLE IF NOT EXISTS kanban_captain_receivers (
+    profile       TEXT NOT NULL,
+    session_key   TEXT NOT NULL,
+    tenant        TEXT,
+    last_seen     INTEGER NOT NULL,
+    PRIMARY KEY (profile, session_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -1704,6 +1716,7 @@ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_captain_inbox_profile ON kanban_captain_inbox(profile, state);
 CREATE INDEX IF NOT EXISTS idx_captain_registry_prof ON kanban_captain_registry(profile);
+CREATE INDEX IF NOT EXISTS idx_captain_receivers_seen ON kanban_captain_receivers(profile, last_seen);
 """
 
 
@@ -2964,6 +2977,43 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
 
+    # Captain v2 adds tenant isolation and durable receiver liveness without
+    # rebuilding either additive v1 table.
+    captain_registry_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='kanban_captain_registry'"
+    ).fetchone() is not None
+    if captain_registry_exists:
+        registry_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_captain_registry)")
+        }
+        if "tenant" not in registry_cols:
+            _add_column_if_missing(
+                conn, "kanban_captain_registry", "tenant", "tenant TEXT"
+            )
+            conn.execute(
+                "UPDATE kanban_captain_registry SET tenant = "
+                "(SELECT tenant FROM tasks WHERE tasks.id = kanban_captain_registry.task_id)"
+            )
+    captain_inbox_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='kanban_captain_inbox'"
+    ).fetchone() is not None
+    if captain_inbox_exists:
+        inbox_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(kanban_captain_inbox)")
+        }
+        if "tenant" not in inbox_cols:
+            _add_column_if_missing(
+                conn, "kanban_captain_inbox", "tenant", "tenant TEXT"
+            )
+            conn.execute(
+                "UPDATE kanban_captain_inbox SET tenant = "
+                "(SELECT tenant FROM tasks WHERE tasks.id = kanban_captain_inbox.task_id)"
+            )
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -3404,6 +3454,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    captain_profile: Optional[str] = None,
+    captain_origin_session_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3633,6 +3685,14 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            if captain_profile:
+                register_captain_owner(
+                    conn,
+                    row["id"],
+                    profile=captain_profile,
+                    origin_session_key=captain_origin_session_key,
+                    tenant=tenant,
+                )
             return row["id"]
 
     enabled_toolsets_list = normalize_enabled_toolsets(
@@ -3790,6 +3850,17 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if captain_profile:
+                    # Registration shares the create transaction but follows
+                    # the ``created`` event, so creation is all-or-nothing and
+                    # that historical event never materializes in the inbox.
+                    register_captain_owner(
+                        conn,
+                        task_id,
+                        profile=captain_profile,
+                        origin_session_key=captain_origin_session_key,
+                        tenant=tenant,
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -4686,15 +4757,15 @@ def _append_event(
     event_id = int(cur.lastrowid)
     if kind in CAPTAIN_REPORT_KINDS:
         reg = conn.execute(
-            "SELECT profile FROM kanban_captain_registry WHERE task_id = ?",
+            "SELECT profile, tenant FROM kanban_captain_registry WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         if reg is not None:
             conn.execute(
                 "INSERT OR IGNORE INTO kanban_captain_inbox "
-                "(event_id, profile, task_id, kind, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-                (event_id, reg["profile"], task_id, kind, now, now),
+                "(event_id, profile, task_id, kind, tenant, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (event_id, reg["profile"], task_id, kind, reg["tenant"], now, now),
             )
     return event_id
 
@@ -13830,6 +13901,7 @@ def register_captain_owner(
     *,
     profile: str,
     origin_session_key: Optional[str] = None,
+    tenant: Optional[str] = None,
 ) -> None:
     """Register ``task_id`` in the Captain ledger owned by ``profile``.
 
@@ -13843,13 +13915,19 @@ def register_captain_owner(
     """
     prof = _normalize_captain_profile(profile)
     origin = str(origin_session_key).strip() if origin_session_key else None
+    if tenant is None:
+        task_row = conn.execute(
+            "SELECT tenant FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        tenant = task_row["tenant"] if task_row is not None else None
+    tenant = str(tenant).strip() if tenant else None
     now = int(time.time())
     with write_txn(conn, allow_nested=True):
         conn.execute(
             "INSERT OR IGNORE INTO kanban_captain_registry "
-            "(task_id, profile, origin_session_key, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, prof, origin, now),
+            "(task_id, profile, origin_session_key, tenant, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, prof, origin, tenant, now),
         )
         if origin:
             conn.execute(
@@ -13858,10 +13936,69 @@ def register_captain_owner(
                 "AND (origin_session_key IS NULL OR origin_session_key = '')",
                 (origin, task_id),
             )
+        if origin:
+            conn.execute(
+                "INSERT INTO kanban_captain_receivers "
+                "(profile, session_key, tenant, last_seen) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(profile, session_key) DO UPDATE SET "
+                "tenant = excluded.tenant, last_seen = excluded.last_seen",
+                (prof, origin, tenant, now),
+            )
+
+
+def touch_captain_receiver(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    session_key: str,
+    tenant: Optional[str],
+    now: Optional[int] = None,
+) -> None:
+    """Publish a bounded cross-process heartbeat for one Captain receiver."""
+    prof = _normalize_captain_profile(profile)
+    key = str(session_key or "").strip()
+    if not key:
+        return
+    tenant_value = str(tenant).strip() if tenant else None
+    seen = int(time.time()) if now is None else int(now)
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "INSERT INTO kanban_captain_receivers "
+            "(profile, session_key, tenant, last_seen) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(profile, session_key) DO UPDATE SET "
+            "tenant = excluded.tenant, last_seen = excluded.last_seen",
+            (prof, key, tenant_value, seen),
+        )
+
+
+def captain_receiver_is_live(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    session_key: str,
+    now: Optional[int] = None,
+    max_age_seconds: int = 15,
+) -> bool:
+    """Return whether ``session_key`` has a fresh durable receiver heartbeat."""
+    prof = _normalize_captain_profile(profile)
+    key = str(session_key or "").strip()
+    if not key:
+        return False
+    current = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT 1 FROM kanban_captain_receivers "
+        "WHERE profile = ? AND session_key = ? AND last_seen >= ?",
+        (prof, key, current - max(1, int(max_age_seconds))),
+    ).fetchone()
+    return row is not None
 
 
 def read_captain_candidates(
     conn: sqlite3.Connection, *, profile: str, now: Optional[int] = None,
+    limit: int = 32,
+    receiver_session_key: Optional[str] = None,
+    receiver_tenant: Optional[str] = None,
+    receiver_max_age_seconds: int = 15,
 ) -> list[dict]:
     """Return claimable Captain rows for ``profile`` (pending or lease-expired).
 
@@ -13871,16 +14008,50 @@ def read_captain_candidates(
     """
     prof = _normalize_captain_profile(profile)
     now = int(time.time()) if now is None else int(now)
+    eligibility_sql = ""
+    eligibility_params: tuple = ()
+    if receiver_session_key is not None:
+        session_key = str(receiver_session_key)
+        tenant = str(receiver_tenant).strip() if receiver_tenant else None
+        eligibility_sql = (
+            " AND ("
+            "   ((r.origin_session_key IS NULL OR r.origin_session_key = '') "
+            "    AND (i.tenant IS NULL OR i.tenant = ?)) "
+            "   OR r.origin_session_key = ? "
+            "   OR (r.origin_session_key IS NOT NULL "
+            "       AND r.origin_session_key != '' "
+            "       AND r.origin_session_key != ? "
+            "       AND (i.tenant IS NULL OR i.tenant = ?) "
+            "       AND NOT EXISTS ("
+            "           SELECT 1 FROM kanban_captain_receivers cr "
+            "           WHERE cr.profile = i.profile "
+            "             AND cr.session_key = r.origin_session_key "
+            "             AND cr.last_seen >= ?"
+            "       ))"
+            " )"
+        )
+        eligibility_params = (
+            tenant,
+            session_key,
+            session_key,
+            tenant,
+            now - max(1, int(receiver_max_age_seconds)),
+        )
     rows = conn.execute(
         "SELECT i.event_id, i.task_id, i.kind, i.state, i.lease_expires, "
-        "       r.origin_session_key "
+        "       r.origin_session_key, i.tenant "
         "FROM kanban_captain_inbox i "
         "LEFT JOIN kanban_captain_registry r ON r.task_id = i.task_id "
         "WHERE i.profile = ? AND ("
         "  i.state = 'pending' OR "
         "  (i.state = 'leased' AND (i.lease_expires IS NULL OR i.lease_expires < ?))"
-        ")",
-        (prof, now),
+        ")" + eligibility_sql + " ORDER BY i.event_id ASC LIMIT ?",
+        (
+            prof,
+            now,
+            *eligibility_params,
+            max(1, min(int(limit), 128)),
+        ),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -13902,7 +14073,9 @@ def lease_captain_reports(
     events are joined against ``task_events`` so the caller can format them.
     """
     prof = _normalize_captain_profile(profile)
-    ids = [int(e) for e in event_ids]
+    # Defensive cap keeps the dynamic IN clause comfortably below every
+    # supported SQLite variable limit even if a caller regresses.
+    ids = list(dict.fromkeys(int(e) for e in event_ids))[:128]
     token = secrets.token_hex(16)
     if not ids:
         return token, []
@@ -14049,11 +14222,23 @@ def gc_events(
     history."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
+        # Acked rows no longer carry retry state. Compact them before deleting
+        # their source events; retain the task registry so reopen/new terminal
+        # events materialize under a fresh event identity.
+        conn.execute(
+            "DELETE FROM kanban_captain_inbox "
+            "WHERE state = 'acked' AND updated_at < ?",
+            (cutoff,),
+        )
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
             "AND id NOT IN (SELECT event_id FROM kanban_captain_inbox "
             "               WHERE state != 'acked')",
+            (cutoff,),
+        )
+        conn.execute(
+            "DELETE FROM kanban_captain_receivers WHERE last_seen < ?",
             (cutoff,),
         )
     return int(cur.rowcount or 0)

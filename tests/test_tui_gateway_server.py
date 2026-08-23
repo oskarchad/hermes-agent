@@ -7083,6 +7083,99 @@ class _RecordingAgent:
         return {"final_response": "", "messages": []}
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ({"final_response": "ok", "messages": []}, True),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "error": "provider failed",
+                "failed": True,
+            },
+            False,
+        ),
+        (RuntimeError("turn exploded"), False),
+    ],
+)
+def test_run_prompt_submit_reports_real_terminal_outcome(
+    monkeypatch, tmp_path, outcome, expected
+):
+    """Admission is not completion: callback fires from the real terminal path."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    results = []
+
+    def record_terminal(ok):
+        results.append(ok)
+        settled.set()
+
+    class _OutcomeAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    session = _session(
+        session_key="terminal-outcome",
+        agent=_OutcomeAgent([]),
+        running=True,
+    )
+    server._sessions["terminal-outcome"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid", "terminal-outcome", session, "synthetic",
+            on_terminal=record_terminal,
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("terminal-outcome", None)
+
+    assert results == [expected]
+
+
+def test_run_prompt_submit_reports_failure_when_terminal_emit_raises(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    results = []
+    original_emit = server._emit
+
+    def record_terminal(ok):
+        results.append(ok)
+        settled.set()
+
+    def fail_terminal_emit(event, sid, payload=None):
+        if event == "message.complete":
+            raise RuntimeError("transport write failed")
+        return original_emit(event, sid, payload)
+
+    monkeypatch.setattr(server, "_emit", fail_terminal_emit)
+    session = _session(
+        session_key="terminal-emit-error",
+        agent=_RecordingAgent([]),
+        running=True,
+    )
+    server._sessions["terminal-emit-error"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "terminal-emit-error",
+            session,
+            "synthetic",
+            on_terminal=record_terminal,
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("terminal-emit-error", None)
+
+    assert results == [False]
+
+
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     monkeypatch, tmp_path
 ):

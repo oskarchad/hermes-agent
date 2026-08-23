@@ -284,11 +284,13 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        monkeypatch.setattr(
-            server,
-            "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
-        )
+        def submit_turn(_rid, _sid, _session, text, *, on_terminal=None, **_kwargs):
+            submits.append(text)
+            if on_terminal is not None:
+                on_terminal(True)
+            return True
+
+        monkeypatch.setattr(server, "_run_prompt_submit", submit_turn)
         stop = threading.Event()
         thread = threading.Thread(
             target=server._notification_poller_loop,
@@ -346,7 +348,13 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        monkeypatch.setattr(server, "_run_prompt_submit", submit)
+        def submit_turn(rid, sid, current_session, text, *, on_terminal=None, **_kwargs):
+            accepted = submit(rid, sid, current_session, text)
+            if accepted is not False and on_terminal is not None:
+                on_terminal(True)
+            return accepted
+
+        monkeypatch.setattr(server, "_run_prompt_submit", submit_turn)
         server._notification_poller_loop(_StopAfterOnePoll(), "sid-poller-test", session)
 
     def test_idle_session_gets_status_update_and_agent_turn(self, monkeypatch):

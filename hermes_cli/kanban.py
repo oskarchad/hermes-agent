@@ -1655,19 +1655,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            captain_profile=_captain_owner_profile(),
+            captain_origin_session_key=None,
         )
-        # Register the OWNING PROFILE (not the author label) in the durable
-        # Captain ledger so a same-profile TUI/Desktop session can report the
-        # terminal event. A CLI/`/kanban` create has no origin session and
-        # invents no chat destination.
-        try:
-            kb.register_captain_owner(
-                conn, task_id,
-                profile=_captain_owner_profile(),
-                origin_session_key=None,
-            )
-        except Exception:
-            pass
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))

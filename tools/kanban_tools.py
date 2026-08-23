@@ -1437,6 +1437,8 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            captain_profile = _resolve_creator_profile()
+            captain_origin = _resolve_captain_origin_session_key()
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1466,9 +1468,14 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                captain_profile=captain_profile,
+                captain_origin_session_key=captain_origin,
             )
             new_task = kb.get_task(conn, new_tid)
-            _maybe_register_captain(conn, new_tid)
+            captain_registered = conn.execute(
+                "SELECT 1 FROM kanban_captain_registry WHERE task_id = ?",
+                (new_tid,),
+            ).fetchone() is not None
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1477,6 +1484,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                captain_registered=captain_registered,
             )
         finally:
             conn.close()
@@ -1519,42 +1527,48 @@ def _resolve_creator_profile() -> str:
         return (profile or "default").strip().lower() or "default"
 
 
-def _maybe_register_captain(conn: Any, task_id: str) -> None:
-    """Register the new task in the durable, profile-scoped Captain ledger.
+def _resolve_captain_origin_session_key() -> Optional[str]:
+    """Return the exact TUI/Desktop origin, never a gateway chat identity."""
+    origin_session_key: Optional[str] = None
+    platform = ""
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        session_key = (
+            get_session_env("HERMES_SESSION_KEY", "")
+            or os.environ.get("HERMES_SESSION_KEY", "")
+        )
+    except Exception:
+        chat_id = ""
+        session_key = os.environ.get("HERMES_SESSION_KEY", "")
+    if session_key and not (platform and chat_id):
+        origin_session_key = session_key
+    return origin_session_key
+
+
+def _maybe_register_captain(conn: Any, task_id: str) -> bool:
+    """Legacy reconciliation helper for callers outside atomic ``create_task``.
 
     Runs unconditionally (no config gate — this is a separate mechanism from
     the exact-origin notify subscription). The creator profile always owns the
     task; the exact TUI/Desktop origin session key is recorded only when the
     creator IS such a session, so a live origin session owns delivery while
     present. Gateway/CLI/cron/unattached creators register with no origin
-    session and invent NO platform/chat destination. Best-effort: a bookkeeping
-    failure must never fail the kanban_create the agent is mid-conversation on.
+    session and invent NO platform/chat destination. New create paths register
+    transactionally; this helper remains bounded and reports success explicitly.
     """
     try:
-        origin_session_key: Optional[str] = None
-        platform = ""
-        try:
-            from gateway.session_context import get_session_env
-            platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-            session_key = (
-                get_session_env("HERMES_SESSION_KEY", "")
-                or os.environ.get("HERMES_SESSION_KEY", "")
-            )
-        except Exception:
-            chat_id = ""
-            session_key = os.environ.get("HERMES_SESSION_KEY", "")
-        # A TUI/Desktop session has a session key but no gateway platform/chat.
-        if session_key and not (platform and chat_id):
-            origin_session_key = session_key
         from hermes_cli import kanban_db as _kb
         _kb.register_captain_owner(
             conn, task_id,
             profile=_resolve_creator_profile(),
-            origin_session_key=origin_session_key,
+            origin_session_key=_resolve_captain_origin_session_key(),
         )
+        return True
     except Exception as _exc:
         logger.warning("_maybe_register_captain failed: %r", _exc)
+        return False
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
