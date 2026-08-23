@@ -14,6 +14,8 @@ import io
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _RUNNER_PATH = REPO_ROOT / "scripts" / "run_tests_parallel.py"
 
@@ -67,3 +69,28 @@ def test_glyph_safe_stdio_noop_without_reconfigure(monkeypatch) -> None:
     print("✓ still fine")
 
     assert "✓ still fine" in plain.getvalue()
+
+
+def test_file_attempt_root_is_cleaned_when_process_launch_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mod = _load_runner()
+    runner_root = tmp_path / "runner-root"
+    runner_root.mkdir()
+
+    def _fail_launch(*_args, **_kwargs):
+        raise OSError("simulated launch failure")
+
+    monkeypatch.setattr(mod.subprocess, "Popen", _fail_launch)
+
+    with pytest.raises(OSError, match="simulated launch failure"):
+        mod._run_one_file_once(
+            tmp_path / "test_probe.py",
+            [],
+            REPO_ROOT,
+            30,
+            runner_root,
+        )
+
+    assert list(runner_root.iterdir()) == []

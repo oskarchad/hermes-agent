@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -98,6 +99,150 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stdout
     assert "UnicodeEncodeError" not in proc.stdout
     assert "1 tests passed" in proc.stdout
+
+
+def test_parallel_children_isolate_home_and_default_kanban_state(
+    tmp_path: Path,
+) -> None:
+    """The runner must isolate default state before pytest imports fixtures."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+
+    real_home = tmp_path / "operator-home"
+    live_db = real_home / ".hermes" / "kanban.db"
+    live_db.parent.mkdir(parents=True)
+    with sqlite3.connect(live_db) as conn:
+        conn.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sentinel(value) VALUES ('operator-row')")
+    sentinel_bytes = live_db.read_bytes()
+
+    output_dir = tmp_path / "probe-output"
+    output_dir.mkdir()
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    live_env = {
+        "HERMES_KANBAN_DB": str(live_db),
+        "HERMES_KANBAN_BOARD": "production-board",
+        "HERMES_KANBAN_TASK": "t_live_owner",
+        "HERMES_KANBAN_RUN_ID": "9001",
+        "HERMES_KANBAN_CLAIM_LOCK": "live-claim-lock",
+        "HERMES_KANBAN_WORKSPACE": str(repo_root),
+        "HERMES_KANBAN_BRANCH": "live-branch",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT": str(real_home / "attachments"),
+        "HERMES_PROFILE": "live-worker-profile",
+        "HERMES_TENANT": "live-tenant",
+        "HERMES_REAL_HOME": str(real_home),
+    }
+    live_names = tuple(name for name in live_env if name != "HERMES_REAL_HOME")
+
+    for label in ("alpha", "beta"):
+        (probe_dir / f"test_{label}.py").write_text(
+            textwrap.dedent(
+                f"""
+                import json
+                import os
+                import sqlite3
+                from pathlib import Path
+
+                from hermes_cli import kanban_db
+
+                LIVE_NAMES = {live_names!r}
+
+                def test_default_kanban_path_is_file_scoped():
+                    db_path = kanban_db.kanban_db_path()
+                    db_path.parent.mkdir(parents=True, exist_ok=True)
+                    with sqlite3.connect(db_path) as conn:
+                        conn.execute(
+                            "CREATE TABLE IF NOT EXISTS sentinel (value TEXT NOT NULL)"
+                        )
+                        conn.execute("INSERT INTO sentinel(value) VALUES (?)", ({label!r},))
+                        row_count = conn.execute(
+                            "SELECT COUNT(*) FROM sentinel"
+                        ).fetchone()[0]
+
+                    payload = {{
+                        "home": os.environ.get("HOME"),
+                        "path_home": str(Path.home()),
+                        "hermes_home": os.environ.get("HERMES_HOME"),
+                        "hermes_real_home": os.environ.get("HERMES_REAL_HOME"),
+                        "db_path": str(db_path),
+                        "row_count": row_count,
+                        "live_env": {{
+                            name: os.environ[name]
+                            for name in LIVE_NAMES
+                            if name in os.environ
+                        }},
+                    }}
+                    output = Path(os.environ["HERMETIC_RUNNER_PROBE_OUTPUT"])
+                    (output / {label!r}).write_text(json.dumps(payload), encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+
+    env = os.environ.copy()
+    env.update(live_env)
+    env["HOME"] = str(real_home)
+    env.pop("HERMES_HOME", None)
+    env["HERMETIC_RUNNER_PROBE_OUTPUT"] = str(output_dir)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-retries",
+            "0",
+            "--file-timeout",
+            "30",
+            f"--confcutdir={probe_dir}",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    payloads = [
+        json.loads((output_dir / label).read_text(encoding="utf-8"))
+        for label in ("alpha", "beta")
+    ]
+    homes = {Path(payload["home"]) for payload in payloads}
+    hermes_homes = {Path(payload["hermes_home"]) for payload in payloads}
+    db_paths = {Path(payload["db_path"]) for payload in payloads}
+
+    assert len(homes) == 2
+    assert real_home not in homes
+    assert {payload["path_home"] for payload in payloads} == {
+        str(path) for path in homes
+    }
+    assert len(hermes_homes) == 2
+    assert len(db_paths) == 2
+    for payload in payloads:
+        home = Path(payload["home"])
+        hermes_home = Path(payload["hermes_home"])
+        assert home.parent == hermes_home.parent
+        assert payload["hermes_real_home"] == str(home)
+        assert Path(payload["db_path"]) == hermes_home / "kanban.db"
+        assert payload["row_count"] == 1
+        assert payload["live_env"] == {}
+
+    attempt_roots = {home.parent for home in homes}
+    runner_roots = {attempt_root.parent for attempt_root in attempt_roots}
+    assert len(attempt_roots) == 2
+    assert len(runner_roots) == 1
+    assert not runner_roots.pop().exists()
+
+    assert live_db.read_bytes() == sentinel_bytes
+    with sqlite3.connect(live_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sentinel").fetchone()[0] == 1
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")

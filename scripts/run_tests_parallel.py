@@ -104,6 +104,15 @@ _DEFAULT_FILE_RETRIES = 1
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
 
+# Dispatcher-launched workers carry live board ownership in their environment.
+# A developer often starts the canonical runner from inside such a worker, so
+# copying these values into pytest children would let collection-time imports
+# resolve the production board before tests/conftest.py fixtures can intervene.
+# Strip the entire namespace so newly-added Kanban ownership/tuning variables
+# fail closed without requiring another incident-specific allow/deny update.
+_LIVE_KANBAN_ENV_PREFIX = "HERMES_KANBAN_"
+_LIVE_KANBAN_ENV_NAMES = frozenset({"HERMES_PROFILE", "HERMES_TENANT"})
+
 
 def _split_pathspec(value: str) -> List[str]:
     """Split a separator-joined path list (``--paths``/``--files``/
@@ -303,11 +312,59 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+def _build_test_subprocess_env(
+    runner_temp_root: Path,
+) -> Tuple[dict[str, str], Path]:
+    """Create one file-attempt's isolated environment and state root.
+
+    The shell launcher deliberately keeps the operator home long enough to
+    locate venvs and the optional live-guard plugin. It must not cross this
+    boundary: every pytest child gets a unique HOME and HERMES_HOME beneath a
+    runner-owned temporary root, including Windows' native home/app-data keys.
+    """
+    attempt_root = Path(
+        tempfile.mkdtemp(prefix="file-attempt-", dir=runner_temp_root)
+    )
+    home = attempt_root / "home"
+    hermes_home = attempt_root / "hermes"
+    pytest_temp = attempt_root / "pytest"
+    for directory in (home, hermes_home, pytest_temp):
+        directory.mkdir()
+
+    env = os.environ.copy()
+    for name in list(env):
+        if name.startswith(_LIVE_KANBAN_ENV_PREFIX) or name in _LIVE_KANBAN_ENV_NAMES:
+            env.pop(name, None)
+
+    env["HOME"] = str(home)
+    env["HERMES_HOME"] = str(hermes_home)
+    env["HERMES_REAL_HOME"] = str(home)
+    env["HERMES_TEST_ISOLATION"] = str(hermes_home)
+    env["PYTEST_DEBUG_TEMPROOT"] = str(pytest_temp)
+
+    if sys.platform == "win32":
+        # Native Windows ignores HOME for Path.home()/expanduser and resolves
+        # several platform config roots directly from these variables.
+        env["USERPROFILE"] = str(home)
+        drive, tail = os.path.splitdrive(str(home))
+        env["HOMEDRIVE"] = drive
+        env["HOMEPATH"] = tail or os.sep
+        local_app_data = home / "AppData" / "Local"
+        roaming_app_data = home / "AppData" / "Roaming"
+        local_app_data.mkdir(parents=True)
+        roaming_app_data.mkdir(parents=True)
+        env["LOCALAPPDATA"] = str(local_app_data)
+        env["APPDATA"] = str(roaming_app_data)
+
+    return env, attempt_root
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    runner_temp_root: Path,
     retries: int = 0,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
@@ -343,14 +400,14 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, runner_temp_root
     )
     attempt = 0
     while rc != 0 and attempt < retries:
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, runner_temp_root
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -378,11 +435,12 @@ def _run_one_file_once(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    runner_temp_root: Path,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
 
-    # Give this subprocess its own pytest temp root.
+    # Give this subprocess its own HOME, Hermes state, and pytest temp root.
     #
     # pytest builds its tmp_path root as <temproot>/pytest-of-<user>/. At the
     # end of a session it walks that directory with cleanup_dead_symlinks().
@@ -396,27 +454,33 @@ def _run_one_file_once(
     # The risk grows with the number of processes that finish together. At 8
     # workers it never occurred. At 144 workers it occurs.
     #
-    # One root for each subprocess removes the shared directory that the race
-    # needs. The parent deletes the root after the attempt.
-    env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
-    env["PYTEST_DEBUG_TEMPROOT"] = temproot
+    # One root for each subprocess removes both the shared pytest directory
+    # race and every default config/session/kanban path shared with the
+    # launcher. The parent deletes the root after the attempt.
+    env, attempt_root = _build_test_subprocess_env(runner_temp_root)
 
     subproc_start = time.monotonic()
     # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=env,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=env,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
+        )
+    except BaseException:
+        # Popen can fail before the communicate() cleanup block exists (bad
+        # executable, exhausted process table, permission error). Do not leave
+        # that failed attempt's isolated state root behind.
+        shutil.rmtree(attempt_root, ignore_errors=True)
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -458,7 +522,7 @@ def _run_one_file_once(
         # Delete the temp root for this attempt. Nothing reads it after the
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite.
-        shutil.rmtree(temproot, ignore_errors=True)
+        shutil.rmtree(attempt_root, ignore_errors=True)
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
@@ -1122,21 +1186,28 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures: List[Future] = []
-        for file in files:
-            t0 = time.monotonic()
-            fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
-            )
-            fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
-            futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
-        for fut in futures:
-            fut.result() if fut.exception() is None else None
+    runner_temp_root = Path(tempfile.mkdtemp(prefix="hermes-test-runner-"))
+    try:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures: List[Future] = []
+            for file in files:
+                t0 = time.monotonic()
+                fut = pool.submit(
+                    _run_one_file, file, pytest_passthrough, repo_root,
+                    args.file_timeout, runner_temp_root, args.file_retries,
+                )
+                fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
+                futures.append(fut)
+            # Block until everything's done. ThreadPoolExecutor.__exit__ waits
+            # for all submitted work, but doing it explicitly here makes the
+            # control flow obvious.
+            for fut in futures:
+                fut.result() if fut.exception() is None else None
+    finally:
+        # Attempts clean their own roots as soon as their pytest child exits.
+        # This outer cleanup removes the runner-owned parent even after a
+        # callback/summary failure and catches any partial setup directory.
+        shutil.rmtree(runner_temp_root, ignore_errors=True)
 
     elapsed = time.monotonic() - started
     print()

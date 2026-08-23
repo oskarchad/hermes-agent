@@ -8,6 +8,7 @@
 #     subprocess. No xdist, no shared workers, no module-level leakage
 #     between files.
 #   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0 (deterministic)
+#   * Unique per-file HOME + HERMES_HOME beneath a runner-owned temp root
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
@@ -108,14 +109,13 @@ if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
 fi
 
 
-# ── Windows location variables (computed before we drop env) ───────────────
-# `env -i` forwards HOME, which is enough on POSIX. Native Windows CPython
-# resolves Path.home() from USERPROFILE (or HOMEDRIVE+HOMEPATH), stdlib
-# platform paths come from LOCALAPPDATA/APPDATA, ssl/sockets need SYSTEMROOT,
-# and tempfile needs TEMP/TMP. Dropping them breaks collection on native
-# Windows (issues #67385, #70813). These are location variables, not
-# credentials, so forwarding them keeps the isolation intent intact. Each is
-# only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
+# ── Windows launcher variables (computed before we drop env) ───────────────
+# The Python runner needs the operator location long enough to boot on native
+# Windows: stdlib platform paths use LOCALAPPDATA/APPDATA, ssl/sockets need
+# SYSTEMROOT, and tempfile needs TEMP/TMP (issues #67385, #70813). These values
+# reach only the runner process. run_tests_parallel.py replaces HOME,
+# USERPROFILE, HOMEDRIVE/HOMEPATH, LOCALAPPDATA/APPDATA, and HERMES_HOME with a
+# unique per-file root before launching pytest children.
 WIN_ENV=()
 for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP; do
   if [ -n "${!_win_var:-}" ]; then
