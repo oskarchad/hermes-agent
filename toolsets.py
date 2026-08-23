@@ -26,6 +26,12 @@ Usage:
 from typing import Dict, List, Any, Set, Optional, Tuple
 
 
+# Dispatcher-owned workers with an explicit task allowlist must retain these
+# surfaces even when the assignee profile disables them for ordinary chats.
+# Keep the order stable: Kanban readback and worker argv expose it verbatim.
+MANDATORY_KANBAN_TASK_TOOLSETS = ("context7", "kanban")
+
+
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [

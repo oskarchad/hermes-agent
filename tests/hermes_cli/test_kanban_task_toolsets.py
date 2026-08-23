@@ -92,6 +92,36 @@ def test_create_task_null_toolsets_preserves_legacy_profile_inheritance(
     assert task.effective_toolsets is None
 
 
+def test_idempotent_duplicate_returns_before_toolset_availability_drift(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_task_toolsets(monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="first delivery",
+            assignee="patch",
+            enabled_toolsets=["web"],
+            idempotency_key="delivery-42",
+        )
+        monkeypatch.setattr(
+            kb,
+            "_available_task_toolset_names",
+            lambda *_args, **_kwargs: {"terminal", "kanban"},
+        )
+
+        duplicate_id = kb.create_task(
+            conn,
+            title="retried delivery",
+            assignee="patch",
+            enabled_toolsets=["web"],
+            idempotency_key="delivery-42",
+        )
+
+    assert duplicate_id == task_id
+
+
 def test_profile_enabled_mcp_server_name_is_a_valid_task_toolset_alias(
     tmp_path: Path,
 ) -> None:
@@ -111,6 +141,36 @@ def test_profile_enabled_mcp_server_name_is_a_valid_task_toolset_alias(
     assert kb.normalize_enabled_toolsets(
         ["terminal", "context7"], hermes_home=str(profile_home)
     ) == ["terminal", "context7"]
+
+
+def test_live_mcp_alias_from_other_profile_is_not_available_to_target_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.registry import registry
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    context7_probe = "mcp__context7__foreign_profile_probe"
+    registry.register(
+        name=context7_probe,
+        toolset="mcp-context7",
+        schema={
+            "name": context7_probe,
+            "description": "Foreign profile MCP probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: "{}",
+    )
+    monkeypatch.setitem(registry._toolset_aliases, "context7", "mcp-context7")
+    try:
+        available = kb._available_task_toolset_names(str(profile_home))
+    finally:
+        registry.deregister(context7_probe)
+
+    assert "context7" not in available
 
 
 @pytest.mark.parametrize(
@@ -275,6 +335,57 @@ def test_dispatch_blocks_tampered_unknown_toolset_before_spawn(
     assert "secret-looking-bad-value" not in serialized
 
 
+def test_dispatch_validates_default_assignee_toolsets_before_claim_or_spawn(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (kanban_home / "config.yaml").write_text(
+        "mcp_servers:\n"
+        "  context7:\n"
+        "    enabled: true\n"
+        "    command: node\n"
+        "    args: []\n",
+        encoding="utf-8",
+    )
+    default_profile = kanban_home / "profiles" / "patch"
+    default_profile.mkdir(parents=True)
+    (default_profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="default profile validation",
+            assignee=None,
+            enabled_toolsets=["terminal"],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_exists", lambda _name: True
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            default_assignee="patch",
+            spawn_fn=lambda task, _workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert spawned == []
+    assert not result.spawned
+    assert result.auto_blocked == [task_id]
+    assert task is not None and task.status == "blocked"
+    validation_events = [
+        event for event in events if event.kind == "toolsets_validation_failed"
+    ]
+    assert len(validation_events) == 1
+    assert validation_events[0].payload == {
+        "field": "enabled_toolsets",
+        "reason_code": "required_toolset_unavailable",
+    }
+    assert not ({"spawn_failed", "gave_up"} & {event.kind for event in events})
+
+
 def test_bounded_worker_toolsets_reduce_real_model_tool_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -305,3 +416,39 @@ def test_bounded_worker_toolsets_reduce_real_model_tool_schema(
     assert len(json.dumps(bounded, sort_keys=True)) < len(
         json.dumps(broad, sort_keys=True)
     )
+
+
+def test_dispatcher_bounded_worker_mandatory_toolsets_survive_profile_disables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    context7_probe = "mcp__context7__task_toolset_probe"
+    registry.register(
+        name=context7_probe,
+        toolset="mcp-context7",
+        schema={
+            "name": context7_probe,
+            "description": "Task toolset regression probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: "{}",
+    )
+    monkeypatch.setitem(registry._toolset_aliases, "context7", "mcp-context7")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_mandatory_surface")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    try:
+        definitions = get_tool_definitions(
+            enabled_toolsets=kb.effective_task_toolsets(["terminal"]),
+            disabled_toolsets=["context7", "kanban"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    finally:
+        registry.deregister(context7_probe)
+
+    names = {item["function"]["name"] for item in definitions}
+    assert context7_probe in names
+    assert "kanban_show" in names
+    assert "kanban_complete" in names

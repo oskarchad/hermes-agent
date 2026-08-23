@@ -38,7 +38,11 @@ from tools.registry import (
     registry,
     tool_error,
 )
-from toolsets import resolve_toolset, validate_toolset
+from toolsets import (
+    MANDATORY_KANBAN_TASK_TOOLSETS,
+    resolve_toolset,
+    validate_toolset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -423,21 +427,22 @@ def _compute_tool_definitions(
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
     tools_to_include: set = set()
+    dispatcher_bounded_worker = bool(
+        enabled_toolsets is not None
+        and os.environ.get("HERMES_KANBAN_TASK")
+        and not _is_delegated_child_context()
+        and _is_dispatcher_owned_worker()
+    )
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if (
-            os.environ.get("HERMES_KANBAN_TASK")
-            and not _is_delegated_child_context()
-            and _is_dispatcher_owned_worker()
-            and "kanban" not in effective_enabled_toolsets
-        ):
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive the lifecycle handoff tools. Assignee
-            # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
-            effective_enabled_toolsets.append("kanban")
+        if dispatcher_bounded_worker:
+            # Task-level readback and worker argv use the same ordered minimum.
+            # Defensively recover it here too so alternate dispatcher entry
+            # points cannot produce a narrower schema than the task reports.
+            for mandatory_toolset in MANDATORY_KANBAN_TASK_TOOLSETS:
+                if mandatory_toolset not in effective_enabled_toolsets:
+                    effective_enabled_toolsets.append(mandatory_toolset)
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -463,6 +468,11 @@ def _compute_tool_definitions(
     # stripped out. See issue #17309.
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
+            if (
+                dispatcher_bounded_worker
+                and toolset_name in MANDATORY_KANBAN_TASK_TOOLSETS
+            ):
+                continue
             if validate_toolset(toolset_name):
                 from toolsets import bundle_non_core_tools, get_toolset
                 if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):

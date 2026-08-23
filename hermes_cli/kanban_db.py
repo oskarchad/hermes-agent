@@ -90,7 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from toolsets import get_toolset_names
+from toolsets import MANDATORY_KANBAN_TASK_TOOLSETS, get_toolset_names
 
 _log = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ MAX_TASK_TOOLSET_NAME_CHARS = 128
 # Explicit task-level narrowing may never remove the documentation lookup
 # surface or the worker's board lifecycle. Keep this order stable: it is
 # exposed for auditability and passed verbatim to ``hermes --toolsets``.
-MANDATORY_TASK_TOOLSETS = ("context7", "kanban")
+MANDATORY_TASK_TOOLSETS = MANDATORY_KANBAN_TASK_TOOLSETS
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
@@ -186,8 +186,26 @@ def _profile_home_for_task(assignee: Optional[str]) -> Optional[str]:
 
 
 def _available_task_toolset_names(hermes_home: Optional[str] = None) -> set[str]:
-    """Return built-in, live-registry, and profile-configured MCP aliases."""
+    """Return built-in/plugin names plus only the target profile's MCP aliases."""
     names = set(get_toolset_names())
+    try:
+        from tools.registry import registry
+
+        aliases = registry.get_registered_toolset_aliases()
+        live_mcp_names = {
+            alias
+            for alias, target in aliases.items()
+            if str(target).startswith("mcp-")
+        }
+        live_mcp_names.update(
+            str(target)
+            for target in aliases.values()
+            if str(target).startswith("mcp-")
+        )
+        names.difference_update(live_mcp_names)
+        names = {name for name in names if not str(name).startswith("mcp-")}
+    except Exception as exc:
+        _log.debug("kanban task toolsets: live MCP inventory unavailable (%s)", exc)
     try:
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
@@ -3366,10 +3384,6 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
-    enabled_toolsets_list = normalize_enabled_toolsets(
-        enabled_toolsets,
-        hermes_home=_profile_home_for_task(assignee),
-    )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3535,10 +3549,11 @@ def create_task(
         skills_list = cleaned
 
     # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # duplicate. Do this before profile-scoped toolset validation so a retry
+    # remains stable when MCP availability drifts after the original write.
+    # The lookup stays outside write_txn to keep the fast path lock-free. A
+    # concurrent duplicate insert race retains the historical best-effort
+    # behavior: the next lookup stabilizes on the newest non-archived row.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -3548,6 +3563,11 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    enabled_toolsets_list = normalize_enabled_toolsets(
+        enabled_toolsets,
+        hermes_home=_profile_home_for_task(assignee),
+    )
 
     now = int(time.time())
 
@@ -10688,11 +10708,16 @@ def _dispatch_once_locked(
         tuple[Optional[list[str]], Optional[str]],
     ] = {}
 
-    def _validate_row_toolsets(row) -> tuple[Optional[list[str]], Optional[str]]:
-        key = (row["assignee"], row["enabled_toolsets"])
+    def _validate_row_toolsets(
+        row,
+        *,
+        effective_assignee: Optional[str] = None,
+    ) -> tuple[Optional[list[str]], Optional[str]]:
+        assignee = effective_assignee or row["assignee"]
+        key = (assignee, row["enabled_toolsets"])
         if key not in toolset_validation_cache:
             toolset_validation_cache[key] = _validate_task_toolsets_for_spawn(
-                row["enabled_toolsets"], assignee=row["assignee"]
+                row["enabled_toolsets"], assignee=assignee
             )
         return toolset_validation_cache[key]
 
@@ -10852,7 +10877,9 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
-        _effective_toolsets, _toolsets_error = _validate_row_toolsets(row)
+        _effective_toolsets, _toolsets_error = _validate_row_toolsets(
+            row, effective_assignee=row_assignee
+        )
         if _toolsets_error is not None:
             result.auto_blocked.append(row["id"])
             if not dry_run:
