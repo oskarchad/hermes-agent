@@ -32,6 +32,10 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.kanban_alerts import (
+    project_kanban_event_lineage,
+    render_kanban_alert,
+)
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -10004,7 +10008,13 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             pass
 
 
-def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
+def _format_kanban_event_text(
+    sub: dict,
+    task,
+    ev,
+    board_slug: str,
+    latest_run=None,
+) -> Optional[str]:
     """Single-line notification text for one kanban event.
 
     Wording mirrors the gateway notifier (gateway/kanban_watchers.py) so a
@@ -10029,24 +10039,49 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         elif getattr(task, "result", None):
             lines = str(task.result).strip().splitlines()
             handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+        return render_kanban_alert(
+            f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+        )
     if kind == "blocked":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+        return render_kanban_alert(
+            f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+        )
     if kind == "gave_up":
+        lineage = project_kanban_event_lineage(task, ev, latest_run)
         err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
+        blocked = "; task is blocked" if lineage.block_is_current else ""
+        return render_kanban_alert(
+            f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated "
+            f"spawn failures{blocked}{err}",
+            lineage=lineage,
+        )
     if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
+        lineage = project_kanban_event_lineage(task, ev, latest_run)
+        recovery = ""
+        if lineage.retry_is_current:
+            recovery = "; dispatcher will retry"
+        elif lineage.block_is_current:
+            recovery = "; task is blocked"
+        return render_kanban_alert(
+            f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone)"
+            f"{recovery}",
+            lineage=lineage,
+        )
     if kind == "timed_out":
         limit = 0
         try:
             limit = int(payload.get("limit_seconds") or 0)
         except (TypeError, ValueError):
             pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+        return render_kanban_alert(
+            f"⏱ {board_tag}{tag}Kanban {task_id} timed out "
+            f"(max_runtime={limit}s); will retry"
+        )
     if kind == "status":
-        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+        return render_kanban_alert(
+            f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+        )
     return None
 
 
@@ -10135,8 +10170,11 @@ def _collect_kanban_notifications(session: dict) -> list:
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
+                latest_run = _kb.latest_run(conn, sub["task_id"])
                 for ev in events:
-                    text = _format_kanban_event_text(sub, task, ev, slug)
+                    text = _format_kanban_event_text(
+                        sub, task, ev, slug, latest_run,
+                    )
                     if text:
                         texts.append(text)
                 # Unsubscribe only on archive. ``done`` is reversible in
