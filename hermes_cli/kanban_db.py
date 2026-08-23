@@ -11345,7 +11345,8 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, enabled_toolsets FROM tasks "
+        "SELECT id, status, assignee, enabled_toolsets, claim_lock, "
+        "current_run_id, worker_pid FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -11354,7 +11355,8 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee, enabled_toolsets FROM tasks "
+            "SELECT id, status, assignee, enabled_toolsets, claim_lock, "
+            "current_run_id, worker_pid FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -11536,11 +11538,18 @@ def _dispatch_once_locked(
             row, effective_assignee=row_assignee
         )
         if _toolsets_error is not None:
-            result.auto_blocked.append(row["id"])
-            if not dry_run:
-                _audit_and_block_invalid_task_toolsets(
-                    conn, row["id"], _toolsets_error
-                )
+            blocked = dry_run or _audit_and_block_invalid_task_toolsets(
+                conn,
+                row["id"],
+                expected_status=row["status"],
+                expected_assignee=row_assignee,
+                expected_enabled_toolsets=row["enabled_toolsets"],
+                expected_claim_lock=row["claim_lock"],
+                expected_run_id=row["current_run_id"],
+                expected_worker_pid=row["worker_pid"],
+            )
+            if blocked:
+                result.auto_blocked.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -11704,11 +11713,18 @@ def _dispatch_once_locked(
             continue
         _effective_toolsets, _toolsets_error = _validate_row_toolsets(row)
         if _toolsets_error is not None:
-            result.auto_blocked.append(row["id"])
-            if not dry_run:
-                _audit_and_block_invalid_task_toolsets(
-                    conn, row["id"], _toolsets_error
-                )
+            blocked = dry_run or _audit_and_block_invalid_task_toolsets(
+                conn,
+                row["id"],
+                expected_status=row["status"],
+                expected_assignee=row["assignee"],
+                expected_enabled_toolsets=row["enabled_toolsets"],
+                expected_claim_lock=row["claim_lock"],
+                expected_run_id=row["current_run_id"],
+                expected_worker_pid=row["worker_pid"],
+            )
+            if blocked:
+                result.auto_blocked.append(row["id"])
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -12103,23 +12119,71 @@ def _validate_task_toolsets_for_spawn(
 def _audit_and_block_invalid_task_toolsets(
     conn: sqlite3.Connection,
     task_id: str,
-    reason_code: str,
-) -> None:
-    """Block invalid task configuration once, before any process is spawned."""
+    *,
+    expected_status: str,
+    expected_assignee: Optional[str],
+    expected_enabled_toolsets: Optional[str],
+    expected_claim_lock: Optional[str],
+    expected_run_id: Optional[int],
+    expected_worker_pid: Optional[int],
+) -> bool:
+    """CAS-block an unchanged invalid task before any process is spawned."""
     reason = (
         "Invalid enabled_toolsets configuration; edit or clear the task-level "
         "toolset override before retrying."
     )
     with write_txn(conn):
-        conn.execute(
+        current = conn.execute(
+            "SELECT status, assignee, enabled_toolsets, claim_lock, "
+            "current_run_id, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None or any(
+            (
+                current["status"] != expected_status,
+                current["assignee"] != expected_assignee,
+                current["enabled_toolsets"] != expected_enabled_toolsets,
+                current["claim_lock"] != expected_claim_lock,
+                current["current_run_id"] != expected_run_id,
+                current["worker_pid"] != expected_worker_pid,
+            )
+        ):
+            return False
+        if any(
+            value is not None
+            for value in (
+                expected_claim_lock,
+                expected_run_id,
+                expected_worker_pid,
+            )
+        ):
+            return False
+        _effective, reason_code = _validate_task_toolsets_for_spawn(
+            current["enabled_toolsets"], assignee=current["assignee"]
+        )
+        if reason_code is None:
+            return False
+        updated = conn.execute(
             "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL, "
             "block_kind = 'capability', "
             "block_recurrences = CASE "
             "WHEN block_kind = 'capability' THEN block_recurrences + 1 ELSE 1 END "
-            "WHERE id = ?",
-            (task_id,),
+            "WHERE id = ? AND status = ? AND assignee IS ? "
+            "AND enabled_toolsets IS ? AND claim_lock IS ? "
+            "AND current_run_id IS ? AND worker_pid IS ?",
+            (
+                task_id,
+                expected_status,
+                expected_assignee,
+                expected_enabled_toolsets,
+                expected_claim_lock,
+                expected_run_id,
+                expected_worker_pid,
+            ),
         )
+        if updated.rowcount != 1:
+            return False
         _append_event(
             conn,
             task_id,
@@ -12133,6 +12197,7 @@ def _audit_and_block_invalid_task_toolsets(
             {"reason": reason, "kind": "capability"},
         )
     notify_task_updated(conn, task_id, ("status", "block_kind"))
+    return True
 
 
 _retagged_workspace_roots: set[str] = set()

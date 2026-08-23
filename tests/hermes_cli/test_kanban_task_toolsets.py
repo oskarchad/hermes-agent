@@ -462,6 +462,268 @@ def test_dispatch_blocks_tampered_unknown_toolset_before_spawn(
     assert "secret-looking-bad-value" not in serialized
 
 
+def test_dispatch_blocks_tampered_review_toolset_before_spawn(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_task_toolsets(monkeypatch)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="tampered review",
+            assignee="patch",
+            enabled_toolsets=["web"],
+        )
+        assert kb.request_review(conn, task_id, summary="ready for review")
+        conn.execute(
+            "UPDATE tasks SET enabled_toolsets = ? WHERE id = ?",
+            (json.dumps(["web", "unknown-review-toolset"]), task_id),
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_exists", lambda _name: True
+        )
+        monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "ok")
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert spawned == []
+    assert not result.spawned
+    assert result.auto_blocked == [task_id]
+    assert task is not None and task.status == "blocked"
+    validation_events = [
+        event for event in events if event.kind == "toolsets_validation_failed"
+    ]
+    assert len(validation_events) == 1
+    assert validation_events[0].payload == {
+        "field": "enabled_toolsets",
+        "reason_code": "unknown_toolset",
+    }
+
+
+@pytest.mark.parametrize(
+    ("lane", "claim_fn"),
+    [
+        ("ready", kb.claim_task),
+        ("review", kb.claim_review_task),
+    ],
+)
+def test_invalid_toolset_auto_block_preserves_concurrent_owner(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+    claim_fn,
+) -> None:
+    _allow_task_toolsets(monkeypatch)
+    spawned: list[str] = []
+
+    with kb.connect() as dispatcher_conn, kb.connect() as external_conn:
+        task_id = kb.create_task(
+            dispatcher_conn,
+            title=f"concurrent {lane} claim",
+            assignee="patch",
+            enabled_toolsets=["web"],
+        )
+        if lane == "review":
+            assert kb.request_review(
+                dispatcher_conn, task_id, summary="ready for concurrent review"
+            )
+        dispatcher_conn.execute(
+            "UPDATE tasks SET enabled_toolsets = ? WHERE id = ?",
+            (json.dumps(["web", "unknown-after-enumeration"]), task_id),
+        )
+        dispatcher_conn.commit()
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_exists", lambda _name: True
+        )
+        monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "ok")
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+
+        claimed: dict[str, kb.Task] = {}
+
+        def claim_during_validation(*_args, **_kwargs) -> set[str]:
+            if not claimed:
+                successor = claim_fn(
+                    external_conn,
+                    task_id,
+                    claimer=f"external-{lane}-owner",
+                )
+                assert successor is not None
+                assert successor.current_run_id is not None
+                assert successor.claim_lock is not None
+                assert kb._set_worker_pid(
+                    external_conn,
+                    task_id,
+                    4242,
+                    expected_run_id=successor.current_run_id,
+                    expected_claim_lock=successor.claim_lock,
+                )
+                owned = kb.get_task(external_conn, task_id)
+                assert owned is not None
+                claimed["task"] = owned
+            return {"context7", "kanban", "web"}
+
+        monkeypatch.setattr(
+            kb, "_available_task_toolset_names", claim_during_validation
+        )
+
+        result = kb.dispatch_once(
+            dispatcher_conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        successor = claimed["task"]
+        current = kb.get_task(dispatcher_conn, task_id)
+        run = dispatcher_conn.execute(
+            "SELECT status, outcome, ended_at, claim_lock, worker_pid "
+            "FROM task_runs WHERE id = ?",
+            (successor.current_run_id,),
+        ).fetchone()
+        events = kb.list_events(dispatcher_conn, task_id)
+
+    assert spawned == []
+    assert not result.spawned
+    assert result.auto_blocked == []
+    assert current is not None and current.status == "running"
+    assert current.claim_lock == successor.claim_lock
+    assert current.current_run_id == successor.current_run_id
+    assert current.worker_pid == 4242
+    assert run is not None and run["status"] == "running"
+    assert run["outcome"] is None
+    assert run["ended_at"] is None
+    assert run["claim_lock"] == successor.claim_lock
+    assert run["worker_pid"] == 4242
+    assert not any(
+        event.kind == "toolsets_validation_failed" for event in events
+    )
+
+
+def test_invalid_toolset_auto_block_rechecks_concurrent_config_update(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_task_toolsets(monkeypatch)
+
+    with kb.connect() as dispatcher_conn, kb.connect() as external_conn:
+        task_id = kb.create_task(
+            dispatcher_conn,
+            title="concurrent toolset repair",
+            assignee="patch",
+            enabled_toolsets=["web"],
+        )
+        dispatcher_conn.execute(
+            "UPDATE tasks SET enabled_toolsets = ? WHERE id = ?",
+            (json.dumps(["web", "unknown-before-repair"]), task_id),
+        )
+        dispatcher_conn.commit()
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_exists", lambda _name: True
+        )
+        monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "ok")
+
+        repaired = False
+
+        def repair_during_validation(*_args, **_kwargs) -> set[str]:
+            nonlocal repaired
+            if not repaired:
+                external_conn.execute(
+                    "UPDATE tasks SET enabled_toolsets = ? WHERE id = ?",
+                    (json.dumps(["web"]), task_id),
+                )
+                external_conn.commit()
+                repaired = True
+            return {"context7", "kanban", "web"}
+
+        monkeypatch.setattr(
+            kb, "_available_task_toolset_names", repair_during_validation
+        )
+        first = kb.dispatch_once(dispatcher_conn, spawn_fn=lambda *_args: None)
+        current = kb.get_task(dispatcher_conn, task_id)
+        first_events = kb.list_events(dispatcher_conn, task_id)
+
+        monkeypatch.setattr(
+            kb,
+            "_available_task_toolset_names",
+            lambda *_args, **_kwargs: {"context7", "kanban", "web"},
+        )
+        second = kb.dispatch_once(
+            dispatcher_conn,
+            dry_run=True,
+            spawn_fn=lambda *_args: None,
+        )
+
+    assert first.auto_blocked == []
+    assert current is not None and current.status == "ready"
+    assert current.enabled_toolsets == ["web"]
+    assert not any(
+        event.kind == "toolsets_validation_failed" for event in first_events
+    )
+    assert [item[0] for item in second.spawned] == [task_id]
+
+
+def test_invalid_toolset_auto_block_rechecks_concurrent_assignee_update(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _allow_task_toolsets(monkeypatch)
+
+    with kb.connect() as dispatcher_conn, kb.connect() as external_conn:
+        task_id = kb.create_task(
+            dispatcher_conn,
+            title="concurrent assignee repair",
+            assignee="patch",
+            enabled_toolsets=["terminal"],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_exists", lambda _name: True
+        )
+        monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "ok")
+        monkeypatch.setattr(kb, "_profile_home_for_task", lambda assignee: assignee)
+
+        reassigned = False
+
+        def reassign_during_validation(profile_home: str | None) -> set[str]:
+            nonlocal reassigned
+            if not reassigned:
+                assert profile_home == "patch"
+                external_conn.execute(
+                    "UPDATE tasks SET assignee = ? WHERE id = ?",
+                    ("gauge", task_id),
+                )
+                external_conn.commit()
+                reassigned = True
+                return {"kanban", "terminal"}
+            return {"context7", "kanban", "terminal"}
+
+        monkeypatch.setattr(
+            kb, "_available_task_toolset_names", reassign_during_validation
+        )
+        first = kb.dispatch_once(dispatcher_conn, spawn_fn=lambda *_args: None)
+        current = kb.get_task(dispatcher_conn, task_id)
+        first_events = kb.list_events(dispatcher_conn, task_id)
+
+        second = kb.dispatch_once(
+            dispatcher_conn,
+            dry_run=True,
+            spawn_fn=lambda *_args: None,
+        )
+
+    assert first.auto_blocked == []
+    assert current is not None and current.status == "ready"
+    assert current.assignee == "gauge"
+    assert not any(
+        event.kind == "toolsets_validation_failed" for event in first_events
+    )
+    assert second.spawned == [(task_id, "gauge", "")]
+
+
 def test_dispatch_validates_default_assignee_toolsets_before_claim_or_spawn(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
