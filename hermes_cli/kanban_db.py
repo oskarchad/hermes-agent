@@ -5356,7 +5356,10 @@ def release_stale_claims(
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"],
+            row["claim_lock"],
+            signal_fn=signal_fn,
+            scope_expected=_worker_scope_expected(conn, row["id"]),
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -5456,8 +5459,21 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        row["worker_pid"],
+        prev_lock,
+        signal_fn=signal_fn,
+        scope_expected=_worker_scope_expected(conn, task_id),
     )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_cleanup_incomplete",
+        )
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -8163,18 +8179,19 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Archive an inactive task; running tasks require verified reclaim first."""
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            "WHERE id = ? AND status NOT IN ('archived', 'running')",
             (task_id,),
         )
         if cur.rowcount != 1:
             return False
-        # If archive happened while a run was still in flight (e.g. user
-        # archived a running task from the dashboard), close that run with
-        # outcome='reclaimed' so attempt history isn't orphaned.
+        # Close any legacy non-running run left open by an older transition so
+        # attempt history is not orphaned. Running ownership is never cleared
+        # here: callers must explicitly reclaim and verify cleanup first.
         run_id = _end_run(
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
@@ -8979,10 +8996,72 @@ def _build_kanban_worker_scope_argv(cmd: list[str], claim_lock: str) -> list[str
 
 
 def _stop_kanban_worker_scope(claim_lock: str) -> bool:
-    """Stop the exact transient scope derived from an owned worker claim."""
+    """Stop and verify the exact transient scope for an owned worker claim."""
     from tools.process_registry import _stop_systemd_unit
 
-    return bool(_stop_systemd_unit(_kanban_worker_scope_unit(claim_lock)))
+    unit = _kanban_worker_scope_unit(claim_lock)
+    return bool(_stop_systemd_unit(unit) and _systemd_worker_scope_inactive(unit))
+
+
+def _systemd_worker_scope_inactive(unit_name: str) -> bool:
+    """Verify that a transient user scope no longer owns live processes."""
+    binary = shutil.which("systemctl")
+    if binary is None:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                binary,
+                "--user",
+                "show",
+                unit_name,
+                "--property=LoadState",
+                "--property=ActiveState",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        error = f"{result.stdout}\n{result.stderr}".lower()
+        return any(
+            marker in error
+            for marker in ("not loaded", "not found", "does not exist")
+        )
+    states = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            states[key] = value
+    return states.get("LoadState") == "not-found" or states.get("ActiveState") in {
+        "inactive",
+        "failed",
+    }
+
+
+def _worker_scope_expected(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Resolve the active run's persisted worker-isolation contract."""
+    row = conn.execute(
+        "SELECT e.payload FROM tasks t "
+        "LEFT JOIN task_events e ON e.task_id = t.id "
+        "  AND e.run_id = t.current_run_id AND e.kind = 'spawned' "
+        "WHERE t.id = ? ORDER BY e.id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is not None and row["payload"]:
+        try:
+            isolation_mode = json.loads(row["payload"]).get("isolation_mode")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            isolation_mode = None
+        if isolation_mode == "systemd_scope":
+            return True
+        if isolation_mode == "process_session":
+            return False
+    # Legacy runs predate persisted isolation metadata. Preserve the original
+    # provenance-based decision for those in-flight workers.
+    return _systemd_worker_scope_required()
 
 
 def _signal_owned_worker(
@@ -9014,8 +9093,9 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    scope_expected: Optional[bool] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Stop a host-local worker and verify its exact ownership boundary."""
     import signal
 
     info: dict[str, Any] = {
@@ -9027,6 +9107,12 @@ def _terminate_reclaimed_worker(
         "termination_target": None,
         "scope_stop_attempted": False,
         "scope_stopped": False,
+        "scope_expected": bool(
+            _systemd_worker_scope_required()
+            if scope_expected is None
+            else scope_expected
+        ),
+        "cleanup_verified": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -9037,18 +9123,16 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     info["termination_attempted"] = True
-    if _systemd_worker_scope_required():
+    if info["scope_expected"]:
         info["scope_stop_attempted"] = True
         info["scope_stopped"] = _stop_kanban_worker_scope(str(claim_lock))
         if info["scope_stopped"]:
             info["termination_target"] = "systemd_scope"
-
-    if info["scope_stopped"]:
-        for _ in range(10):
-            if not _pid_alive(pid):
-                info["terminated"] = True
-                return info
-            time.sleep(0.5)
+            # The exact cgroup is authoritative. Once systemd confirms it is
+            # inactive, do not fall back to a potentially reused wrapper PID.
+            info["terminated"] = True
+            info["cleanup_verified"] = True
+            return info
 
     # Preserve the historical ``signal_fn`` test-hook contract: an injected
     # signal function observes the initial SIGTERM even when its companion
@@ -9064,6 +9148,7 @@ def _terminate_reclaimed_worker(
             )
         except ProcessLookupError:
             info["terminated"] = True
+            info["cleanup_verified"] = not info["scope_expected"]
             return info
         except (PermissionError, OSError):
             return info
@@ -9071,6 +9156,7 @@ def _terminate_reclaimed_worker(
     for _ in range(10):
         if not _pid_alive(pid):
             info["terminated"] = True
+            info["cleanup_verified"] = not info["scope_expected"]
             return info
         time.sleep(0.5)
 
@@ -9085,22 +9171,35 @@ def _terminate_reclaimed_worker(
             return info
 
     info["terminated"] = not _pid_alive(pid)
+    info["cleanup_verified"] = bool(
+        info["scope_stopped"]
+        if info["scope_expected"]
+        else info["terminated"]
+    )
     return info
 
 
 def _worker_survived_termination(termination: dict) -> bool:
-    """True when we tried to kill our own host-local worker and it is still alive.
+    """True when exact host-local worker cleanup is still incomplete.
 
-    Reclaiming in this state would release the claim and let the dispatcher
-    spawn a second worker while the first is still running — the duplication
-    loop. Only host-local workers we actually signalled count: a non-local
-    claim lock or a no-op attempt (no ``os.kill`` available) must fall through
-    to the normal release path, since we cannot manage that worker anyway.
+    Wrapper PID death is insufficient when a transient scope was used: a failed
+    stop or inactive-state verification can leave descendants alive. Preserve
+    claim/run ownership until the exact scope verifies clean. Older injected
+    test payloads without ``cleanup_verified`` retain equivalent semantics.
     """
+    cleanup_verified = termination.get("cleanup_verified")
+    if cleanup_verified is None:
+        cleanup_verified = bool(
+            termination.get("terminated")
+            and (
+                not termination.get("scope_stop_attempted")
+                or termination.get("scope_stopped")
+            )
+        )
     return bool(
         termination.get("termination_attempted")
         and termination.get("host_local")
-        and not termination.get("terminated")
+        and not cleanup_verified
     )
 
 
@@ -9245,6 +9344,7 @@ def enforce_max_runtime(
             pid,
             row["claim_lock"],
             signal_fn=signal_fn,
+            scope_expected=_worker_scope_expected(conn, tid),
         )
         # A timeout is not permission to launch a duplicate beside a worker
         # that survived cleanup. Preserve the claim and retry termination on a
@@ -9380,7 +9480,10 @@ def detect_stale_running(
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+            pid,
+            lock,
+            signal_fn=signal_fn,
+            scope_expected=_worker_scope_expected(conn, tid),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -9649,6 +9752,38 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    cleanup_ready: dict[str, dict[str, Any]] = {}
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    cleanup_rows = conn.execute(
+        "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    for row in cleanup_rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        started_at = row["started_at"]
+        if started_at is not None and now - int(started_at) < _resolve_crash_grace_seconds():
+            continue
+        if _pid_alive(row["worker_pid"]):
+            continue
+        termination = _terminate_reclaimed_worker(
+            int(row["worker_pid"]),
+            row["claim_lock"],
+            scope_expected=_worker_scope_expected(conn, row["id"]),
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                row["id"],
+                row["claim_lock"],
+                now,
+                termination,
+                reason="crash_scope_cleanup_incomplete",
+            )
+            continue
+        cleanup_ready[row["id"]] = termination
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9657,8 +9792,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str, Optional[int]]] = []
     # (task_id, pid, claimer, protocol_violation, error_text, trigger_run_id)
-    scope_cleanup_details: list[tuple[int, str]] = []
-    # (pid, claim_lock)
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
@@ -9668,7 +9801,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
@@ -9683,6 +9815,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if time.time() - started_at < grace:
                     continue
             if _pid_alive(row["worker_pid"]):
+                continue
+            # Cleanup is a precondition for releasing ownership. A worker that
+            # died after the preflight snapshot waits for the next tick; a
+            # failed exact-scope stop was deferred above with claim/run intact.
+            if row["id"] not in cleanup_ready:
                 continue
 
             pid = int(row["worker_pid"])
@@ -9774,7 +9911,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
-                scope_cleanup_details.append((pid, row["claim_lock"]))
+
                 exited_hook_payloads.append({
                     "task_id": row["id"],
                     "assignee": row["assignee"],
@@ -9814,13 +9951,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text, run_id)
                     )
-    # Outside the main txn: a dead worker parent can leave descendants alive
-    # inside its task-owned transient scope. Stop that exact scope before this
-    # dispatch tick can spawn a retry. Keep event ordering/lineage unchanged:
-    # ``crashed`` / ``rate_limited`` remains the authoritative exit event.
-    for pid, claim_lock in scope_cleanup_details:
-        _terminate_reclaimed_worker(pid, claim_lock)
-
     # Account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
     # on top of the event we already emitted).

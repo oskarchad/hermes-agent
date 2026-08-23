@@ -138,6 +138,49 @@ def test_reclaim_stops_exact_worker_scope_before_pid_fallback(monkeypatch):
 
 
 @pytest.mark.linux_only
+def test_scope_stop_requires_inactive_verification(monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import process_registry
+
+    stopped = []
+    monkeypatch.setattr(
+        process_registry,
+        "_stop_systemd_unit",
+        lambda unit: stopped.append(unit) or True,
+    )
+    monkeypatch.setattr(
+        kb,
+        "_systemd_worker_scope_inactive",
+        lambda _unit: False,
+        raising=False,
+    )
+
+    assert kb._stop_kanban_worker_scope("host:pid:scope-token") is False
+    assert stopped == [kb._kanban_worker_scope_unit("host:pid:scope-token")]
+
+
+@pytest.mark.linux_only
+def test_dead_wrapper_does_not_hide_failed_scope_cleanup(monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    host = kb._claimer_id().split(":", 1)[0]
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda _lock: False)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    result = kb._terminate_reclaimed_worker(
+        12345,
+        f"{host}:owned-scope",
+        scope_expected=True,
+    )
+
+    assert result["terminated"] is True
+    assert result["scope_stop_attempted"] is True
+    assert result["scope_stopped"] is False
+    assert result["cleanup_verified"] is False
+    assert kb._worker_survived_termination(result) is True
+
+
+@pytest.mark.linux_only
 def test_reclaim_never_stops_scope_for_foreign_host(monkeypatch):
     from hermes_cli import kanban_db as kb
 
@@ -502,5 +545,163 @@ def test_crash_reclaim_stops_surviving_worker_scope_descendants(
         crash = next(event for event in events if event.kind == "crashed")
         assert crash.run_id == claimed.current_run_id
         assert not any(event.kind == "worker_scope_cleanup" for event in events)
+    finally:
+        conn.close()
+
+
+def test_crash_cleanup_failure_preserves_run_and_suppresses_retry_until_verified(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="dead wrapper live child", assignee="patch")
+        lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=lock)
+        assert claimed is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                82345,
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(lock),
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (int(time.time()) - 30, task_id),
+        )
+        conn.commit()
+
+        state = {"scope_stopped": False}
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("unknown", None))
+        monkeypatch.setattr(
+            kb,
+            "_stop_kanban_worker_scope",
+            lambda _lock: state["scope_stopped"],
+        )
+
+        assert kb.detect_crashed_workers(conn) == []
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.claim_lock == lock
+        assert held.worker_pid == 82345
+        assert held.current_run_id == claimed.current_run_id
+        deferred = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "reclaim_deferred"
+        )
+        assert deferred.run_id == claimed.current_run_id
+        assert deferred.payload["reason"] == "crash_scope_cleanup_incomplete"
+        assert deferred.payload["cleanup_verified"] is False
+
+        spawns = []
+        dispatch = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: spawns.append("duplicate") or 90001,
+        )
+        assert dispatch.spawned == []
+        assert spawns == []
+
+        state["scope_stopped"] = True
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        released = kb.get_task(conn, task_id)
+        assert released is not None
+        assert released.status == "ready"
+        assert released.claim_lock is None
+        assert released.worker_pid is None
+        assert released.current_run_id is None
+    finally:
+        conn.close()
+
+
+def test_manual_reclaim_scope_failure_preserves_ownership(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="reclaim exact scope", assignee="patch")
+        lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=lock)
+        assert claimed is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                83456,
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(lock),
+            ),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda _lock: False)
+
+        assert kb.reclaim_task(conn, task_id, reason="operator stop") is False
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_lock == lock
+        assert task.worker_pid == 83456
+        assert task.current_run_id == claimed.current_run_id
+        event = kb.list_events(conn, task_id)[-1]
+        assert event.kind == "reclaim_deferred"
+        assert event.run_id == claimed.current_run_id
+        assert event.payload["reason"] == "manual_reclaim_cleanup_incomplete"
+    finally:
+        conn.close()
+
+
+def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="archive running", assignee="patch")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 84567)
+
+        assert kb.archive_task(conn, task_id) is False
+        running = kb.get_task(conn, task_id)
+        assert running is not None
+        assert running.status == "running"
+        assert running.claim_lock == claimed.claim_lock
+        assert running.worker_pid == 84567
+        assert running.current_run_id == claimed.current_run_id
+        assert not any(event.kind == "archived" for event in kb.list_events(conn, task_id))
+
+        monkeypatch.setattr(
+            kb,
+            "_terminate_reclaimed_worker",
+            lambda *_args, **_kwargs: {
+                "prev_pid": 84567,
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": True,
+                "sigkill": False,
+                "termination_target": "process_group",
+                "scope_stop_attempted": False,
+                "scope_stopped": False,
+                "cleanup_verified": True,
+            },
+        )
+        assert kb.reclaim_task(conn, task_id, reason="archive requested") is True
+        assert kb.archive_task(conn, task_id) is True
+
+        archived = kb.get_task(conn, task_id)
+        assert archived is not None
+        assert archived.status == "archived"
+        assert archived.claim_lock is None
+        assert archived.worker_pid is None
+        assert archived.current_run_id is None
     finally:
         conn.close()
