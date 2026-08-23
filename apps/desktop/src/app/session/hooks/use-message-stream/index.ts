@@ -563,7 +563,8 @@ export function useMessageStream({
       text: string,
       responsePreviewed?: boolean,
       failure?: { error: string; partial: boolean; surface?: ErrorSurface | null },
-      occurredAt = Date.now() / 1000
+      occurredAt = Date.now() / 1000,
+      completionId?: string
     ) => {
       let shouldHydrate = false
 
@@ -613,6 +614,7 @@ export function useMessageStream({
         const completeMessage = (message: ChatMessage): ChatMessage => {
           const settled = {
             ...message,
+            ...(completionId ? { id: completionId } : {}),
             completedAt: occurredAt,
             parts: completeOpenTimelineParts(message.parts, occurredAt),
             pending: false,
@@ -633,7 +635,7 @@ export function useMessageStream({
         }
 
         const newAssistantFromCompletion = (): ChatMessage => ({
-          id: `assistant-${Date.now()}`,
+          id: completionId || `assistant-${Date.now()}`,
           role: 'assistant',
           parts:
             completionError && !keepFailedPartialText
@@ -650,7 +652,18 @@ export function useMessageStream({
         const prev = state.messages
         let nextMessages = prev
 
-        if (streamId && prev.some(m => m.id === streamId)) {
+        const replayedCompletion = Boolean(
+          completionId && prev.some(message => message.id === completionId && !message.pending)
+        )
+
+        if (replayedCompletion) {
+          // A Captain retry may have streamed into a fresh pending bubble before
+          // its stable completion id arrives. Keep the already-visible receipt
+          // and discard only that transient replay bubble.
+          nextMessages = streamId
+            ? prev.filter(message => message.id !== streamId || message.id === completionId)
+            : prev
+        } else if (streamId && prev.some(m => m.id === streamId)) {
           nextMessages = prev.map(m => (m.id === streamId ? completeMessage(m) : m))
         } else {
           const fallbackIndex = [...prev]

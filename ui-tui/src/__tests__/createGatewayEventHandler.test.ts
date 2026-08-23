@@ -67,23 +67,20 @@ describe('createGatewayEventHandler', () => {
     patchUiState({ showReasoning: true })
   })
 
-  it('deduplicates replayed process receipts by stable id across intervening status', () => {
-    const onEvent = createGatewayEventHandler(buildCtx([]))
+  it('deduplicates a replayed Captain assistant completion by stable id', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
 
-    onEvent({
-      payload: { id: 'kanban:board:42', kind: 'process', text: 'Task finished' },
-      type: 'status.update'
-    } as any)
-    onEvent({
-      payload: { kind: 'process', text: 'Unrelated process status' },
-      type: 'status.update'
-    } as any)
-    onEvent({
-      payload: { id: 'kanban:board:42', kind: 'process', text: 'Task finished' },
-      type: 'status.update'
-    } as any)
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({
+        payload: { id: 'kanban-report:board:42', text: 'Captain report' },
+        type: 'message.complete'
+      } as any)
+    }
 
-    expect(getTurnState().activity.filter(item => item.text === 'Task finished')).toHaveLength(1)
+    expect(appended.filter(msg => msg.role === 'assistant' && msg.text === 'Captain report')).toHaveLength(1)
+    expect(getUiState().busy).toBe(false)
   })
 
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {

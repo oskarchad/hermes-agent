@@ -716,9 +716,11 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
         conn.close()
 
     attempts: list[str] = []
+    completion_ids: list[str | None] = []
 
     def submit(_rid, _sid, _session, text, **kwargs):
         attempts.append(text)
+        completion_ids.append(kwargs.get("completion_id"))
         if len(attempts) == 1:
             return False
         kwargs["on_terminal"](True)
@@ -744,6 +746,8 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     run_once()
     assert len(attempts) == 2
     assert attempts[1] == attempts[0]
+    assert completion_ids[0]
+    assert completion_ids[1] == completion_ids[0]
     assert _inbox_states() == {"acked": 1}
 
     # Turn finishes; a later idle poll must not replay the acked report.
@@ -801,7 +805,93 @@ def test_cross_process_live_origin_wins_shared_captain_claim():
     assert _collect_kanban_notifications(origin, claim_records=[]) == []
 
 
-def test_tenant_tagged_fallback_requires_explicit_same_tenant_receiver():
+def test_busy_origin_heartbeat_stays_fresh_before_any_event(monkeypatch):
+    """A long-running origin publishes liveness without pending Captain work."""
+    from tools.process_registry import process_registry
+
+    origin = {
+        **_session(ORIGIN_KEY),
+        "history_lock": threading.Lock(),
+        "running": True,
+    }
+    profile = _profile_for(origin)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="idle-before-event", assignee="worker")
+        kb.register_captain_owner(
+            conn, tid, profile=profile, origin_session_key=ORIGIN_KEY
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_captain_receivers SET last_seen = ?",
+                (int(time.time()) - server._CAPTAIN_RECEIVER_TTL_SECONDS - 1,),
+            )
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
+    server._notification_poller_loop(_StopAfterOnePoll(), "sid-origin", origin)
+
+    conn = kb.connect()
+    try:
+        assert kb.captain_receiver_is_live(
+            conn,
+            profile=profile,
+            session_key=ORIGIN_KEY,
+            max_age_seconds=server._CAPTAIN_RECEIVER_TTL_SECONDS,
+        )
+    finally:
+        conn.close()
+
+
+def test_lease_rechecks_origin_liveness_atomically_after_candidate_read(monkeypatch):
+    """A sibling cannot lease after the origin refreshes during its claim."""
+    origin = _session(ORIGIN_KEY)
+    sibling = _session(SIBLING_KEY)
+    profile = _profile_for(origin)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="atomic-origin", assignee="worker")
+        kb.register_captain_owner(
+            conn, tid, profile=profile, origin_session_key=ORIGIN_KEY
+        )
+        kb.complete_task(conn, tid, summary="origin still owns this")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE kanban_captain_receivers SET last_seen = ?",
+                (int(time.time()) - server._CAPTAIN_RECEIVER_TTL_SECONDS - 1,),
+            )
+    finally:
+        conn.close()
+
+    real_lease = kb.lease_captain_reports
+
+    def refresh_origin_then_lease(conn, **kwargs):
+        if kwargs.get("owner") == SIBLING_KEY:
+            kb.touch_captain_receiver(
+                conn,
+                profile=profile,
+                session_key=ORIGIN_KEY,
+                tenant=None,
+            )
+        return real_lease(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "lease_captain_reports", refresh_origin_then_lease)
+    server._sessions.clear()
+    _register_live("sid-sibling", sibling)
+    assert _collect_kanban_notifications(sibling, claim_records=[]) == []
+    assert _inbox_states() == {"pending": 1}
+
+    server._sessions.clear()
+    _register_live("sid-origin", origin)
+    claims = []
+    texts = _collect_kanban_notifications(origin, claim_records=claims)
+    assert len(texts) == 1 and "origin still owns this" in texts[0]
+    server._settle_kanban_notification_claims(claims, accepted=True)
+
+
+def test_tenant_tagged_unattached_report_has_no_fallback_without_session_identity():
     profile = _profile_for(_session("tenant-origin"))
     conn = kb.connect()
     try:
@@ -817,19 +907,12 @@ def test_tenant_tagged_fallback_requires_explicit_same_tenant_receiver():
 
     unscoped = _session("unscoped")
     wrong = {**_session("tenant-b"), "tenant": "tenant-b"}
-    matching = {**_session("tenant-a"), "tenant": "tenant-a"}
-    for sid, candidate in (("u", unscoped), ("b", wrong)):
+    fabricated_matching = {**_session("tenant-a"), "tenant": "tenant-a"}
+    for sid, candidate in (("u", unscoped), ("b", wrong), ("a", fabricated_matching)):
         server._sessions.clear()
         _register_live(sid, candidate)
         assert _collect_kanban_notifications(candidate, claim_records=[]) == []
         assert _inbox_states() == {"pending": 1}
-
-    server._sessions.clear()
-    _register_live("a", matching)
-    claims = []
-    texts = _collect_kanban_notifications(matching, claim_records=claims)
-    assert len(texts) == 1 and "tenant private" in texts[0]
-    server._settle_kanban_notification_claims(claims, accepted=True)
 
 
 def test_exact_origin_preserved_for_tenant_task_without_receiver_binding():
@@ -886,6 +969,35 @@ def test_backlog_is_paged_under_strict_row_and_byte_caps():
     assert len(delivered) == total
     assert len(page_sizes) >= 3
     assert _inbox_states() == {"acked": total}
+
+
+def test_row_cap_is_global_across_multiple_boards():
+    profile = _profile_for(_session("global-cap"))
+    second_board = "captain-second"
+    kb.create_board(second_board)
+    for board in (kb.DEFAULT_BOARD, second_board):
+        conn = kb.connect(board=board)
+        try:
+            for index in range(server._CAPTAIN_POLL_ROW_CAP):
+                tid = kb.create_task(
+                    conn, title=f"{board}-{index}", assignee="worker"
+                )
+                kb.register_captain_owner(
+                    conn, tid, profile=profile, origin_session_key=None
+                )
+                kb.complete_task(conn, tid, summary="global page")
+        finally:
+            conn.close()
+
+    session = _session("global-cap")
+    _register_live("global-cap", session)
+    claims = []
+    texts = _collect_kanban_notifications(session, claim_records=claims)
+
+    assert len(texts) == server._CAPTAIN_POLL_ROW_CAP
+    assert sum(
+        1 for record in claims if record.get("route") == "captain"
+    ) == server._CAPTAIN_POLL_ROW_CAP
 
 
 def test_ineligible_first_page_cannot_starve_later_fallback_report():

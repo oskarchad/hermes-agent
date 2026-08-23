@@ -746,6 +746,7 @@ export type GatewayEvent =
       payload?: {
         billing?: BillingBlock
         failure_reason?: string
+        id?: string
         reasoning?: string
         rendered?: string
         response_previewed?: boolean

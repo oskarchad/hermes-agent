@@ -419,9 +419,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   syncThemeToTerminalBackground()
 
   // Survives gateway reconnects for the life of this UI handler. Captain
-  // retries intentionally reuse the event-derived receipt id, so a server
-  // crash between external emission and DB ack cannot paint the report twice.
-  const statusReceiptIds = new Set<string>()
+  // retries intentionally reuse the event-derived completion id.
+  const messageReceiptIds = new Set<string>()
 
   const { rpc } = ctx.gateway
   const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
@@ -833,22 +832,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (!p?.text) {
           return
-        }
-
-        if (p.id) {
-          if (statusReceiptIds.has(p.id)) {
-            return
-          }
-
-          if (statusReceiptIds.size >= 1024) {
-            const oldest = statusReceiptIds.values().next().value
-
-            if (oldest) {
-              statusReceiptIds.delete(oldest)
-            }
-          }
-
-          statusReceiptIds.add(p.id)
         }
 
         if (p.kind === 'goal') {
@@ -1443,9 +1426,24 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.complete': {
+        const receiptId = typeof ev.payload?.id === 'string' ? ev.payload.id : ''
+        const replayedReceipt = Boolean(receiptId && messageReceiptIds.has(receiptId))
+
+        if (receiptId && !replayedReceipt) {
+          if (messageReceiptIds.size >= 1024) {
+            const oldest = messageReceiptIds.values().next().value
+
+            if (oldest) {
+              messageReceiptIds.delete(oldest)
+            }
+          }
+
+          messageReceiptIds.add(receiptId)
+        }
+
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
 
-        if (!wasInterrupted) {
+        if (!wasInterrupted && !replayedReceipt) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
           msgs.forEach(appendMessage)
 

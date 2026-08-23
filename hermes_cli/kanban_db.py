@@ -13997,14 +13997,14 @@ def read_captain_candidates(
     conn: sqlite3.Connection, *, profile: str, now: Optional[int] = None,
     limit: int = 32,
     receiver_session_key: Optional[str] = None,
-    receiver_tenant: Optional[str] = None,
     receiver_max_age_seconds: int = 15,
 ) -> list[dict]:
     """Return claimable Captain rows for ``profile`` (pending or lease-expired).
 
-    Each row carries the registered ``origin_session_key`` so the caller can
-    apply in-process liveness eligibility (the live origin session owns
-    delivery) before taking the durable lease.
+    Each row carries the registered ``origin_session_key`` for formatting and
+    diagnostics. Cross-process liveness is read from the durable receiver
+    table here and rechecked inside ``lease_captain_reports`` so a stale
+    candidate read cannot steal from an origin that refreshed meanwhile.
     """
     prof = _normalize_captain_profile(profile)
     now = int(time.time()) if now is None else int(now)
@@ -14012,29 +14012,23 @@ def read_captain_candidates(
     eligibility_params: tuple = ()
     if receiver_session_key is not None:
         session_key = str(receiver_session_key)
-        tenant = str(receiver_tenant).strip() if receiver_tenant else None
         eligibility_sql = (
             " AND ("
-            "   ((r.origin_session_key IS NULL OR r.origin_session_key = '') "
-            "    AND (i.tenant IS NULL OR i.tenant = ?)) "
-            "   OR r.origin_session_key = ? "
-            "   OR (r.origin_session_key IS NOT NULL "
-            "       AND r.origin_session_key != '' "
-            "       AND r.origin_session_key != ? "
-            "       AND (i.tenant IS NULL OR i.tenant = ?) "
-            "       AND NOT EXISTS ("
+            "   r.origin_session_key = ? "
+            "   OR (i.tenant IS NULL AND ("
+            "       r.origin_session_key IS NULL OR r.origin_session_key = '' "
+            "       OR (r.origin_session_key != ? AND NOT EXISTS ("
             "           SELECT 1 FROM kanban_captain_receivers cr "
             "           WHERE cr.profile = i.profile "
             "             AND cr.session_key = r.origin_session_key "
             "             AND cr.last_seen >= ?"
-            "       ))"
+            "       )))"
+            "   )"
             " )"
         )
         eligibility_params = (
-            tenant,
             session_key,
             session_key,
-            tenant,
             now - max(1, int(receiver_max_age_seconds)),
         )
     rows = conn.execute(
@@ -14064,13 +14058,17 @@ def lease_captain_reports(
     event_ids: Iterable[int],
     now: Optional[int] = None,
     lease_seconds: int = 120,
+    receiver_session_key: Optional[str] = None,
+    receiver_max_age_seconds: int = 15,
 ) -> tuple[str, list[Event]]:
     """Atomically lease the given ``event_ids`` for ``profile`` under ``owner``.
 
     Returns ``(token, events)``. Only rows currently ``pending`` or holding an
     expired lease flip to ``leased`` under a freshly minted opaque token, so
-    concurrent same-profile pollers never both win the same row. The returned
-    events are joined against ``task_events`` so the caller can format them.
+    concurrent same-profile pollers never both win the same row. When a
+    receiver key is supplied, origin liveness and tenant fail-closed rules are
+    rechecked in the same write transaction as the lease. The returned events
+    are joined against ``task_events`` so the caller can format them.
     """
     prof = _normalize_captain_profile(profile)
     # Defensive cap keeps the dynamic IN clause comfortably below every
@@ -14082,6 +14080,33 @@ def lease_captain_reports(
     now = int(time.time()) if now is None else int(now)
     expires = now + int(lease_seconds)
     placeholders = ",".join("?" * len(ids))
+    eligibility_sql = ""
+    eligibility_params: tuple = ()
+    if receiver_session_key is not None:
+        receiver = str(receiver_session_key)
+        eligibility_sql = (
+            " AND EXISTS ("
+            "   SELECT 1 FROM kanban_captain_registry r "
+            "   WHERE r.task_id = kanban_captain_inbox.task_id AND ("
+            "     r.origin_session_key = ? "
+            "     OR (kanban_captain_inbox.tenant IS NULL AND ("
+            "       r.origin_session_key IS NULL OR r.origin_session_key = '' OR ("
+            "         r.origin_session_key != ? AND NOT EXISTS ("
+            "           SELECT 1 FROM kanban_captain_receivers cr "
+            "           WHERE cr.profile = kanban_captain_inbox.profile "
+            "             AND cr.session_key = r.origin_session_key "
+            "             AND cr.last_seen >= ?"
+            "         )"
+            "       )"
+            "     ))"
+            "   )"
+            " )"
+        )
+        eligibility_params = (
+            receiver,
+            receiver,
+            now - max(1, int(receiver_max_age_seconds)),
+        )
     with write_txn(conn):
         conn.execute(
             "UPDATE kanban_captain_inbox "
@@ -14090,8 +14115,8 @@ def lease_captain_reports(
             f"WHERE profile = ? AND event_id IN ({placeholders}) AND ("
             "  state = 'pending' OR "
             "  (state = 'leased' AND (lease_expires IS NULL OR lease_expires < ?))"
-            ")",
-            (token, owner, expires, now, prof, *ids, now),
+            ")" + eligibility_sql,
+            (token, owner, expires, now, prof, *ids, now, *eligibility_params),
         )
         rows = conn.execute(
             "SELECT i.event_id, e.task_id, e.kind, e.payload, e.created_at, e.run_id "

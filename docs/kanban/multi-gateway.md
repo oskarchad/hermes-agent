@@ -46,12 +46,24 @@ their owned profiles. The TUI/Desktop **Captain reporting inbox** (see the
 [Kanban feature guide](../../website/docs/user-guide/features/kanban.md), "TUI &
 Desktop Captain reports") is a different, local mechanism: it durably reports a
 task's terminal event to an active TUI/Desktop session bound to the
-**same normalized profile**, exactly once, with the live origin session
-preferred and another same-profile session claiming only when the origin is
-gone.
+**same normalized profile**, exactly once. Every session publishes receiver
+liveness independently of pending work; the live exact origin wins, and an
+untenant row may fall back to another same-profile session only after that
+origin heartbeat expires. Eligibility is rechecked atomically with the lease.
+Tenant-tagged fallback fails closed because current transport sessions do not
+carry authoritative tenant identity; those rows may return only to their exact
+origin.
 
 It is **not a cross-gateway relay**. A Captain report is never routed across
 gateways, profiles, tenants, boards, or accounts, and it invents no chat/human
 destination. A gateway subscription and a Captain report are independent paths
 that never duplicate each other — a task can notify its gateway chat *and*
 report to its local Captain without either standing in for the other.
+
+After a successful synthetic turn, Hermes persists the transcript and acks the
+Captain lease before emitting the visible assistant `message.complete` with a
+stable event-derived ID. A transport crash therefore cannot leave a pending row
+that replays a second assistant response; reconnect hydration recovers a frame
+missed after transcript commit, and both TUI and Desktop defensively deduplicate
+the stable ID. The row cap is global across all boards in one poll, as is the
+UTF-8 byte cap.

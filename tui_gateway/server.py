@@ -10570,34 +10570,29 @@ def _session_key_is_live(session_key: str) -> bool:
     return False
 
 
-def _session_captain_tenant(session: dict) -> Optional[str]:
-    """Return an explicitly bound tenant; missing identity stays unscoped."""
-    value = session.get("tenant") if isinstance(session, dict) else None
-    return str(value).strip() if value else None
-
-
 def _captain_row_eligible(
     conn,
     *,
     profile: str,
     this_key: str,
-    receiver_tenant: Optional[str],
     origin_key,
     row_tenant,
     now: int,
 ) -> bool:
     """Whether this session may claim a Captain row with the given origin.
 
-    - No origin (gateway/CLI/cron/unattached) → any same-profile session.
+    - No origin (gateway/CLI/cron/unattached) → same-profile only when untenant.
     - We ARE the origin → always ours while live.
-    - A different origin → only if that origin is not currently live.
+    - A different origin → only if that origin is not live and the row is
+      untenant. Tenant-tagged fallback fails closed until session transport
+      carries authoritative tenant identity.
     """
     origin = str(origin_key).strip() if origin_key else ""
     if not origin:
-        return not row_tenant or receiver_tenant == str(row_tenant)
+        return not row_tenant
     if origin == str(this_key or ""):
         return True
-    if row_tenant and receiver_tenant != str(row_tenant):
+    if row_tenant:
         return False
     from hermes_cli import kanban_db as _kb
 
@@ -10618,7 +10613,8 @@ def _collect_captain_reports(
     claimed_event_ids: set,
     claim_records: Optional[list[dict]],
     texts: list,
-) -> None:
+    row_limit: int = _CAPTAIN_POLL_ROW_CAP,
+) -> int:
     """Claim eligible Captain inbox rows for this session's profile.
 
     Runs alongside the exact-origin ``kanban_notify_subs`` route on the same
@@ -10628,7 +10624,9 @@ def _collect_captain_reports(
     them on a successful terminal turn or releases them on rejection/failure.
 
     A Captain row is acked ONLY after the synthetic turn reaches a successful
-    terminal outcome, so leasing is meaningless without a settlement callback.
+    terminal outcome and its transcript is durable, immediately before the
+    stable-id assistant completion is emitted. Leasing is meaningless without
+    a settlement callback.
     When ``claim_records`` is ``None`` (a probe-style call with no way to
     ack/release), this helper is a no-op and leaves every row ``pending`` —
     it never leases or acks merely because it was invoked.
@@ -10636,23 +10634,25 @@ def _collect_captain_reports(
     from hermes_cli import kanban_db as _kb
 
     if claim_records is None:
-        return
+        return 0
+
+    row_limit = max(0, min(int(row_limit), _CAPTAIN_POLL_ROW_CAP))
+    if row_limit == 0:
+        return 0
 
     this_key = str(session.get("session_key") or "")
-    receiver_tenant = _session_captain_tenant(session)
     now = int(time.time())
     try:
         candidates = _kb.read_captain_candidates(
             conn,
             profile=captain_profile,
             now=now,
-            limit=_CAPTAIN_POLL_ROW_CAP,
+            limit=row_limit,
             receiver_session_key=this_key,
-            receiver_tenant=receiver_tenant,
             receiver_max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
         )
     except Exception:
-        return
+        return 0
     eligible = [
         int(c["event_id"])
         for c in candidates
@@ -10660,17 +10660,17 @@ def _collect_captain_reports(
             conn,
             profile=captain_profile,
             this_key=this_key,
-            receiver_tenant=receiver_tenant,
             origin_key=c.get("origin_session_key"),
             row_tenant=c.get("tenant"),
             now=now,
         )
     ]
     if not eligible:
-        return
+        return 0
     task_cache: dict = {}
     used_bytes = sum(len(t.encode("utf-8")) + 1 for t in texts)
-    for event_id in eligible:
+    leased_count = 0
+    for event_id in eligible[:row_limit]:
         if used_bytes >= _CAPTAIN_POLL_BYTE_CAP:
             break
         # One event per lease token makes byte paging lossless: rows that do
@@ -10683,9 +10683,12 @@ def _collect_captain_reports(
             event_ids=[event_id],
             now=now,
             lease_seconds=_CAPTAIN_LEASE_SECONDS,
+            receiver_session_key=this_key,
+            receiver_max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
         )
         if not events:
             continue
+        leased_count += 1
         ev = events[0]
         deliveries: list[dict] = []
         if ev.id in claimed_event_ids:
@@ -10746,6 +10749,49 @@ def _collect_captain_reports(
             "task_ids": {ev.task_id},
             "deliveries": deliveries,
         })
+    return leased_count
+
+
+def _touch_captain_receivers(session: dict) -> None:
+    """Publish this live receiver on every board, even while its turn is busy."""
+    session_key = str(session.get("session_key") or "")
+    if not session_key or session.get("_finalized"):
+        return
+    from hermes_cli import kanban_db as _kb
+
+    captain_profile = _session_captain_profile(session)
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [{"slug": _kb.DEFAULT_BOARD}]
+    seen_db_paths: set[str] = set()
+    for board_meta in boards:
+        slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
+        db_path = (board_meta or {}).get("db_path")
+        try:
+            resolved = (
+                str(Path(db_path).expanduser().resolve())
+                if db_path else str(_kb.kanban_db_path(slug).resolve())
+            )
+        except Exception:
+            resolved = f"slug:{slug}"
+        if resolved in seen_db_paths:
+            continue
+        seen_db_paths.add(resolved)
+        conn = None
+        try:
+            conn = _kb.connect(board=slug)
+            _kb.touch_captain_receiver(
+                conn,
+                profile=captain_profile,
+                session_key=session_key,
+                tenant=None,
+            )
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
@@ -10964,6 +11010,7 @@ def _collect_kanban_notifications(
     # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
     # notifier).
     seen_db_paths: set = set()
+    captain_rows_leased = 0
     for board_meta in boards:
         slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
         db_path = (board_meta or {}).get("db_path")
@@ -11006,17 +11053,6 @@ def _collect_kanban_notifications(
         except Exception:
             continue
         try:
-            try:
-                _kb.touch_captain_receiver(
-                    conn,
-                    profile=captain_profile,
-                    session_key=session_key,
-                    tenant=_session_captain_tenant(session),
-                )
-            except Exception:
-                # Receiver publication is required only for fallback liveness;
-                # exact-origin delivery and durable leasing remain available.
-                pass
             claimed_event_ids: set = set()
             try:
                 subs = _kb.list_notify_subs(conn)
@@ -11103,9 +11139,10 @@ def _collect_kanban_notifications(
             # events for this session's profile, deduplicating any already
             # rendered by the exact-origin route on this board.
             try:
-                _collect_captain_reports(
+                captain_rows_leased += _collect_captain_reports(
                     conn, slug, session, captain_profile,
                     claimed_event_ids, claim_records, texts,
+                    row_limit=_CAPTAIN_POLL_ROW_CAP - captain_rows_leased,
                 )
             except Exception as exc:
                 print(
@@ -11184,33 +11221,14 @@ def _settle_kanban_notification_claims(
                 conn.close()
 
 
-def _emit_kanban_notification_receipts(
-    sid: str, claim_records: list[dict]
-) -> None:
-    """Emit stable-id external receipts after a successful synthetic turn."""
-    seen: set[str] = set()
-    for record in claim_records:
-        for delivery in record.get("deliveries") or ():
-            receipt_id = str(delivery.get("id") or "")
-            text = str(delivery.get("text") or "")
-            if not receipt_id or not text or receipt_id in seen:
-                continue
-            seen.add(receipt_id)
-            _emit(
-                "status.update",
-                sid,
-                {"kind": "process", "text": text, "id": receipt_id},
-            )
-
-
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
     """Poll completion_queue and dispatch notifications autonomously.
 
     Runs in a daemon thread started by _init_session(). Chains an agent turn via
-    _run_prompt_submit when idle, then emits stable-id process receipts and acks
-    the claims only after that turn reports successful terminal completion.
+    _run_prompt_submit when idle, then commits the claims after the transcript
+    is durable and before the stable-id assistant completion is emitted.
 
     The completion_queue is process-global. In multi-session Desktop each
     poller requeues events owned by another live session and drops addressed
@@ -11246,6 +11264,14 @@ def _notification_poller_loop(
                 )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
+            try:
+                _touch_captain_receivers(session)
+            except Exception as _heartbeat_exc:
+                print(
+                    f"[tui_gateway] Captain receiver heartbeat failed: "
+                    f"{type(_heartbeat_exc).__name__}: {_heartbeat_exc}",
+                    file=sys.stderr,
+                )
             _reserved = False
             _kanban_claims: list[dict] = []
             _kanban_texts: list[str] = []
@@ -11285,21 +11311,24 @@ def _notification_poller_loop(
                     if _kanban_texts:
                         rid = f"__notif__{int(time.time() * 1000)}"
                         _settled = threading.Event()
+                        delivery_ids = sorted({
+                            str(delivery.get("id"))
+                            for record in _kanban_claims
+                            for delivery in (record.get("deliveries") or ())
+                            if delivery.get("id")
+                        })
+                        receipt_material = "\n".join(delivery_ids or _kanban_texts)
+                        completion_id = (
+                            "kanban-report:"
+                            + hashlib.sha256(receipt_material.encode("utf-8")).hexdigest()[:24]
+                        )
 
                         def _settle_after_terminal(succeeded: bool) -> None:
                             if _settled.is_set():
                                 return
                             _settled.set()
-                            accepted = bool(succeeded)
-                            if accepted:
-                                try:
-                                    _emit_kanban_notification_receipts(
-                                        sid, _kanban_claims
-                                    )
-                                except Exception:
-                                    accepted = False
                             _settle_kanban_notification_claims(
-                                _kanban_claims, accepted=accepted
+                                _kanban_claims, accepted=bool(succeeded)
                             )
 
                         try:
@@ -11310,6 +11339,7 @@ def _notification_poller_loop(
                                 session,
                                 "\n".join(_kanban_texts),
                                 on_terminal=_settle_after_terminal,
+                                completion_id=completion_id,
                             )
                             if accepted is False:
                                 raise RuntimeError("synthetic turn was not accepted")
@@ -11828,6 +11858,7 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     on_terminal: Optional[Callable[[bool], None]] = None,
+    completion_id: str | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -11900,6 +11931,7 @@ def _run_prompt_submit(
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
         turn_succeeded = False
+        terminal_callback_called = False
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -12362,6 +12394,8 @@ def _run_prompt_submit(
             turn_succeeded = status == "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if completion_id:
+                payload["id"] = completion_id
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -12418,6 +12452,9 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
+            if on_terminal is not None:
+                terminal_callback_called = True
+                on_terminal(turn_succeeded)
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
@@ -12578,7 +12615,12 @@ def _run_prompt_submit(
         except Exception as e:
             import traceback
 
-            turn_succeeded = False
+            # Once the transcript and Captain claim were committed, a transport
+            # write failure must not manufacture a second terminal assistant
+            # frame. Reconnect hydration recovers the durable reply.
+            terminal_committed = terminal_callback_called and turn_succeeded
+            if not terminal_committed:
+                turn_succeeded = False
             trace = traceback.format_exc()
             try:
                 os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
@@ -12593,26 +12635,27 @@ def _run_prompt_submit(
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
-            # The agent persists its working transcript on normal finalization,
-            # but an exception in that finalizer can otherwise leave the
-            # gateway's separate in-memory history at the turn-start snapshot.
-            # Keep the partial turn available to the next prompt; the durable
-            # inflight record still carries the recoverable error state.
-            _restore_agent_history_after_turn_error(session, agent)
-            try:
-                # Close the turn with the same terminal error frame shape as
-                # the returned-error path (uniform client handling), retaining
-                # the failed turn for resume replay.
-                _emit_terminal_turn_error(sid, session, e)
-                turn_error_retained = True
-            except Exception as emit_exc:
-                print(
-                    f"[gateway-turn] terminal error emit failed: "
-                    f"{type(emit_exc).__name__}: {emit_exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                _emit("error", sid, {"message": str(e)})
+            if not terminal_committed:
+                # The agent persists its working transcript on normal finalization,
+                # but an exception in that finalizer can otherwise leave the
+                # gateway's separate in-memory history at the turn-start snapshot.
+                # Keep the partial turn available to the next prompt; the durable
+                # inflight record still carries the recoverable error state.
+                _restore_agent_history_after_turn_error(session, agent)
+                try:
+                    # Close the turn with the same terminal error frame shape as
+                    # the returned-error path (uniform client handling), retaining
+                    # the failed turn for resume replay.
+                    _emit_terminal_turn_error(sid, session, e)
+                    turn_error_retained = True
+                except Exception as emit_exc:
+                    print(
+                        f"[gateway-turn] terminal error emit failed: "
+                        f"{type(emit_exc).__name__}: {emit_exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _emit("error", sid, {"message": str(e)})
         finally:
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
@@ -12701,7 +12744,7 @@ def _run_prompt_submit(
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
-            if on_terminal is not None:
+            if on_terminal is not None and not terminal_callback_called:
                 try:
                     on_terminal(turn_succeeded)
                 except Exception:

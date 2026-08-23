@@ -7136,20 +7136,25 @@ def test_run_prompt_submit_reports_real_terminal_outcome(
     assert results == [expected]
 
 
-def test_run_prompt_submit_reports_failure_when_terminal_emit_raises(
+def test_run_prompt_submit_settles_success_before_terminal_emit_can_fail(
     monkeypatch, tmp_path
 ):
     _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
     settled = threading.Event()
     results = []
+    order = []
     original_emit = server._emit
 
     def record_terminal(ok):
         results.append(ok)
+        order.append(f"settled:{ok}")
         settled.set()
 
     def fail_terminal_emit(event, sid, payload=None):
         if event == "message.complete":
+            # Model a transport that accepted the visible frame and then died
+            # before the worker could observe the write result.
+            order.append("visible")
             raise RuntimeError("transport write failed")
         return original_emit(event, sid, payload)
 
@@ -7173,7 +7178,8 @@ def test_run_prompt_submit_reports_failure_when_terminal_emit_raises(
     finally:
         server._sessions.pop("terminal-emit-error", None)
 
-    assert results == [False]
+    assert results == [True]
+    assert order == ["settled:True", "visible"]
 
 
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
