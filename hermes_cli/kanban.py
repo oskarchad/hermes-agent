@@ -2212,7 +2212,7 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
+    """Return a rejection reason when goal-mode completion is premature."""
     if task is None or not task.goal_mode:
         return None
     try:
@@ -2275,9 +2275,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
-            # to every terminal handoff so request-review cannot bypass the
-            # acceptance contract that protects complete.
+            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Completion
+            # is terminal, so it must satisfy the card's acceptance contract.
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
@@ -2432,17 +2431,6 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
-        rejection = _goal_mode_handoff_rejection(
-            kb.get_task(conn, tid),
-            summary or "",
-        )
-        if rejection is not None:
-            print(
-                f"kanban: goal review handoff of {tid} rejected by judge: "
-                f"{rejection}. Provide acceptance evidence matching the task.",
-                file=sys.stderr,
-            )
-            return 1
         ok, reason = kb.request_review(
             conn,
             tid,

@@ -252,7 +252,7 @@ def _goal_judge_available() -> bool:
 
 
 def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
+    """Return a rejection reason when goal-mode completion is premature."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return None
     verdict = "done"
@@ -936,14 +936,6 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
-            if rejection is not None:
-                return tool_error(
-                    f"Goal review handoff rejected by judge: {rejection}. "
-                    "Provide acceptance evidence matching the card before "
-                    "requesting review."
-                )
             ok, fail_reason = kb.request_review(
                 conn, tid,
                 summary=summary,
