@@ -67,6 +67,8 @@ For code-changing tasks, pick the review model encoded by the task graph:
 
 Both review models carry their structured handoff on the lifecycle transition itself. Do not place secrets, tokens, or raw PII in `summary` or `metadata`; run rows are durable.
 
+Spawn-time context is a bounded projection, not a replay of every row. It includes the current target and phase, lifecycle/blockers, the latest material delta, and at most one parent artifact whose exact version is tied to an explicit PASS/accepted review disposition. A terminal `done` parent without that provenance is not promoted to authority. Older versions appear only as supersession provenance. Repair workers receive the latest changes request and candidate; closure reviewers receive the exact `review_requested` run. Unrelated recent work by the assignee is excluded. `kanban_show` remains the explicit full-history surface for every run, event, and comment.
+
 The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the same-card review loop, and `kanban_block` for genuine blockers.
 
 ## Logs and audit trail

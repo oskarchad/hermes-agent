@@ -644,13 +644,10 @@ def _(home, kb):
         t0 = time.monotonic()
         ctx = kb.build_worker_context(conn, tid)
         elapsed = (time.monotonic() - t0) * 1000
-        # The "Prior attempts" section renders ALL closed runs.
-        # For 1000 runs this could produce a massive string.
-        # Fair question: is this bounded? Let's measure.
+        # Spawn context projects only the latest material run while preserving
+        # the count; full history remains available via list_runs/kanban_show.
         print(f"  1000 runs → list_runs OK; build_worker_context = {elapsed:.0f}ms, {len(ctx)} chars")
-        if len(ctx) > 200_000:
-            print(f"  ⚠ build_worker_context unbounded on retry-heavy tasks "
-                  f"({len(ctx)} chars) — worker context will be huge")
+        assert len(ctx) < 10_000, f"retry-heavy spawn context is unbounded: {len(ctx)} chars"
     finally:
         conn.close()
 
@@ -878,8 +875,7 @@ def _(home, kb):
         ctx = kb.build_worker_context(conn, tid)
         elapsed = (time.monotonic() - t0) * 1000
         print(f"  1000 comments: list in {elapsed:.0f}ms, context size = {len(ctx)} chars")
-        if len(ctx) > 200_000:
-            print("  ⚠ comment thread unbounded in worker context")
+        assert len(ctx) < 10_000, f"comment-storm spawn context is unbounded: {len(ctx)} chars"
     finally:
         conn.close()
 

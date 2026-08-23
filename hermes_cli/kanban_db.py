@@ -597,16 +597,13 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
-# Worker-context caps so build_worker_context() stays bounded on
-# pathological boards (retry-heavy tasks, comment storms, giant
-# summaries). Values chosen to fit a typical 100k-char LLM prompt with
-# plenty of headroom. Each constant is tuned independently so users
-# who need to relax one don't have to relax all of them.
-_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
-_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
-_CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
-_CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
-_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+# Spawn-time worker context is a compact projection over the durable task
+# history, not a second copy of that history. Full runs/comments/events remain
+# available through ``kanban_show``. Per-field caps keep one material delta or
+# accepted handoff from dominating the prompt.
+_CTX_MAX_FIELD_BYTES = 4 * 1024
+_CTX_MAX_BODY_BYTES = 8 * 1024
+_CTX_MAX_COMMENT_BYTES = 2 * 1024
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -11796,250 +11793,353 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+_ACCEPTED_DISPOSITIONS = {"accepted", "approved", "pass", "passed"}
+_VERSION_METADATA_KEYS = ("commit", "sha", "version", "tree", "artifact_id", "release")
+
+
+def _context_cap(value: Any, limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+    """Redact and visibly cap one value rendered into worker context."""
+    if value is None:
+        return ""
+    safe = str(redact_review_value(value)).strip()
+    if len(safe) <= limit:
+        return safe
+    return safe[:limit] + f"… [truncated, {len(safe) - limit} chars omitted]"
+
+
+def _context_metadata(metadata: Optional[Mapping[str, Any]]) -> str:
+    if not isinstance(metadata, Mapping) or not metadata:
+        return ""
+    safe = redact_review_value(dict(metadata))
+    try:
+        return _context_cap(
+            json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    except (TypeError, ValueError):
+        return ""
+
+
+def _run_version_ref(run: Run) -> Optional[str]:
+    metadata = run.metadata if isinstance(run.metadata, Mapping) else {}
+    for key in _VERSION_METADATA_KEYS:
+        value = metadata.get(key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            rendered = _context_cap(value, 300)
+            if rendered:
+                return f"{key}={rendered}"
+    return None
+
+
+def _run_disposition(run: Run) -> Optional[str]:
+    metadata = run.metadata if isinstance(run.metadata, Mapping) else {}
+    for key in ("verdict", "disposition", "approval"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower().replace(" ", "_")
+    return None
+
+
+def _run_claimed_from_review(
+    conn: sqlite3.Connection, task_id: str, run_id: int
+) -> bool:
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return False
+    try:
+        payload = json.loads(row["payload"])
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(payload, dict) and payload.get("source_status") == "review"
+
+
+def _accepted_parent_projection(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    """Select one versioned parent artifact with explicit review acceptance.
+
+    ``done`` is intentionally insufficient. Authority requires an explicit
+    PASS-like disposition in run metadata or a completion run claimed from the
+    first-class review lane, plus an exact version pointer and matching producer
+    run. Older accepted/rejected versions are retained only as supersession
+    provenance.
+    """
+    entries: list[tuple[Task, Run]] = []
+    for parent_id in parent_ids(conn, task_id):
+        parent = get_task(conn, parent_id)
+        if parent is None or parent.status != "done":
+            continue
+        entries.extend(
+            (parent, run)
+            for run in list_runs(conn, parent_id, include_active=False)
+        )
+
+    accepted: list[tuple[Task, Run, str, str]] = []
+    for parent, run in entries:
+        if run.outcome != "completed":
+            continue
+        disposition = _run_disposition(run)
+        if disposition not in _ACCEPTED_DISPOSITIONS:
+            if not _run_claimed_from_review(conn, parent.id, run.id):
+                continue
+            disposition = "approved"
+        version = _run_version_ref(run)
+        if version:
+            accepted.append((parent, run, disposition, version))
+    if not accepted:
+        return None
+
+    accepted.sort(key=lambda item: (item[1].ended_at or item[1].started_at, item[1].id))
+    acceptance_task, acceptance_run, verdict, version = accepted[-1]
+
+    producers = [
+        (parent, run)
+        for parent, run in entries
+        if run.id != acceptance_run.id
+        and _run_version_ref(run) == version
+        and _run_disposition(run) is None
+        and run.outcome in {"completed", "review_requested"}
+    ]
+    if not producers:
+        return None
+    producers.sort(key=lambda item: (item[1].ended_at or item[1].started_at, item[1].id))
+    producer_task, producer_run = producers[-1]
+
+    superseded: list[str] = []
+    for _parent, run in entries:
+        if run.id == acceptance_run.id or _run_disposition(run) is None:
+            continue
+        prior_version = _run_version_ref(run)
+        if prior_version and prior_version != version and prior_version not in superseded:
+            superseded.append(prior_version)
+
+    return {
+        "producer_task": producer_task,
+        "producer_run": producer_run,
+        "acceptance_task": acceptance_task,
+        "acceptance_run": acceptance_run,
+        "verdict": verdict,
+        "version": version,
+        "superseded": superseded,
+    }
+
+
+def _active_worker_phase(
+    conn: sqlite3.Connection, task: Task, events: list[Event]
+) -> str:
+    if task.current_run_id is not None and _run_claimed_from_review(
+        conn, task.id, task.current_run_id
+    ):
+        return "closure review"
+    latest_review = max(
+        (event.id for event in events if event.kind == "review_requested"),
+        default=-1,
+    )
+    latest_changes = max(
+        (event.id for event in events if event.kind == "changes_requested"),
+        default=-1,
+    )
+    return "repair" if latest_changes > latest_review else "implementation"
+
+
+def _append_run_projection(
+    lines: list[str], run: Run, *, now: int, label: str
+) -> None:
+    age = _relative_age(run.ended_at or run.started_at, now)
+    lines.append(f"{label}: run {run.id} · {run.outcome or run.status}" + (f" · {age}" if age else ""))
+    if run.summary:
+        lines.append(_context_cap(run.summary))
+    if run.error:
+        lines.append(f"Error: {_context_cap(run.error)}")
+    metadata = _context_metadata(run.metadata)
+    if metadata:
+        lines.append(f"Metadata: `{metadata}`")
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
-    """Return the full text a worker should read to understand its task.
+    """Return a bounded, phase-specific spawn projection for one task.
 
-    Order:
-      1. Task title (mandatory).
-      2. Task body (optional opening post, capped at 8 KB).
-      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
-         shown; older attempts collapsed into a one-line summary).
-         Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
-         ``_CTX_MAX_FIELD_BYTES`` each.
-      4. Structured handoff results of every done parent task. Prefers
-         ``run.summary`` / ``run.metadata`` when the parent was executed
-         via a run; falls back to ``task.result`` for older data. Same
-         per-field cap.
-      5. Cross-task role history for the assignee (most recent 5
-         completed runs on other tasks).
-      6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
-         collapsed).
-
-    All caps exist so worker prompts stay bounded even on pathological
-    boards (retry-heavy tasks, comment storms). The per-field char cap
-    prevents a single 1 MB summary from dominating context.
+    The canonical run/event/comment history remains in SQLite and is returned
+    in full by explicit ``kanban_show``. Spawn context carries only the current
+    target, lifecycle/blockers, latest material delta, one accepted parent
+    artifact with review provenance, and the latest comment.
     """
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
 
-    # Single clock reading shared by every relative-age stamp below, so all
-    # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
-    # by the seconds it takes to build the block).
-    _now = int(time.time())
+    now = int(time.time())
+    events = list_events(conn, task_id)
+    runs = list_runs(conn, task_id)
+    prior_runs = [run for run in runs if run.ended_at is not None]
+    comments = list_comments(conn, task_id)
+    phase = _active_worker_phase(conn, task, events)
 
-    def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
-        """Truncate a string to `limit` chars with a visible ellipsis."""
-        if not s:
-            return ""
-        s = s.strip()
-        if len(s) <= limit:
-            return s
-        return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
-
-    lines: list[str] = []
-    lines.append(f"# Kanban task {task.id}: {task.title}")
-    lines.append("")
-    lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
-    lines.append(f"Status:   {task.status}")
+    lines = [
+        f"# Kanban task {task.id}: {_context_cap(task.title)}",
+        "",
+        f"Assignee: {task.assignee or '(unassigned)'}",
+        f"Status: {task.status}",
+        f"Phase: {phase}",
+        f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}",
+    ]
     if task.tenant:
-        lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+        lines.append(f"Tenant: {_context_cap(task.tenant, 300)}")
+    if task.branch_name:
+        lines.append(f"Branch: {_context_cap(task.branch_name, 500)}")
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
-            task.max_runtime_seconds,
-            os.environ.get("TERMINAL_TIMEOUT"),
+            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT")
         )
-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
         lines.append(f"Max runtime: {task.max_runtime_seconds}s")
-        if effective_terminal_timeout:
-            lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
-    if task.branch_name:
-        lines.append(f"Branch:   {task.branch_name}")
+        if terminal_timeout or os.environ.get("TERMINAL_TIMEOUT"):
+            lines.append(
+                f"Terminal timeout: {terminal_timeout or os.environ.get('TERMINAL_TIMEOUT')}s"
+            )
     lines.append("")
 
     if task.body and task.body.strip():
-        lines.append("## Body")
-        lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
-        lines.append("")
+        lines.extend(("## Target", _context_cap(task.body, _CTX_MAX_BODY_BYTES), ""))
 
-    # Attachments — files uploaded to this task (PDFs, source docs,
-    # images). Surface the absolute on-disk path so the worker, which has
-    # full file-tool access, can read them directly (read_file, terminal
-    # `pdftotext`, etc.). On the local terminal backend the path resolves
-    # as-is; remote backends need the kanban attachments dir mounted.
     attachments = list_attachments(conn, task_id)
     if attachments:
         lines.append("## Attachments")
-        lines.append(
-            "Files attached to this task. Read them with the file/terminal "
-            "tools at the absolute paths below:"
-        )
-        for att in attachments:
-            size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
-            size_str = f", {size_kb} KB" if size_kb else ""
-            ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+        for attachment in attachments:
+            size_kb = max(1, (attachment.size + 1023) // 1024) if attachment.size else 0
+            details = [value for value in (attachment.content_type, f"{size_kb} KB" if size_kb else "") if value]
+            suffix = f" ({', '.join(details)})" if details else ""
+            lines.append(
+                f"- `{_context_cap(attachment.filename, 500)}`{suffix} → "
+                f"`{_context_cap(attachment.stored_path, 1500)}`"
+            )
         lines.append("")
 
-    # Prior attempts — show closed runs so a retrying worker sees the
-    # history. Skip the currently-active run (that's this worker).
-    # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
-    # attempts get collapsed into a one-line marker so the worker knows
-    # more exist without bloating the prompt.
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    # list_runs returns ascending by started_at; "most recent" = last N
-    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
-        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
-        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
-        first_shown_idx = omitted + 1
+    lines.append("## Lifecycle and blockers")
+    active = get_run(conn, task.current_run_id) if task.current_run_id is not None else None
+    if active is not None:
+        age = _relative_age(active.started_at, now)
+        lines.append(f"Active run: {active.id}" + (f" · started {age}" if age else ""))
     else:
-        omitted = 0
-        shown = all_prior
-        first_shown_idx = 1
-    if shown:
-        lines.append("## Prior attempts on this task")
-        if omitted:
-            lines.append(
-                f"_({omitted} earlier attempt{'s' if omitted != 1 else ''} "
-                f"omitted; showing most recent {len(shown)})_"
-            )
-        for offset, run in enumerate(shown):
-            idx = first_shown_idx + offset
-            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
-            age = _relative_age(run.started_at, _now)
-            ts_disp = f"{ts}, {age}" if age else ts
-            profile = run.profile or "(unknown)"
-            outcome = run.outcome or run.status
-            lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
-            if run.summary and run.summary.strip():
-                lines.append(_cap(run.summary))
-            if run.error and run.error.strip():
-                lines.append(f"_error_: {_cap(run.error)}")
-            if run.metadata:
-                try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    lines.append(f"_metadata_: `{_cap(meta_str)}`")
-                except Exception:
-                    pass
-            lines.append("")
-
-    # Parents: prefer the most-recent 'completed' run's summary + metadata,
-    # fall back to ``task.result`` when no run rows exist (legacy DBs,
-    # or tasks completed before the runs table landed).
-    parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        lines.append("Active run: none")
+    lines.append(f"History: {len(prior_runs)} closed run(s), {len(comments)} comment(s)")
+    if task.block_kind:
+        lines.append(f"Block kind: {task.block_kind} (recurrences: {task.block_recurrences})")
+    blocked_parents = conn.execute(
+        "SELECT t.id, t.title, t.status FROM task_links l "
+        "JOIN tasks t ON t.id = l.parent_id "
+        "WHERE l.child_id = ? AND t.status NOT IN ('done', 'archived') "
+        "ORDER BY t.id",
         (task_id,),
     ).fetchall()
-    parent_ids = [r["parent_id"] for r in parent_rows]
+    for parent in blocked_parents:
+        lines.append(
+            f"Waiting on: {parent['id']} [{parent['status']}] "
+            f"{_context_cap(parent['title'], 500)}"
+        )
+    lines.append("")
 
-    if parent_ids:
-        wrote_header = False
-        for pid in parent_ids:
-            pt = get_task(conn, pid)
-            if not pt or pt.status != "done":
-                continue
-            runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
-            runs.sort(key=lambda r: r.started_at, reverse=True)
-            run = runs[0] if runs else None
-
-            if not wrote_header:
-                lines.append("## Parent task results")
-                lines.append(
-                    "_Handoffs from upstream tasks, captured when each parent "
-                    "completed (see age below). These are point-in-time "
-                    "snapshots, not live state — if a result drives your "
-                    "current work and it's not recent, re-verify against the "
-                    "source before acting on it as current._"
-                )
-                wrote_header = True
-
-            # When did this parent's result get produced? Prefer the
-            # completed run's end time; fall back to the task's completed_at.
-            done_ts = None
-            if run is not None and getattr(run, "ended_at", None):
-                done_ts = run.ended_at
-            elif pt.completed_at:
-                done_ts = pt.completed_at
-            age = _relative_age(done_ts, _now)
-            lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
-
-            body_lines: list[str] = []
-            if run is not None and run.summary and run.summary.strip():
-                body_lines.append(_cap(run.summary))
-            elif pt.result:
-                body_lines.append(_cap(pt.result))
-            else:
-                body_lines.append("(no result recorded)")
-
-            if run is not None and run.metadata:
-                try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
-                except Exception:
-                    pass
-            lines.extend(body_lines)
+    if phase == "closure review":
+        target_run = next(
+            (run for run in reversed(prior_runs) if run.outcome == "review_requested"),
+            None,
+        )
+        if target_run is not None:
+            lines.append("## Review target")
+            lines.append(f"Run: {target_run.id}")
+            if target_run.summary:
+                lines.append(_context_cap(target_run.summary))
+            version = _run_version_ref(target_run)
+            if version:
+                lines.append(f"Version: {version}")
+            metadata = _context_metadata(target_run.metadata)
+            if metadata:
+                lines.append(f"Metadata: `{metadata}`")
             lines.append("")
-
-    # Cross-task role history: what else has THIS assignee completed
-    # recently? Gives the worker implicit continuity — "I'm the reviewer
-    # and my last three reviews focused on security" — without forcing
-    # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
-    # most recent 5 completed runs, excluding this task so the retry
-    # section above isn't duplicated. Safe on assignee=None (skipped).
-    if task.assignee:
-        role_rows = conn.execute(
-            "SELECT t.id, t.title, r.summary, r.ended_at "
-            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-            "WHERE r.profile = ? AND r.task_id != ? "
-            "  AND r.outcome = 'completed' "
-            "ORDER BY r.ended_at DESC LIMIT 5",
-            (task.assignee, task_id),
-        ).fetchall()
-        if role_rows:
-            lines.append(f"## Recent work by @{task.assignee}")
-            for row in role_rows:
-                ts = time.strftime(
-                    "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
-                )
-                age = _relative_age(row["ended_at"], _now)
-                ts_disp = f"{ts}, {age}" if age else ts
-                s = (row["summary"] or "").strip().splitlines()
-                first = s[0][:200] if s else "(no summary)"
-                lines.append(f"- {row['id']} — {row['title']} ({ts_disp}): {first}")
-            lines.append("")
-
-    # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
-    # comment-storm tasks don't blow out the worker's prompt. Older
-    # comments summarised in a one-line marker like prior attempts.
-    all_comments = list_comments(conn, task_id)
-    if len(all_comments) > _CTX_MAX_COMMENTS:
-        omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
-        shown_c = all_comments[-_CTX_MAX_COMMENTS:]
-    else:
-        omitted_c = 0
-        shown_c = all_comments
-    if shown_c:
-        lines.append("## Comment thread")
-        if omitted_c:
+    elif phase == "repair":
+        changes_event = next(
+            (event for event in reversed(events) if event.kind == "changes_requested"),
+            None,
+        )
+        lines.append("## Latest material delta")
+        if changes_event is not None:
+            age = _relative_age(changes_event.created_at, now)
             lines.append(
-                f"_({omitted_c} earlier comment{'s' if omitted_c != 1 else ''} "
-                f"omitted; showing most recent {len(shown_c)})_"
+                f"Changes requested" + (f" {age}" if age else "")
+                + (f" · run {changes_event.run_id}" if changes_event.run_id else "")
             )
-        for c in shown_c:
-            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
-            age = _relative_age(c.created_at, _now)
-            ts_disp = f"{ts}, {age}" if age else ts
-            # Render author with explicit "comment from worker" framing so
-            # operator-controlled HERMES_PROFILE values like "hermes-system"
-            # or "operator" can't be misread by the next worker as a system
-            # directive above the (attacker-influenceable) comment body.
-            # Defense-in-depth — the LLM-controlled author-forgery surface
-            # was already closed in #22435. See #22452.
-            safe_author = (c.author or "").replace("`", "")
-            lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
-            lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+            payload = changes_event.payload if isinstance(changes_event.payload, Mapping) else {}
+            if payload.get("reason"):
+                lines.append(_context_cap(payload["reason"]))
+        previous_target = next(
+            (run for run in reversed(prior_runs) if run.outcome == "review_requested"),
+            None,
+        )
+        if previous_target is not None:
+            _append_run_projection(lines, previous_target, now=now, label="Previous candidate")
+        lines.append("")
+    elif prior_runs:
+        lines.append("## Latest material delta")
+        _append_run_projection(lines, prior_runs[-1], now=now, label="Latest closed run")
+        lines.append("")
+
+    parent_count = len(parent_ids(conn, task_id))
+    if parent_count:
+        accepted = _accepted_parent_projection(conn, task_id)
+        if accepted is None:
+            lines.extend(
+                (
+                    "## Parent acceptance",
+                    "No accepted parent output is recorded. A terminal `done` parent "
+                    "without an exact version and explicit PASS/accepted review "
+                    "disposition is not authoritative; inspect `kanban_show` history.",
+                    "",
+                )
+            )
+        else:
+            producer_task = accepted["producer_task"]
+            producer_run = accepted["producer_run"]
+            acceptance_task = accepted["acceptance_task"]
+            acceptance_run = accepted["acceptance_run"]
+            age = _relative_age(acceptance_run.ended_at, now)
+            lines.extend(
+                (
+                    "## Accepted parent output",
+                    f"Producer: {producer_task.id} run {producer_run.id}",
+                    f"Artifact: {_context_cap(producer_task.title, 500)}",
+                    f"Accepted by: {acceptance_task.id} run {acceptance_run.id}"
+                    + (f" · {age}" if age else ""),
+                    f"Verdict: {accepted['verdict']}",
+                    f"Version: {accepted['version']}",
+                )
+            )
+            if accepted["superseded"]:
+                lines.append(f"Supersedes: {', '.join(accepted['superseded'])}")
+            if producer_run.summary:
+                lines.append(_context_cap(producer_run.summary))
+            producer_metadata = _context_metadata(producer_run.metadata)
+            if producer_metadata:
+                lines.append(f"Artifact metadata: `{producer_metadata}`")
+            acceptance_metadata = _context_metadata(acceptance_run.metadata)
+            if acceptance_metadata:
+                lines.append(f"Acceptance metadata: `{acceptance_metadata}`")
             lines.append("")
+
+    if comments:
+        latest_comment = comments[-1]
+        age = _relative_age(latest_comment.created_at, now)
+        safe_author = (latest_comment.author or "").replace("`", "")
+        lines.extend(
+            (
+                "## Latest comment",
+                f"comment from worker `{safe_author}`" + (f" · {age}" if age else ""),
+                _context_cap(latest_comment.body, _CTX_MAX_COMMENT_BYTES),
+                "",
+            )
+        )
 
     return "\n".join(lines).rstrip() + "\n"
 

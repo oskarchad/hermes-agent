@@ -518,7 +518,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
-    runs (attempt history), and the last N events."""
+    runs (attempt history), and events."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -576,7 +576,7 @@ def _handle_show(args: dict, **kw) -> str:
                 "events": [
                     {"kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
+                    for e in events
                 ],
                 "runs": [_run_dict(r) for r in runs],
                 # Also surface the worker's own context block so the
@@ -1703,7 +1703,7 @@ KANBAN_SHOW_SCHEMA = {
     "description": (
         "Read a task's full state — title, body, assignee, parent task "
         "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
+        "and events. Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
         "pre-formatted ``worker_context`` string suitable for inclusion "
         "verbatim in your reasoning."
