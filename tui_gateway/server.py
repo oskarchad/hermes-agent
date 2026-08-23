@@ -11336,21 +11336,26 @@ def _captain_completion_id(
 
 
 def _persisted_captain_report(session: dict, completion_id: str):
-    """Return the canonical assistant row for a committed Captain event."""
+    """Return the profile-wide canonical receipt for a Captain event."""
     agent = session.get("agent")
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None) or session.get("session_key")
     if db is None or not session_id or not completion_id:
         return None
-    try:
-        messages = db.get_messages_as_conversation(session_id)
-    except Exception:
-        logger.warning(
-            "Captain transcript reconciliation read failed for %s",
-            session_id,
-            exc_info=True,
-        )
-        return None
+    rehome = getattr(db, "rehome_captain_report", None)
+    if callable(rehome):
+        try:
+            return rehome(completion_id, session_id)
+        except Exception:
+            logger.warning(
+                "Captain profile-wide transcript reconciliation failed for %s",
+                session_id,
+                exc_info=True,
+            )
+            raise
+
+    # Compatibility for narrow SessionDB test doubles and older embedders.
+    messages = db.get_messages_as_conversation(session_id)
     for message in reversed(messages):
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
@@ -11359,7 +11364,13 @@ def _persisted_captain_report(session: dict, completion_id: str):
             isinstance(metadata, dict)
             and metadata.get(_CAPTAIN_COMPLETION_METADATA_KEY) == completion_id
         ):
-            return message
+            return {
+                "report": message,
+                "messages": [message],
+                "source_session_id": session_id,
+                "destination_session_id": session_id,
+                "moved": False,
+            }
     return None
 
 
@@ -11370,9 +11381,13 @@ def _reconcile_persisted_captain_report(
     completion_id: str,
 ) -> bool:
     """Ack a durable Captain report without running the model a second time."""
-    report = _persisted_captain_report(session, completion_id)
-    if report is None:
+    receipt = _persisted_captain_report(session, completion_id)
+    if receipt is None:
         return False
+    report = receipt["report"]
+    pending = session.setdefault("_captain_pending_projection_ids", set())
+    if receipt.get("moved"):
+        pending.add(completion_id)
 
     _settle_kanban_notification_claims(claim_records, accepted=True)
 
@@ -11384,10 +11399,9 @@ def _reconcile_persisted_captain_report(
             == completion_id
             for message in session.get("history") or ()
         ):
-            session.setdefault("history", []).append(report)
+            session.setdefault("history", []).extend(receipt.get("messages") or [report])
             session["history_version"] = int(session.get("history_version", 0)) + 1
 
-    pending = session.get("_captain_pending_projection_ids")
     if isinstance(pending, set) and completion_id in pending:
         pending.discard(completion_id)
         text = str(report.get("content") or "")
@@ -11537,12 +11551,37 @@ def _notification_poller_loop(
                             _kanban_claims,
                             _kanban_texts,
                         )
-                        if _reconcile_persisted_captain_report(
-                            sid,
-                            session,
-                            _kanban_claims,
-                            completion_id,
-                        ):
+                        try:
+                            _reconciled = _reconcile_persisted_captain_report(
+                                sid,
+                                session,
+                                _kanban_claims,
+                                completion_id,
+                            )
+                        except Exception as _reconcile_exc:
+                            _release_exc = None
+                            try:
+                                _settle_kanban_notification_claims(
+                                    _kanban_claims,
+                                    accepted=False,
+                                )
+                            except Exception as exc:
+                                _release_exc = exc
+                            print(
+                                f"[tui_gateway] Captain receipt reconciliation failed: "
+                                f"{type(_reconcile_exc).__name__}: {_reconcile_exc}",
+                                file=sys.stderr,
+                            )
+                            if _release_exc is not None:
+                                print(
+                                    f"[tui_gateway] Captain reconciliation release failed: "
+                                    f"{type(_release_exc).__name__}: {_release_exc}",
+                                    file=sys.stderr,
+                                )
+                            with session["history_lock"]:
+                                session["running"] = False
+                            continue
+                        if _reconciled:
                             with session["history_lock"]:
                                 session["running"] = False
                             continue
@@ -12116,7 +12155,11 @@ def _run_prompt_submit(
         ):
             session["running"] = False
             return False
-        if image_paths is None:
+        if require_persisted:
+            # Captain reports are task-only model turns. Do not consume or send
+            # image attachments staged for the user's next ordinary prompt.
+            images = []
+        elif image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
         else:
@@ -12243,7 +12286,7 @@ def _run_prompt_submit(
             streamer = make_stream_renderer(cols)
             prompt = text
 
-            if isinstance(prompt, str) and "@" in prompt:
+            if not require_persisted and isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
 
@@ -12380,17 +12423,23 @@ def _run_prompt_submit(
             # Barged mid-speech? Tell the model (API-message note, same
             # enrichment channel as attached images) so it can react
             # ("rude!") instead of being oblivious to its own interruption.
-            from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
+            if not require_persisted:
+                from tools.tts_streaming import (
+                    SPEECH_INTERRUPTED_NOTE,
+                    take_speech_interrupted,
+                )
 
-            if take_speech_interrupted():
-                run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
+                if take_speech_interrupted():
+                    run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
 
-            # Reactions the user added since the last turn.
-            run_message = _prepend_note(run_message, _pending_reaction_notes(session))
+                # Reactions the user added since the last turn.
+                run_message = _prepend_note(
+                    run_message, _pending_reaction_notes(session)
+                )
 
-            # Which window the message was typed into. HUD mode is per-turn
-            # state, so it cannot live in the (byte-stable) system prompt.
-            run_message = _prepend_note(run_message, _hud_surface_note(session))
+                # Which window the message was typed into. HUD mode is per-turn
+                # state, so it cannot live in the (byte-stable) system prompt.
+                run_message = _prepend_note(run_message, _hud_surface_note(session))
 
             _deferred_assistant_events = []
             _original_model_callbacks = {}
@@ -12453,7 +12502,11 @@ def _run_prompt_submit(
                 agent.interim_assistant_callback = None
 
             run_kwargs = {
-                "conversation_history": list(history),
+                # Captain generation is a bounded task/event report, not a turn
+                # in the user's active conversation. The agent still supplies
+                # its approved static system/persona prompt, but no ordinary
+                # session messages cross this model boundary.
+                "conversation_history": [] if require_persisted else list(history),
                 "stream_callback": _stream,
                 "persist_user_message": (
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
@@ -12471,6 +12524,8 @@ def _run_prompt_submit(
                 _run_params = {}
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
+            if require_persisted and "task_only_context" in _run_params:
+                run_kwargs["task_only_context"] = True
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
@@ -12576,10 +12631,15 @@ def _run_prompt_submit(
                     or result.get("session_persisted") is True
                 )
                 if isinstance(result.get("messages"), list) and result_is_durable:
+                    result_messages = (
+                        [*history, *result["messages"]]
+                        if require_persisted
+                        else result["messages"]
+                    )
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            session["history"] = result_messages
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn.
@@ -12616,12 +12676,12 @@ def _run_prompt_submit(
                                 # turn-start history.  Guard against
                                 # auto-compression making result["messages"]
                                 # shorter than history (#77274 review).
-                                if len(result["messages"]) > len(history):
-                                    new_messages = result["messages"][len(history):]
+                                if len(result_messages) > len(history):
+                                    new_messages = result_messages[len(history):]
                                 else:
                                     # Compression rebound the messages list —
                                     # use the full result as the base.
-                                    new_messages = list(result["messages"])
+                                    new_messages = list(result_messages)
                                 session["history"] = current_history + new_messages
                                 session["history_version"] = current_version + 1
                             else:

@@ -7440,6 +7440,92 @@ def test_persisted_turn_releases_interim_delta_and_tts_only_after_settlement(
     }
 
 
+def test_persisted_captain_turn_excludes_unrelated_session_history(
+    monkeypatch, tmp_path
+):
+    """Captain model input is the bounded event prompt, never the active chat."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    captured = {}
+
+    class _ContextCapturingAgent(_RecordingAgent):
+        valid_tool_names = set()
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_assistant_display_metadata=None,
+            images=None,
+            task_only_context=False,
+            **kwargs,
+        ):
+            captured["provider_messages"] = [
+                {"role": "system", "content": "approved static persona"},
+                *(conversation_history or []),
+                {"role": "user", "content": prompt},
+            ]
+            captured["images"] = images
+            captured["task_only_context"] = task_only_context
+            assert stream_callback is not None
+            stream_callback("bounded Captain response")
+            return {
+                "final_response": "bounded Captain response",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "bounded Captain response"},
+                ],
+                "session_persisted": True,
+            }
+
+    event_prompt = "Kanban task t_safe completed: bounded handoff"
+    secret_marker = "UNRELATED_SECRET_MARKER_MUST_NOT_REACH_PROVIDER"
+    agent = _ContextCapturingAgent([])
+    session = _session(
+        session_key="captain-task-only-context",
+        agent=agent,
+        running=True,
+    )
+    session["history"] = [
+        {"role": "user", "content": f"ordinary conversation {secret_marker}"},
+        {"role": "assistant", "content": "ordinary reply"},
+    ]
+    session["attached_images"] = ["UNRELATED_SESSION_IMAGE"]
+    session["client_surface"] = "hud"
+    server._sessions["captain-task-only-context"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "captain-task-only-context",
+            session,
+            event_prompt,
+            on_terminal=lambda _ok: settled.set(),
+            require_persisted=True,
+            completion_id="kanban-report:task-only",
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("captain-task-only-context", None)
+
+    provider_messages = captured["provider_messages"]
+    assert provider_messages == [
+        {"role": "system", "content": "approved static persona"},
+        {"role": "user", "content": event_prompt},
+    ]
+    assert secret_marker not in json.dumps(provider_messages)
+    assert captured["images"] in (None, [])
+    assert captured["task_only_context"] is True
+    assert session["attached_images"] == ["UNRELATED_SESSION_IMAGE"]
+    assert [message.get("content") for message in session["history"]] == [
+        f"ordinary conversation {secret_marker}",
+        "ordinary reply",
+        event_prompt,
+        "bounded Captain response",
+    ]
+
+
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     monkeypatch, tmp_path
 ):

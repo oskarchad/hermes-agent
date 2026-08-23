@@ -67,9 +67,24 @@ when another board settles independently. Model deltas remain buffered (includin
 TTS) and a visible assistant `message.complete` is emitted only after an explicit
 successful transcript-persistence receipt and a verified, unexpired owner-fenced
 acknowledgement rowcount; persistence, lock, ownership, and settlement failures
-propagate as recoverable errors and leave every still-owned unsettled token
-retryable. A transport crash after
-that commit therefore cannot leave a pending row that replays a second assistant
-response; reconnect hydration recovers a frame missed after transcript commit,
-and both TUI and Desktop defensively deduplicate the stable ID. The candidate row
-cap is global across all boards in one poll, as is the UTF-8 byte cap.
+remain recoverable. The poller reports reconciliation failures, releases every
+still-owned unsettled token, clears its turn reservation, and keeps polling and
+refreshing receiver heartbeats.
+
+The persistence receipt is searched across the session database owned by the
+normalized profile, not only the session that currently holds the lease. If a
+different same-profile fallback session claims after the original session
+disappears, Hermes atomically rehomes the committed synthetic turn to that
+destination before acknowledgement instead of running the model or copying the
+assistant report again. The profile-owned database and the board-qualified event
+identity are the hard receipt boundaries; no lookup crosses a profile, tenant, or
+board. A transport crash after commit therefore cannot leave two canonical
+session projections of one event; reconnect hydration recovers a missed frame,
+and both TUI and Desktop also deduplicate the stable ID defensively.
+
+Captain generation receives only the bounded task/event report prompt plus the
+agent's approved static system/persona context. Ordinary history from whichever
+TUI/Desktop session happened to claim the event is not sent to the model. The
+generated turn alone is persisted into the destination transcript and then
+merged back into that session's in-memory history. The candidate row cap is
+global across all boards in one poll, as is the UTF-8 byte cap.

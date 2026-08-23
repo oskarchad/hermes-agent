@@ -11763,6 +11763,137 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             return best if best is not None else session_id
 
+    def rehome_captain_report(
+        self,
+        completion_id: str,
+        destination_session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one profile-local Captain receipt, moving its turn if needed.
+
+        A :class:`SessionDB` belongs to one resolved ``HERMES_HOME`` profile, so
+        searching this database is the durable profile boundary.  The receipt's
+        completion id already namespaces the board-local event id.  When a
+        fallback session claims an event whose model turn committed in a now-
+        absent session, move that complete synthetic turn to the destination in
+        the same transaction.  This leaves one canonical, visible transcript
+        projection instead of copying the assistant row into two sessions.
+        """
+        if not completion_id or not destination_session_id:
+            return None
+
+        def _do(conn):
+            destination = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (destination_session_id,),
+            ).fetchone()
+            if destination is None:
+                raise RuntimeError("Captain receipt destination session is missing")
+
+            receipt_rows = conn.execute(
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                "FROM messages "
+                "WHERE role = 'assistant' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ? "
+                "ORDER BY CASE WHEN session_id = ? THEN 0 ELSE 1 END, id",
+                (completion_id, destination_session_id),
+            ).fetchall()
+            if not receipt_rows:
+                return None
+
+            canonical = receipt_rows[0]
+            canonical_id = int(canonical["id"])
+            source_session_id = str(canonical["session_id"])
+
+            def _turn_start(session_id: str, assistant_id: int) -> int:
+                row = conn.execute(
+                    "SELECT id FROM messages "
+                    "WHERE session_id = ? AND active = 1 AND role = 'user' AND id <= ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id, assistant_id),
+                ).fetchone()
+                return int(row["id"]) if row is not None else assistant_id
+
+            # Old affected builds could already have copied one completion into
+            # multiple sessions. Soft-delete every non-canonical synthetic turn
+            # so normal resume/export projections expose only the chosen receipt.
+            for duplicate in receipt_rows[1:]:
+                duplicate_session_id = str(duplicate["session_id"])
+                duplicate_id = int(duplicate["id"])
+                duplicate_start = _turn_start(duplicate_session_id, duplicate_id)
+                conn.execute(
+                    "UPDATE messages SET active = 0 "
+                    "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ?",
+                    (duplicate_session_id, duplicate_start, duplicate_id),
+                )
+
+            turn_start = _turn_start(source_session_id, canonical_id)
+            moved = source_session_id != destination_session_id
+            if moved:
+                moved_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS n FROM messages "
+                        "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ?",
+                        (source_session_id, turn_start, canonical_id),
+                    ).fetchone()["n"]
+                )
+                conn.execute(
+                    "UPDATE messages SET session_id = ? "
+                    "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ?",
+                    (
+                        destination_session_id,
+                        source_session_id,
+                        turn_start,
+                        canonical_id,
+                    ),
+                )
+                if moved_count:
+                    conn.execute(
+                        "UPDATE sessions SET message_count = "
+                        "CASE WHEN message_count >= ? THEN message_count - ? ELSE 0 END "
+                        "WHERE id = ?",
+                        (moved_count, moved_count, source_session_id),
+                    )
+                    conn.execute(
+                        "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
+                        (moved_count, destination_session_id),
+                    )
+
+            turn_rows = conn.execute(
+                f"SELECT {self._CONVERSATION_ROW_COLUMNS} FROM messages "
+                "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ? "
+                "ORDER BY id",
+                (destination_session_id, turn_start, canonical_id),
+            ).fetchall()
+            messages = self._rows_to_conversation(
+                turn_rows,
+                session_id=destination_session_id,
+                include_ancestors=False,
+                repair_alternation=False,
+            )
+            report = next(
+                (
+                    message
+                    for message in reversed(messages)
+                    if message.get("role") == "assistant"
+                    and isinstance(message.get("display_metadata"), dict)
+                    and message["display_metadata"].get("captain_completion_id")
+                    == completion_id
+                ),
+                None,
+            )
+            if report is None:
+                raise RuntimeError("Captain receipt lost its canonical assistant row")
+            return {
+                "report": report,
+                "messages": messages,
+                "source_session_id": source_session_id,
+                "destination_session_id": destination_session_id,
+                "moved": moved,
+            }
+
+        return self._execute_write(_do)
+
     def get_messages_as_conversation(
         self,
         session_id: str,

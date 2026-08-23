@@ -8586,6 +8586,7 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
         persist_assistant_display_metadata: Optional[Dict[str, Any]] = None,
+        task_only_context: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8962,6 +8963,7 @@ class AIAgent:
                         persist_assistant_display_metadata=(
                             persist_assistant_display_metadata
                         ),
+                        task_only_context=task_only_context,
                         moa_config=moa_config,
                     )
                 finally:

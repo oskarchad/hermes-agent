@@ -1076,18 +1076,19 @@ def test_captain_completion_identity_namespaces_board_local_delivery_ids():
 
 
 @pytest.mark.parametrize("ack_failure", ["exception", "zero_rows"])
-def test_persisted_captain_report_reconciles_without_duplicate_after_restart(
+def test_persisted_captain_report_reconciles_across_same_profile_sessions(
     monkeypatch, ack_failure
 ):
-    """Transcript commit is the durable idempotency record across ack loss."""
+    """A profile-wide receipt moves to the fallback session without a new turn."""
     from hermes_state import SessionDB
     from tools.process_registry import process_registry
 
-    session_id = "captain-reconcile-session"
+    first_session_id = "captain-reconcile-session-a"
+    fallback_session_id = "captain-reconcile-session-b"
     db = SessionDB()
-    db.create_session(session_id=session_id, source="tui", model="test")
-    agent = SimpleNamespace(_session_db=db, session_id=session_id)
-    profile = _profile_for(_session(session_id))
+    db.create_session(session_id=first_session_id, source="tui", model="test")
+    db.create_session(session_id=fallback_session_id, source="tui", model="test")
+    profile = _profile_for(_session(first_session_id))
 
     conn = kb.connect()
     try:
@@ -1110,11 +1111,12 @@ def test_persisted_captain_report_reconciles_without_duplicate_after_restart(
             return 0
         return real_ack(conn, **kwargs)
 
-    def submit(_rid, _sid, _session, text, **kwargs):
+    def submit(_rid, _sid, active_session, text, **kwargs):
         completion_id = kwargs["completion_id"]
         attempts.append(completion_id)
+        active_session_id = active_session["agent"].session_id
         db.append_messages_batch(
-            session_id,
+            active_session_id,
             [
                 {"role": "user", "content": text},
                 {
@@ -1136,8 +1138,8 @@ def test_persisted_captain_report_reconciles_without_duplicate_after_restart(
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
 
     first = {
-        **_session(session_id),
-        "agent": agent,
+        **_session(first_session_id),
+        "agent": SimpleNamespace(_session_db=db, session_id=first_session_id),
         "history": [],
         "history_lock": threading.Lock(),
         "running": False,
@@ -1147,40 +1149,134 @@ def test_persisted_captain_report_reconciles_without_duplicate_after_restart(
     assert len(attempts) == 1
     assert _inbox_states() == {"pending": 1}
 
-    # Process restart: no process-local delivery memory survives. The canonical
-    # transcript is the only idempotency record available to the next poller.
+    # Session A disappears after committing the receipt but before ack. A
+    # distinct same-profile session B must reconcile that receipt profile-wide.
     server._sessions.clear()
-    durable_history = db.get_messages_as_conversation(session_id)
-    restarted = {
-        **_session(session_id),
-        "agent": agent,
-        "history": durable_history,
+    fallback = {
+        **_session(fallback_session_id),
+        "agent": SimpleNamespace(_session_db=db, session_id=fallback_session_id),
+        "history": db.get_messages_as_conversation(fallback_session_id),
         "history_lock": threading.Lock(),
         "running": False,
     }
-    _register_live("restarted-runtime", restarted)
+    _register_live("fallback-runtime", fallback)
     server._notification_poller_loop(
-        _StopAfterOnePoll(), "restarted-runtime", restarted
+        _StopAfterOnePoll(), "fallback-runtime", fallback
     )
 
     assert len(attempts) == 1
     assert _inbox_states() == {"acked": 1}
-    rows = db.get_messages_as_conversation(session_id)
+    first_rows = db.get_messages_as_conversation(first_session_id)
+    fallback_rows = db.get_messages_as_conversation(fallback_session_id)
     captain_rows = [
         row
-        for row in rows
+        for row in [*first_rows, *fallback_rows]
         if row.get("role") == "assistant"
         and (row.get("display_metadata") or {}).get("captain_completion_id")
         == attempts[0]
     ]
     assert [row["content"] for row in captain_rows] == ["Captain durable report"]
-    visible = server._history_to_messages(rows)
+    assert all(row.get("content") != "Captain durable report" for row in first_rows)
+    assert db.get_session(first_session_id)["message_count"] == 0
+    assert db.get_session(fallback_session_id)["message_count"] == 2
+    visible = server._history_to_messages(fallback["history"])
     assert [
         row["text"]
         for row in visible
         if row.get("role") == "assistant"
         and row.get("text") == "Captain durable report"
     ] == ["Captain durable report"]
+    db.close()
+
+
+def test_reconciliation_ack_failures_do_not_stop_poller_or_receiver_heartbeats(
+    monkeypatch,
+):
+    """Two recoverable receipt-ack failures stay inside one live poll loop."""
+    from hermes_state import SessionDB
+    from tools.process_registry import process_registry
+
+    session_id = "captain-reconcile-survives"
+    db = SessionDB()
+    db.create_session(session_id=session_id, source="tui", model="test")
+    profile = _profile_for(_session(session_id))
+    session = {
+        **_session(session_id),
+        "agent": SimpleNamespace(_session_db=db, session_id=session_id),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "running": False,
+    }
+    _register_live("surviving-runtime", session)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="captain-survives", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="retry ack twice")
+    finally:
+        conn.close()
+
+    seed_claims = []
+    seed_texts = _collect_kanban_notifications(session, claim_records=seed_claims)
+    completion_id = server._captain_completion_id(seed_claims, seed_texts)
+    server._settle_kanban_notification_claims(seed_claims, accepted=False)
+    db.append_messages_batch(
+        session_id,
+        [
+            {"role": "user", "content": seed_texts[0]},
+            {
+                "role": "assistant",
+                "content": "Captain survives transient ack failures",
+                "display_metadata": {"captain_completion_id": completion_id},
+            },
+        ],
+    )
+
+    real_ack = kb.ack_captain_reports
+    ack_calls = 0
+    heartbeat_calls = 0
+
+    def fail_two_acks(conn, **kwargs):
+        nonlocal ack_calls
+        ack_calls += 1
+        if ack_calls <= 2:
+            raise RuntimeError(f"transient ack failure {ack_calls}")
+        return real_ack(conn, **kwargs)
+
+    def record_heartbeat(_session):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+
+    class _StopAfterThreePolls(threading.Event):
+        def __init__(self):
+            super().__init__()
+            self.polls = 0
+
+        def is_set(self):
+            self.polls += 1
+            return self.polls > 3
+
+    monkeypatch.setattr(kb, "ack_captain_reports", fail_two_acks)
+    monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
+    monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
+    monkeypatch.setattr(server, "_touch_captain_receivers", record_heartbeat)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_a, **_k: pytest.fail("persisted receipt must not invoke the model"),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+
+    server._notification_poller_loop(
+        _StopAfterThreePolls(), "surviving-runtime", session
+    )
+
+    assert ack_calls == 3
+    assert heartbeat_calls == 3
+    assert _inbox_states() == {"acked": 1}
+    assert session["running"] is False
     db.close()
 
 

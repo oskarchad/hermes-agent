@@ -284,6 +284,48 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
+def test_task_only_context_skips_dynamic_session_context():
+    agent = _FakeAgent()
+    memory_manager = MagicMock()
+    memory_manager.prefetch_all.return_value = "UNRELATED_MEMORY_CONTEXT"
+    agent._memory_manager = memory_manager
+    recovered_history = [
+        {"role": "user", "content": "UNRELATED_ROTATED_HISTORY"},
+        {"role": "assistant", "content": "ordinary reply"},
+    ]
+
+    with (
+        patch(
+            "agent.turn_context.recover_rotated_compression_session",
+            return_value=recovered_history,
+        ) as recover,
+        patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            return_value=[{"context": "UNRELATED_PLUGIN_CONTEXT"}],
+        ) as invoke_hook,
+        patch(
+            "agent.turn_context.consume_gateway_turn_context_notes",
+            return_value="UNRELATED_GATEWAY_NOTE",
+        ) as consume_notes,
+    ):
+        ctx = _build(
+            agent,
+            conversation_history=[],
+            task_only_context=True,
+        )
+
+    recover.assert_not_called()
+    invoke_hook.assert_not_called()
+    consume_notes.assert_not_called()
+    memory_manager.on_turn_start.assert_not_called()
+    memory_manager.prefetch_all.assert_not_called()
+    assert ctx.conversation_history == []
+    assert [message.get("content") for message in ctx.messages] == ["hello"]
+    assert "api_content" not in ctx.messages[0]
+    assert ctx.plugin_user_context == ""
+    assert ctx.ext_prefetch_cache == ""
+
+
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)
