@@ -15,6 +15,7 @@ Three gaps found in review of the original memory-guard PR:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -288,6 +289,60 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
 
     # Human-lane review is not spawnable → no reservation, ready gets both.
     assert len(res.spawned) == 2
+
+
+def test_unsafe_legacy_review_does_not_tax_ready_budget(
+    kanban_home, monkeypatch,
+):
+    """A refused legacy review must not consume the only host slot."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    monkeypatch.setattr(
+        profmod,
+        "profile_exists",
+        lambda name: name in {"patch", "gauge", "alice"},
+    )
+
+    spawns: list = []
+    implementation_skills = ["repo-context-gate", "test-driven-development"]
+    with kb.connect() as conn:
+        unsafe_review_id = kb.create_task(
+            conn,
+            title="unsafe legacy review",
+            assignee="patch",
+            skills=implementation_skills,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'review', assignee = 'gauge' WHERE id = ?",
+            (unsafe_review_id,),
+        )
+        ready_id = kb.create_task(conn, title="healthy ready", assignee="alice")
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=1,
+        )
+
+        assert [item[0] for item in res.spawned] == [ready_id]
+        assert spawns == [ready_id]
+        unsafe_review = kb.get_task(conn, unsafe_review_id)
+        assert unsafe_review is not None
+        assert unsafe_review.status == "review"
+        assert unsafe_review.assignee == "gauge"
+        assert unsafe_review.skills == implementation_skills
+        diagnostic = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_dispatch_refused'",
+            (unsafe_review_id,),
+        ).fetchone()
+        assert diagnostic is not None
+        assert json.loads(diagnostic["payload"])["reason"] == "missing_review_handoff"
 
 
 def test_review_budget_still_bounded_by_shared_cap(

@@ -6702,6 +6702,9 @@ def _record_review_dispatch_refusal(
 def _reconcile_legacy_review_skills_before_claim(
     conn: sqlite3.Connection,
     task_id: str,
+    *,
+    apply: bool = True,
+    record_refusal: bool = True,
 ) -> bool:
     """Sanitize a pre-fix cross-profile review inside its claim transaction.
 
@@ -6716,9 +6719,15 @@ def _reconcile_legacy_review_skills_before_claim(
     safely to a phase. The caller then leaves the card parked in ``review``
     rather than spawning a profile with unsafe flags, and a bounded sanitized
     diagnostic event makes the refusal visible without repeating every tick.
+    ``apply=False`` performs the same provenance validation without changing a
+    safely reconcilable row; the dispatcher uses that read-only result when
+    deciding whether review work may reserve host capacity. Refusals can still
+    be recorded during that preflight so an unsafe row is visible even when a
+    healthy ready task consumes the released slot.
     """
     def refuse(reason: str) -> bool:
-        _record_review_dispatch_refusal(conn, task_id, reason)
+        if record_refusal:
+            _record_review_dispatch_refusal(conn, task_id, reason)
         return False
 
     task_row = conn.execute(
@@ -6802,6 +6811,9 @@ def _reconcile_legacy_review_skills_before_claim(
         if current_skills:
             return refuse("missing_implementation_skill_provenance")
         implementation_skills = current_skills
+
+    if not apply:
+        return True
 
     updated = conn.execute(
         "UPDATE tasks SET skills = NULL "
@@ -10481,9 +10493,9 @@ def _dispatch_once_locked(
     # from the ready loop so the review lane always gets a spawn
     # opportunity. The reservation is per-tick and self-releasing: with no
     # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
+    # full budget. "Spawnable" mirrors the review loop's profile gate and
+    # phase-skill claim gate so neither human-pulled control-plane lanes nor
+    # unsafe legacy handoffs permanently tax ready throughput.
     def _any_spawnable_review() -> bool:
         if not review_rows:
             return False
@@ -10492,10 +10504,29 @@ def _dispatch_once_locked(
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
+            _rpe = None
+        for row in review_rows:
+            if not row["assignee"]:
+                continue
+            if _rpe is not None and not _rpe(row["assignee"]):
+                continue
+            if dry_run:
+                claimable = _reconcile_legacy_review_skills_before_claim(
+                    conn,
+                    row["id"],
+                    apply=False,
+                    record_refusal=False,
+                )
+            else:
+                with write_txn(conn):
+                    claimable = _reconcile_legacy_review_skills_before_claim(
+                        conn,
+                        row["id"],
+                        apply=False,
+                    )
+            if claimable:
+                return True
+        return False
 
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
