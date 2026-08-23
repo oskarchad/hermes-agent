@@ -929,3 +929,295 @@ def test_dispatch_stops_exact_spawn_when_pid_persistence_cas_loses(
         )
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("operation", ["manual_reclaim", "reassign"])
+def test_dispatch_pre_pid_manual_recovery_preserves_original_owner(
+    monkeypatch, tmp_path, operation,
+):
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda pid, *_args, **_kwargs: {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": pid is not None,
+            "terminated": pid is not None,
+            "scope_stop_attempted": False,
+            "scope_stopped": False,
+            "cleanup_verified": pid is not None,
+        },
+    )
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title=f"pre-pid {operation}",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        attempted = {}
+
+        def spawn_during_recovery(claimed, _workspace):
+            side = kb.connect()
+            try:
+                if operation == "manual_reclaim":
+                    attempted["result"] = kb.reclaim_task(
+                        side, claimed.id, reason="operator raced spawn",
+                    )
+                else:
+                    attempted["result"] = kb.reassign_task(
+                        side,
+                        claimed.id,
+                        "gauge",
+                        reclaim_first=True,
+                        reason="operator raced spawn",
+                    )
+                held = kb.get_task(side, claimed.id)
+                assert held is not None
+                attempted["run_id"] = held.current_run_id
+                attempted["claim_lock"] = held.claim_lock
+                attempted["assignee"] = held.assignee
+            finally:
+                side.close()
+            return 89201
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn_during_recovery)
+
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert attempted == {
+            "result": False,
+            "run_id": held.current_run_id,
+            "claim_lock": held.claim_lock,
+            "assignee": "patch",
+        }
+        assert held.status == "running"
+        assert held.worker_pid == 89201
+        assert [item[0] for item in result.spawned] == [task_id]
+        active_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
+            "AND status = 'running' AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()[0]
+        assert active_runs == 1
+    finally:
+        conn.close()
+
+
+def test_dispatch_pre_pid_stale_ttl_reclaim_preserves_original_owner(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda pid, *_args, **_kwargs: {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": pid is not None,
+            "terminated": pid is not None,
+            "scope_stop_attempted": False,
+            "scope_stopped": False,
+            "cleanup_verified": pid is not None,
+        },
+    )
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="pre-pid stale ttl",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        attempted = {}
+
+        def spawn_during_stale_reclaim(claimed, _workspace):
+            side = kb.connect()
+            try:
+                with kb.write_txn(side):
+                    expired = int(time.time()) - 1
+                    side.execute(
+                        "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                        (expired, claimed.id),
+                    )
+                    side.execute(
+                        "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                        (expired, claimed.current_run_id),
+                    )
+                attempted["reclaimed"] = kb.release_stale_claims(side)
+                held = kb.get_task(side, claimed.id)
+                assert held is not None
+                attempted["run_id"] = held.current_run_id
+                attempted["claim_lock"] = held.claim_lock
+            finally:
+                side.close()
+            return 89202
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=spawn_during_stale_reclaim,
+        )
+
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert attempted == {
+            "reclaimed": 0,
+            "run_id": held.current_run_id,
+            "claim_lock": held.claim_lock,
+        }
+        assert held.status == "running"
+        assert held.worker_pid == 89202
+        assert [item[0] for item in result.spawned] == [task_id]
+        active_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
+            "AND status = 'running' AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()[0]
+        assert active_runs == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_pid_cas_loss_cleanup_failure_does_not_mutate_successor(
+    monkeypatch, tmp_path, lane,
+):
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.config as config
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda *_args, **_kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    cleanup_calls = []
+
+    def cleanup_cannot_verify(pid, claim_lock, *, scope_expected=None, **_kwargs):
+        cleanup_calls.append((int(pid), claim_lock, scope_expected))
+        return {
+            "prev_pid": int(pid),
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": False,
+            "scope_stop_attempted": False,
+            "scope_stopped": False,
+            "cleanup_verified": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", cleanup_cannot_verify)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title=f"{lane} pid CAS cleanup failure",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        if lane == "review":
+            implementation = kb.claim_task(conn, task_id)
+            assert implementation is not None
+            assert kb.request_review(
+                conn,
+                task_id,
+                summary="ready for exact-boundary review",
+                expected_run_id=implementation.current_run_id,
+            )
+        original = {}
+        replacement = {}
+
+        def spawn_then_replace_owner(claimed, _workspace):
+            original.update(
+                run_id=claimed.current_run_id,
+                claim_lock=claimed.claim_lock,
+            )
+            side = kb.connect()
+            try:
+                with kb.write_txn(side):
+                    kb._end_run(
+                        side,
+                        claimed.id,
+                        outcome="reclaimed",
+                        status="reclaimed",
+                        summary="concurrent owner replacement",
+                    )
+                    side.execute(
+                        "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                        (lane, claimed.id),
+                    )
+                successor_lock = kb._dispatcher_claim_lock(side, claimed.id)
+                if lane == "review":
+                    successor = kb.claim_review_task(
+                        side, claimed.id, claimer=successor_lock,
+                    )
+                else:
+                    successor = kb.claim_task(
+                        side, claimed.id, claimer=successor_lock,
+                    )
+                assert successor is not None
+                kb._set_worker_pid(side, claimed.id, 89300)
+                replacement.update(
+                    run_id=successor.current_run_id,
+                    claim_lock=successor_lock,
+                )
+            finally:
+                side.close()
+            return kb._SpawnedWorkerPid(
+                89301,
+                isolation_mode="process_session",
+                scope_unit=None,
+            )
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn_then_replace_owner)
+
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.current_run_id == replacement["run_id"]
+        assert held.claim_lock == replacement["claim_lock"]
+        assert held.worker_pid == 89300
+        assert held.consecutive_failures == 0
+        successor = kb.latest_run(conn, task_id)
+        assert successor is not None
+        assert successor.id == replacement["run_id"]
+        assert successor.status == "running"
+        assert successor.ended_at is None
+        assert result.spawned == []
+        assert cleanup_calls == [(89301, original["claim_lock"], False)]
+        active_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
+            "AND status = 'running' AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()[0]
+        assert active_runs == 1
+        events = kb.list_events(conn, task_id)
+        assert not any(event.kind == "spawn_failed" for event in events)
+        assert not any(
+            event.kind in {"spawned", "spawn_failed"} and event.run_id is None
+            for event in events
+        )
+        cleanup_failed = [
+            event for event in events if event.kind == "spawn_cleanup_failed"
+        ]
+        assert len(cleanup_failed) == 1
+        assert cleanup_failed[0].run_id == original["run_id"]
+        assert cleanup_failed[0].payload is not None
+        assert cleanup_failed[0].payload["pid"] == 89301
+    finally:
+        conn.close()

@@ -461,6 +461,7 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
 
 def test_reclaim_fails_safe_on_non_object_claim_provenance(conn) -> None:
     task_id, _review = _claimed_review(conn, "Non-object claimed payload")
+    kb._set_worker_pid(conn, task_id, 89399)
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE task_events SET payload = '[]' "
@@ -487,6 +488,8 @@ def test_interrupted_review_runs_retry_in_review_phase(
         f"Retry review after {reclaim_kind}",
         ttl_seconds=-1 if reclaim_kind == "expired_claim" else None,
     )
+    if reclaim_kind in {"expired_claim", "manual_reclaim"}:
+        kb._set_worker_pid(conn, task_id, 89400)
 
     if reclaim_kind == "spawn_failure":
         assert not kb._record_spawn_failure(

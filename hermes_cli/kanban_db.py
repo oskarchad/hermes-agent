@@ -5302,6 +5302,12 @@ def release_stale_claims(
         (now,),
     ).fetchall()
     for row in stale:
+        # A claimed task with no persisted PID is inside the spawn boundary:
+        # the child may already be live while spawn_fn has not returned yet.
+        # There is no exact process identity to stop, so releasing ownership
+        # here would let this same tick dispatch a duplicate beside it.
+        if row["worker_pid"] is None:
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -5457,6 +5463,15 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if (
+        row["status"] == "running"
+        and row["claim_lock"] is not None
+        and row["worker_pid"] is None
+    ):
+        # PID persistence is the first exact process boundary we can stop and
+        # verify. Until it lands, manual recovery must retain ownership so the
+        # in-flight spawn cannot be orphaned beside a replacement.
+        return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"],
@@ -5535,7 +5550,16 @@ def reassign_task(
     """
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
-        reclaim_task(conn, task_id, reason=reason or "reassign")
+        reclaimed = reclaim_task(conn, task_id, reason=reason or "reassign")
+        if not reclaimed:
+            current = conn.execute(
+                "SELECT status, claim_lock FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if current is not None and (
+                current["status"] == "running" or current["claim_lock"] is not None
+            ):
+                return False
     # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)
@@ -10573,21 +10597,82 @@ def _set_worker_pid(
         return True
 
 
-def _stop_spawn_after_pid_persistence_loss(task: Task, pid: int) -> None:
-    """Stop and verify a child whose exact claimed owner no longer exists."""
-    isolation_mode = getattr(pid, "isolation_mode", None)
-    scope_expected = (
-        isolation_mode == "systemd_scope"
-        if isolation_mode in {"systemd_scope", "process_session"}
-        else _systemd_worker_scope_required()
-    )
-    termination = _terminate_reclaimed_worker(
-        int(pid), task.claim_lock, scope_expected=scope_expected,
-    )
-    if not _worker_cleanup_verified(termination):
-        raise RuntimeError(
-            f"spawned worker cleanup could not be verified after PID CAS loss: {task.id}"
+def _record_spawn_cleanup_failure(
+    conn: sqlite3.Connection,
+    task: Task,
+    pid: int,
+    termination: dict[str, Any],
+) -> None:
+    """Attach a failed post-CAS cleanup diagnostic to the displaced run."""
+    run_id = task.current_run_id
+    if run_id is None:
+        return
+    with write_txn(conn):
+        original = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(run_id), task.id),
+        ).fetchone()
+        current_task = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+        if original is None or current_task is None:
+            return
+        payload: dict[str, Any] = {"pid": int(pid)}
+        payload.update(termination)
+        _append_event(
+            conn,
+            task.id,
+            "spawn_cleanup_failed",
+            payload,
+            run_id=int(run_id),
         )
+
+
+def _stop_spawn_after_pid_persistence_loss(
+    conn: sqlite3.Connection,
+    task: Task,
+    pid: int,
+) -> bool:
+    """Stop a displaced spawn without touching its replacement owner."""
+    try:
+        isolation_mode = getattr(pid, "isolation_mode", None)
+        scope_expected = (
+            isolation_mode == "systemd_scope"
+            if isolation_mode in {"systemd_scope", "process_session"}
+            else _systemd_worker_scope_required()
+        )
+        termination = _terminate_reclaimed_worker(
+            int(pid), task.claim_lock, scope_expected=scope_expected,
+        )
+        if _worker_cleanup_verified(termination):
+            return True
+    except Exception as exc:
+        termination = {
+            "cleanup_verified": False,
+            "cleanup_error": str(exc)[:500],
+        }
+
+    _log.error(
+        "kanban dispatch: spawned worker cleanup could not be verified after "
+        "PID persistence CAS loss for task %s run %s pid %s",
+        task.id,
+        task.current_run_id,
+        int(pid),
+    )
+    try:
+        _record_spawn_cleanup_failure(conn, task, pid, termination)
+    except Exception:
+        # This is a diagnostic-only write. Most importantly, never let its
+        # failure enter generic spawn-failure accounting, which is scoped to
+        # the task's *current* owner and may now be a replacement run.
+        _log.exception(
+            "kanban dispatch: failed to persist PID CAS-loss cleanup diagnostic "
+            "for task %s run %s",
+            task.id,
+            task.current_run_id,
+        )
+    return False
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -11551,7 +11636,7 @@ def _dispatch_once_locked(
                 expected_run_id=claimed.current_run_id,
                 expected_claim_lock=claimed.claim_lock,
             ):
-                _stop_spawn_after_pid_persistence_loss(claimed, pid)
+                _stop_spawn_after_pid_persistence_loss(conn, claimed, pid)
                 continue
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
@@ -11703,7 +11788,7 @@ def _dispatch_once_locked(
                 expected_run_id=claimed.current_run_id,
                 expected_claim_lock=claimed.claim_lock,
             ):
-                _stop_spawn_after_pid_persistence_loss(claimed, pid)
+                _stop_spawn_after_pid_persistence_loss(conn, claimed, pid)
                 continue
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
