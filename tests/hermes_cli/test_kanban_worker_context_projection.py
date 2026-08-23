@@ -301,6 +301,7 @@ def test_repair_retry_retains_newer_protocol_violation_diagnostic(
         )
         stale = kb.claim_task(conn, task_id, claimer=f"{host}:stale-implementation")
         assert stale is not None
+        kb._set_worker_pid(conn, task_id, 991_775)
         assert kb.reclaim_task(
             conn,
             task_id,
@@ -372,6 +373,7 @@ def test_closure_review_retry_retains_only_newer_operational_failure(
         )
         stale = kb.claim_task(conn, task_id, claimer="builder:stale")
         assert stale is not None
+        kb._set_worker_pid(conn, task_id, 991_776)
         assert kb.reclaim_task(
             conn,
             task_id,
@@ -418,6 +420,7 @@ def test_closure_review_retry_retains_only_newer_operational_failure(
                 conn, signal_fn=lambda *_args: None
             )
         elif failure_kind == "reclaimed":
+            kb._set_worker_pid(conn, task_id, 991_780)
             assert kb.reclaim_task(
                 conn,
                 task_id,
