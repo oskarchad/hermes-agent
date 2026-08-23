@@ -1,4 +1,5 @@
 import asyncio
+import time
 import pytest
 
 from pathlib import Path
@@ -783,6 +784,116 @@ async def test_lineage_current_gave_up_keeps_block_and_redacts_bounded_payload(
     assert "lineage=current" in message
     assert "task is blocked" in message
     assert secret not in message
+    assert len(message) <= 700
+
+
+@pytest.mark.asyncio
+async def test_lineage_crash_breaker_preserves_run_and_current_block_alert(
+    kanban_home,
+    monkeypatch,
+):
+    session_key = "lineage-crash-breaker"
+    secret = "sk-proj-" + ("B" * 80)
+    long_exit_code = f"failure with {secret} " + ("x" * 2_000)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="crash breaker",
+            assignee="worker1",
+            max_retries=1,
+        )
+    _subscribe_lineage_surfaces(task_id, session_key=session_key)
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        kb._set_worker_pid(conn, task_id, 991001)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb,
+            "_classify_worker_exit",
+            lambda _pid: ("nonzero_exit", long_exit_code),
+        )
+        assert kb.detect_crashed_workers(conn) == [task_id]
+
+        task = kb.get_task(conn, task_id)
+        gave_up = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "gave_up"
+        )
+        assert task is not None and task.status == "blocked"
+        assert gave_up.run_id == run_id
+
+    from agent import redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    message = await _assert_gateway_tui_lineage_parity(
+        session_key=session_key,
+        matching_text="gave up",
+    )
+
+    assert f"event_run_id={run_id}" in message
+    assert "status=blocked" in message
+    assert "current_run_id=none" in message
+    assert "lineage=current" in message
+    assert "task is blocked" in message
+    assert secret not in message
+    assert len(message) <= 700
+
+
+@pytest.mark.asyncio
+async def test_lineage_timeout_breaker_preserves_run_and_current_block_alert(
+    kanban_home,
+    monkeypatch,
+):
+    session_key = "lineage-timeout-breaker"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="timeout breaker",
+            assignee="worker1",
+            max_runtime_seconds=1,
+            max_retries=1,
+        )
+    _subscribe_lineage_surfaces(task_id, session_key=session_key)
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        kb._set_worker_pid(conn, task_id, 991002)
+        old_started = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (old_started, run_id),
+            )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        assert kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None) == [
+            task_id
+        ]
+
+        task = kb.get_task(conn, task_id)
+        gave_up = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "gave_up"
+        )
+        assert task is not None and task.status == "blocked"
+        assert gave_up.run_id == run_id
+
+    message = await _assert_gateway_tui_lineage_parity(
+        session_key=session_key,
+        matching_text="gave up",
+    )
+
+    assert f"event_run_id={run_id}" in message
+    assert "status=blocked" in message
+    assert "current_run_id=none" in message
+    assert "lineage=current" in message
+    assert "task is blocked" in message
     assert len(message) <= 700
 
 

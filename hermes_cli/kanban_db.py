@@ -8903,6 +8903,7 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        run_id: Optional[int] = None
         # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
@@ -8969,6 +8970,7 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
+                trigger_run_id=run_id,
                 event_payload_extra={
                     "pid": pid,
                     "sigkill": killed,
@@ -9323,8 +9325,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, Optional[int]]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, trigger_run_id)
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
@@ -9477,7 +9479,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, run_id)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
@@ -9499,10 +9501,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (
+            tid, pid, claimer, protocol_violation, error_text, trigger_run_id,
+        ) in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -9539,6 +9543,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
+                    trigger_run_id=trigger_run_id,
                     event_payload_extra={
                         "pid": pid,
                         "claimer": claimer,
@@ -9558,6 +9563,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 failure_limit=1 if is_systemic else None,
                 release_claim=False,
                 end_run=False,
+                trigger_run_id=trigger_run_id,
                 event_payload_extra={"pid": pid, "claimer": claimer},
             )
             if tripped:
@@ -9597,6 +9603,7 @@ def _record_task_failure(
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
+    trigger_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
@@ -9621,7 +9628,9 @@ def _record_task_failure(
       Caller has ALREADY restored the task's source phase and closed the
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
-      into ``blocked`` and a ``gave_up`` event is emitted.
+      into ``blocked`` and a ``gave_up`` event is emitted. The caller passes
+      that closed run's id as ``trigger_run_id`` so the derived event retains
+      authoritative lineage even though ``tasks.current_run_id`` is cleared.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -9692,7 +9701,7 @@ def _record_task_failure(
                     "WHERE id = ? AND status IN ('ready', 'review', 'running')",
                     (failures, error[:500], task_id),
                 )
-            run_id = None
+            run_id = trigger_run_id
             if end_run:
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
