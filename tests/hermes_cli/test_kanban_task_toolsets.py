@@ -272,6 +272,133 @@ def test_default_spawn_uses_exact_task_toolsets_in_worker_and_reviewer_phases(
     assert not ({"meta_ads", "email", "claude_design", "video"} & set(pinned))
 
 
+def test_default_spawn_marks_only_explicit_task_toolset_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "patch"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - terminal
+mcp_servers:
+  context7:
+    enabled: true
+    command: node
+    args: []
+agent:
+  disabled_toolsets:
+    - context7
+    - kanban
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_TASK_TOOLSETS_BOUNDED", "stale-parent-value")
+    _allow_task_toolsets(monkeypatch)
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    captured: list[tuple[list[str], dict[str, str]]] = []
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured.append((list(cmd), dict(kwargs.get("env") or {})))
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        legacy_id = kb.create_task(
+            conn,
+            title="spawn inherited task",
+            assignee="patch",
+        )
+        explicit_id = kb.create_task(
+            conn,
+            title="spawn bounded task",
+            assignee="patch",
+            enabled_toolsets=["terminal"],
+        )
+        legacy_task = kb.get_task(conn, legacy_id)
+        explicit_task = kb.get_task(conn, explicit_id)
+
+    assert legacy_task is not None
+    assert explicit_task is not None
+
+    kb._default_spawn(legacy_task, str(workspace))
+    kb._default_spawn(explicit_task, str(workspace))
+
+    legacy_cmd, legacy_env = captured[0]
+    explicit_cmd, explicit_env = captured[1]
+    legacy_toolsets = legacy_cmd[legacy_cmd.index("--toolsets") + 1].split(",")
+    explicit_toolsets = explicit_cmd[explicit_cmd.index("--toolsets") + 1].split(",")
+
+    assert legacy_task.effective_toolsets is None
+    assert "terminal" in legacy_toolsets
+    assert not ({"context7", "kanban"} & set(legacy_toolsets))
+    assert "HERMES_KANBAN_TASK_TOOLSETS_BOUNDED" not in legacy_env
+    assert explicit_toolsets == ["terminal", "context7", "kanban"]
+    assert explicit_env["HERMES_KANBAN_TASK_TOOLSETS_BOUNDED"] == "1"
+
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    context7_probe = "mcp__context7__spawn_policy_probe"
+    registry.register(
+        name=context7_probe,
+        toolset="mcp-context7",
+        schema={
+            "name": context7_probe,
+            "description": "Spawn policy integration probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: "{}",
+    )
+    monkeypatch.setitem(registry._toolset_aliases, "context7", "mcp-context7")
+
+    def spawned_tool_names(
+        toolsets: list[str], child_env: dict[str, str]
+    ) -> set[str]:
+        with monkeypatch.context() as child:
+            for key in (
+                "HERMES_KANBAN_TASK",
+                "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_TASK_TOOLSETS_BOUNDED",
+            ):
+                if key in child_env:
+                    child.setenv(key, child_env[key])
+                else:
+                    child.delenv(key, raising=False)
+            definitions = get_tool_definitions(
+                enabled_toolsets=toolsets,
+                disabled_toolsets=["context7", "kanban"],
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+        return {item["function"]["name"] for item in definitions}
+
+    try:
+        legacy_names = spawned_tool_names(legacy_toolsets, legacy_env)
+        explicit_names = spawned_tool_names(explicit_toolsets, explicit_env)
+    finally:
+        registry.deregister(context7_probe)
+
+    assert context7_probe not in legacy_names
+    assert "kanban_show" in legacy_names
+    assert "kanban_complete" in legacy_names
+    assert context7_probe in explicit_names
+    assert "kanban_show" in explicit_names
+    assert "kanban_complete" in explicit_names
+
+
 def test_review_transition_preserves_requested_and_effective_toolsets(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -438,6 +565,7 @@ def test_dispatcher_bounded_worker_mandatory_toolsets_survive_profile_disables(
     monkeypatch.setitem(registry._toolset_aliases, "context7", "mcp-context7")
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_mandatory_surface")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    monkeypatch.setenv("HERMES_KANBAN_TASK_TOOLSETS_BOUNDED", "1")
     try:
         definitions = get_tool_definitions(
             enabled_toolsets=kb.effective_task_toolsets(["terminal"]),
@@ -452,3 +580,51 @@ def test_dispatcher_bounded_worker_mandatory_toolsets_survive_profile_disables(
     assert context7_probe in names
     assert "kanban_show" in names
     assert "kanban_complete" in names
+
+
+def test_task_bound_marker_changes_cached_mandatory_toolset_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    context7_probe = "mcp__context7__task_bound_cache_probe"
+    registry.register(
+        name=context7_probe,
+        toolset="mcp-context7",
+        schema={
+            "name": context7_probe,
+            "description": "Task bound cache identity probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: "{}",
+    )
+    monkeypatch.setitem(registry._toolset_aliases, "context7", "mcp-context7")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bound_cache")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "8")
+    monkeypatch.delenv("HERMES_KANBAN_TASK_TOOLSETS_BOUNDED", raising=False)
+    enabled = ["terminal", "context7", "kanban"]
+    disabled = ["context7", "kanban"]
+    try:
+        inherited = get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK_TOOLSETS_BOUNDED", "1")
+        bounded = get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    finally:
+        registry.deregister(context7_probe)
+
+    inherited_names = {item["function"]["name"] for item in inherited}
+    bounded_names = {item["function"]["name"] for item in bounded}
+    assert context7_probe not in inherited_names
+    assert "kanban_show" in inherited_names
+    assert context7_probe in bounded_names
+    assert "kanban_show" in bounded_names

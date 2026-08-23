@@ -39,6 +39,7 @@ from tools.registry import (
     tool_error,
 )
 from toolsets import (
+    KANBAN_TASK_TOOLSETS_BOUNDED_ENV,
     MANDATORY_KANBAN_TASK_TOOLSETS,
     resolve_toolset,
     validate_toolset,
@@ -374,6 +375,7 @@ def get_tool_definitions(
                 registry._generation,
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
+                os.environ.get(KANBAN_TASK_TOOLSETS_BOUNDED_ENV) == "1",
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
@@ -427,20 +429,31 @@ def _compute_tool_definitions(
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
     tools_to_include: set = set()
-    dispatcher_bounded_worker = bool(
-        enabled_toolsets is not None
-        and os.environ.get("HERMES_KANBAN_TASK")
+    dispatcher_worker = bool(
+        os.environ.get("HERMES_KANBAN_TASK")
         and not _is_delegated_child_context()
         and _is_dispatcher_owned_worker()
     )
+    dispatcher_bounded_worker = bool(
+        dispatcher_worker
+        and os.environ.get(KANBAN_TASK_TOOLSETS_BOUNDED_ENV) == "1"
+    )
+    irreducible_worker_toolsets = {"kanban"} if dispatcher_worker else set()
+    if dispatcher_bounded_worker:
+        irreducible_worker_toolsets.update(MANDATORY_KANBAN_TASK_TOOLSETS)
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if dispatcher_bounded_worker:
-            # Task-level readback and worker argv use the same ordered minimum.
-            # Defensively recover it here too so alternate dispatcher entry
-            # points cannot produce a narrower schema than the task reports.
-            for mandatory_toolset in MANDATORY_KANBAN_TASK_TOOLSETS:
+        if dispatcher_worker:
+            # Every worker retains board lifecycle. Explicitly bounded tasks
+            # additionally retain the ordered Context7 + Kanban minimum shown
+            # in task readback. Legacy NULL tasks keep profile inheritance.
+            ordered_minimum = (
+                MANDATORY_KANBAN_TASK_TOOLSETS
+                if dispatcher_bounded_worker
+                else ("kanban",)
+            )
+            for mandatory_toolset in ordered_minimum:
                 if mandatory_toolset not in effective_enabled_toolsets:
                     effective_enabled_toolsets.append(mandatory_toolset)
         for toolset_name in effective_enabled_toolsets:
@@ -468,10 +481,7 @@ def _compute_tool_definitions(
     # stripped out. See issue #17309.
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
-            if (
-                dispatcher_bounded_worker
-                and toolset_name in MANDATORY_KANBAN_TASK_TOOLSETS
-            ):
+            if toolset_name in irreducible_worker_toolsets:
                 continue
             if validate_toolset(toolset_name):
                 from toolsets import bundle_non_core_tools, get_toolset

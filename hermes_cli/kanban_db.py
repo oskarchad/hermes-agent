@@ -90,7 +90,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from toolsets import MANDATORY_KANBAN_TASK_TOOLSETS, get_toolset_names
+from toolsets import (
+    KANBAN_TASK_TOOLSETS_BOUNDED_ENV,
+    MANDATORY_KANBAN_TASK_TOOLSETS,
+    get_toolset_names,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -11539,6 +11543,14 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # An explicit task allowlist and a legacy NULL/profile-inherited task both
+    # receive --toolsets below. Carry the persisted distinction separately so
+    # model_tools only makes Context7 irreducible for genuinely bounded tasks.
+    # Clear first because env starts as a parent copy and nested test/dispatcher
+    # processes must not leak another task's bound into this child.
+    env.pop(KANBAN_TASK_TOOLSETS_BOUNDED_ENV, None)
+    if task.enabled_toolsets is not None:
+        env[KANBAN_TASK_TOOLSETS_BOUNDED_ENV] = "1"
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
