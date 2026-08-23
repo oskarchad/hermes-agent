@@ -3168,6 +3168,7 @@
     const [priority, setPriority] = useState(0);
     const [parent, setParent] = useState("");
     const [skills, setSkills] = useState("");
+    const [toolsets, setToolsets] = useState("");
     // A board with a configured workdir defaults to a persistent workspace:
     // worktree for git repositories, dir for ordinary directories. Boards
     // without one keep scratch for disposable research and ops tasks.
@@ -3201,6 +3202,11 @@
         .map(function (s) { return s.trim(); })
         .filter(function (s) { return s.length > 0; });
       if (skillList.length > 0) body.skills = skillList;
+      const toolsetList = toolsets
+        .split(",")
+        .map(function (s) { return s.trim(); })
+        .filter(function (s) { return s.length > 0; });
+      if (toolsetList.length > 0) body.enabled_toolsets = toolsetList;
       // Only send workspace_kind when it's non-default. Keeps the request
       // shape small and interoperable with older dispatcher versions.
       if (workspaceKind && workspaceKind !== "scratch") {
@@ -3217,6 +3223,7 @@
       }
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
+      setToolsets("");
       setWorkspaceKind(defaultWorkspaceKind); setWorkspacePath(defaultWorkspacePath);
       setGoalMode(false); setGoalMaxTurns("");
     };
@@ -3304,6 +3311,17 @@
               placeholder: tx(t, "skillsPlaceholder",
                 "skills (optional, comma-separated): translation, github-code-review"),
               title: "Force-load these skills into the worker (in addition to the built-in kanban-worker).",
+              className: "h-8 text-sm",
+            }),
+          ),
+          h("div", { className: "flex flex-col gap-1" },
+            fieldLabel(tx(t, "toolsetsLabel", "Worker toolsets"),
+              tx(t, "toolsetsLabelHint", "(optional, comma-separated allowlist)")),
+            h(Input, {
+              value: toolsets,
+              onChange: function (e) { setToolsets(e.target.value); },
+              placeholder: tx(t, "toolsetsPlaceholder", "terminal, file, web"),
+              title: "Bound this task's model-visible tools. Context7 and Kanban lifecycle tools are added automatically.",
               className: "h-8 text-sm",
             }),
           ),
@@ -3906,6 +3924,7 @@
           label: tx(i18n, "skills", "Skills"),
           value: t.skills.join(", "),
         }) : null,
+        h(ToolsetEditor, { task: t, onPatch: props.onPatch }),
         t.goal_mode ? h(MetaRow, {
           label: tx(i18n, "goalMode", "Goal mode"),
           value: t.goal_max_turns
@@ -4300,6 +4319,58 @@
           if (e.key === "Escape") setEditing(false);
         },
         className: "h-7 text-xs w-20",
+      }),
+    );
+  }
+
+  function ToolsetEditor(props) {
+    const { t } = useI18n();
+    const requested = props.task.enabled_toolsets;
+    const effective = props.task.effective_toolsets;
+    const [editing, setEditing] = useState(false);
+    const [v, setV] = useState(Array.isArray(requested) ? requested.join(", ") : "");
+    useEffect(function () {
+      setV(Array.isArray(requested) ? requested.join(", ") : "");
+    }, [requested]);
+    if (!editing) {
+      const current = Array.isArray(effective)
+        ? effective.join(", ")
+        : tx(t, "profileDefault", "profile default");
+      return h("div", { className: "hermes-kanban-meta-row" },
+        h("span", { className: "hermes-kanban-meta-label" },
+          tx(t, "workerToolsets", "Worker toolsets")),
+        h("span", {
+          className: cn(
+            "hermes-kanban-meta-value hermes-kanban-editable",
+            !Array.isArray(requested) ? "text-muted-foreground" : "",
+          ),
+          onClick: function () { setEditing(true); },
+          title: "Click to edit the task-level toolset allowlist",
+        }, current),
+      );
+    }
+    const save = function () {
+      const names = v.split(",")
+        .map(function (name) { return name.trim(); })
+        .filter(function (name) { return name.length > 0; });
+      const patch = names.length > 0
+        ? { enabled_toolsets: names }
+        : { clear_enabled_toolsets: true };
+      props.onPatch(patch).then(function () { setEditing(false); });
+    };
+    return h("div", { className: "hermes-kanban-meta-row" },
+      h("span", { className: "hermes-kanban-meta-label" },
+        tx(t, "workerToolsets", "Worker toolsets")),
+      h(Input, {
+        value: v,
+        autoFocus: true,
+        onChange: function (e) { setV(e.target.value); },
+        onKeyDown: function (e) {
+          if (e.key === "Enter") { e.preventDefault(); save(); }
+          if (e.key === "Escape") setEditing(false);
+        },
+        placeholder: tx(t, "toolsetsPlaceholder", "terminal, file, web"),
+        className: "h-7 text-xs flex-1",
       }),
     );
   }

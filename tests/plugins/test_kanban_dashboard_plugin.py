@@ -116,6 +116,45 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_task_toolsets_create_edit_clear_and_readback(client, monkeypatch):
+    monkeypatch.setattr(
+        kb,
+        "_available_task_toolset_names",
+        lambda *_args, **_kwargs: {
+            "context7", "file", "kanban", "terminal", "web",
+        },
+    )
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "bounded dashboard task",
+            "assignee": "patch",
+            "enabled_toolsets": ["web", "terminal", "web"],
+        },
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()["task"]
+    assert task["enabled_toolsets"] == ["web", "terminal"]
+    assert task["effective_toolsets"] == [
+        "web", "terminal", "context7", "kanban",
+    ]
+
+    edited = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"enabled_toolsets": ["file", "web"]},
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["task"]["enabled_toolsets"] == ["file", "web"]
+
+    cleared = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"clear_enabled_toolsets": True},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["task"]["enabled_toolsets"] is None
+    assert cleared.json()["task"]["effective_toolsets"] is None
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

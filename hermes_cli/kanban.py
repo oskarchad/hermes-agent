@@ -75,6 +75,12 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "completed_at": t.completed_at,
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
+        "enabled_toolsets": (
+            list(t.enabled_toolsets) if t.enabled_toolsets is not None else None
+        ),
+        "effective_toolsets": (
+            list(t.effective_toolsets) if t.effective_toolsets is not None else None
+        ),
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
@@ -361,6 +367,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). The kanban lifecycle is already "
                                "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument(
+        "--toolset", action="append", default=[], dest="enabled_toolsets",
+        help="Bound this task's worker tools to a named toolset "
+             "(repeatable). Required lifecycle toolsets are added automatically.",
+    )
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -494,6 +505,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
     )
+
+    # --- set-toolsets (per-task bounded worker surface) ---
+    p_set_toolsets = sub.add_parser(
+        "set-toolsets",
+        help="Set or clear a task's bounded worker toolset allowlist",
+    )
+    p_set_toolsets.add_argument("task_id")
+    p_set_toolsets.add_argument("toolsets", nargs="*")
+    p_set_toolsets.add_argument(
+        "--clear", action="store_true",
+        help="Clear the override and inherit the assignee profile toolsets",
+    )
+    p_set_toolsets.add_argument("--json", action="store_true")
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -1114,6 +1138,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "set-toolsets": _cmd_set_toolsets,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1580,6 +1605,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
+            enabled_toolsets=(
+                getattr(args, "enabled_toolsets", None) or None
+            ),
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
@@ -1890,6 +1918,36 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_toolsets(args: argparse.Namespace) -> int:
+    if args.clear and args.toolsets:
+        print("kanban: --clear cannot be combined with toolset names", file=sys.stderr)
+        return 2
+    requested = None if args.clear else list(args.toolsets)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_enabled_toolsets(conn, args.task_id, requested)
+            task = kb.get_task(conn, args.task_id) if ok else None
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok or task is None:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    elif requested is None:
+        print(
+            f"Cleared toolset override on {args.task_id} "
+            "(worker inherits its profile toolsets)"
+        )
+    else:
+        print(
+            f"Set toolset override on {args.task_id}: "
+            + ",".join(task.effective_toolsets or ())
+        )
     return 0
 
 

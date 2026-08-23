@@ -608,6 +608,7 @@ class CreateTaskBody(BaseModel):
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
+    enabled_toolsets: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
     model_override: Optional[str] = None
@@ -640,6 +641,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             idempotency_key=payload.idempotency_key,
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
+            enabled_toolsets=payload.enabled_toolsets,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
             model_override=payload.model_override,
@@ -851,6 +853,10 @@ class UpdateTaskBody(BaseModel):
     # override doesn't silently reset the depth the operator chose.
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
+    # Task-level bounded worker surface. None means omitted; use the explicit
+    # clear flag to restore legacy profile inheritance.
+    enabled_toolsets: Optional[list[str]] = None
+    clear_enabled_toolsets: bool = False
 
 
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
@@ -970,6 +976,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=409,
                     detail=f"status transition to {s!r} not valid from current state",
                 )
+
+        # --- bounded worker toolsets ---------------------------------------
+        if payload.clear_enabled_toolsets or payload.enabled_toolsets is not None:
+            new_toolsets = (
+                None if payload.clear_enabled_toolsets else payload.enabled_toolsets
+            )
+            try:
+                ok = kanban_db.set_enabled_toolsets(conn, task_id, new_toolsets)
+            except (ValueError, RuntimeError) as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if not ok:
+                raise HTTPException(status_code=404, detail="task not found")
 
         # --- model/provider override ---------------------------------------
         if payload.clear_model_override or payload.model_override is not None:

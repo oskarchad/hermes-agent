@@ -503,6 +503,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "enabled_toolsets": task.enabled_toolsets,
+        "effective_toolsets": task.effective_toolsets,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -549,6 +551,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "enabled_toolsets": t.enabled_toolsets,
+                    "effective_toolsets": t.effective_toolsets,
                 }
 
             def _run_dict(r):
@@ -1397,6 +1401,14 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
+    enabled_toolsets = args.get("enabled_toolsets")
+    if enabled_toolsets is not None and not isinstance(
+        enabled_toolsets, (list, tuple)
+    ):
+        return tool_error(
+            "enabled_toolsets must be a list of toolset names, got "
+            f"{type(enabled_toolsets).__name__}"
+        )
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
@@ -1444,6 +1456,7 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
+                enabled_toolsets=enabled_toolsets,
                 model_override=model_override,
                 provider_override=provider_override,
                 goal_mode=goal_mode,
@@ -2250,6 +2263,17 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "enabled_toolsets": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {"type": "string", "maxLength": 128},
+                "description": (
+                    "Optional bounded task-level toolset allowlist. The "
+                    "dispatcher adds mandatory lifecycle toolsets and passes "
+                    "only the effective list to the worker. Omit to inherit "
+                    "the assignee profile's normal CLI toolsets."
                 ),
             },
             "goal_mode": {

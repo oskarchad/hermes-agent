@@ -158,8 +158,112 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+MAX_TASK_ENABLED_TOOLSETS = 32
+MAX_TASK_TOOLSET_NAME_CHARS = 128
+# Explicit task-level narrowing may never remove the documentation lookup
+# surface or the worker's board lifecycle. Keep this order stable: it is
+# exposed for auditability and passed verbatim to ``hermes --toolsets``.
+MANDATORY_TASK_TOOLSETS = ("context7", "kanban")
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _profile_home_for_task(assignee: Optional[str]) -> Optional[str]:
+    """Best-effort profile home used to validate task-scoped toolsets."""
+    if assignee:
+        try:
+            from hermes_cli.profiles import resolve_profile_env
+
+            return resolve_profile_env(assignee)
+        except (FileNotFoundError, ValueError):
+            pass
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
+    except Exception:
+        return None
+
+
+def _available_task_toolset_names(hermes_home: Optional[str] = None) -> set[str]:
+    """Return built-in, live-registry, and profile-configured MCP aliases."""
+    names = set(get_toolset_names())
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import enabled_mcp_server_names
+
+        token = set_hermes_home_override(hermes_home) if hermes_home else None
+        try:
+            names.update(enabled_mcp_server_names(load_config()))
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+    except Exception as exc:
+        _log.debug("kanban task toolsets: profile inventory unavailable (%s)", exc)
+    return names
+
+
+def normalize_enabled_toolsets(
+    value: Any,
+    *,
+    hermes_home: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Validate and normalize a bounded task-level toolset allowlist."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("enabled_toolsets must be a list of toolset names")
+    if len(value) > MAX_TASK_ENABLED_TOOLSETS:
+        raise ValueError(
+            f"enabled_toolsets may contain at most {MAX_TASK_ENABLED_TOOLSETS} entries"
+        )
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise ValueError("enabled_toolsets must contain only strings")
+        name = raw.strip()
+        if not name:
+            raise ValueError("enabled_toolsets entries must not be empty")
+        if len(name) > MAX_TASK_TOOLSET_NAME_CHARS:
+            raise ValueError(
+                "enabled_toolsets names may contain at most "
+                f"{MAX_TASK_TOOLSET_NAME_CHARS} characters"
+            )
+        if any(ord(char) < 32 or char == "," for char in name):
+            raise ValueError("enabled_toolsets names contain an invalid character")
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+
+    available = _available_task_toolset_names(hermes_home)
+    unknown = [name for name in cleaned if name not in available]
+    if unknown:
+        raise ValueError(
+            "unknown toolset name(s) in enabled_toolsets: "
+            + ", ".join(repr(name) for name in unknown)
+        )
+    missing_required = [name for name in MANDATORY_TASK_TOOLSETS if name not in available]
+    if missing_required:
+        raise ValueError(
+            "required task toolset(s) unavailable in assignee profile: "
+            + ", ".join(missing_required)
+        )
+    return cleaned
+
+
+def effective_task_toolsets(requested: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Return exact requested order plus stable mandatory worker minimums."""
+    if requested is None:
+        return None
+    effective = list(requested)
+    for name in MANDATORY_TASK_TOOLSETS:
+        if name not in effective:
+            effective.append(name)
+    return effective
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -1093,6 +1197,11 @@ class Task:
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
+    # Optional bounded toolset allowlist requested for this task. ``None``
+    # preserves legacy profile inheritance.
+    enabled_toolsets: Optional[list[str]] = None
+    # Derived, non-persisted audit view of the exact worker spawn list.
+    effective_toolsets: Optional[list[str]] = None
     model_override: Optional[str] = None
     # Provider that ``model_override`` belongs to. When set, the dispatcher
     # passes ``--provider <name>`` alongside ``-m <model>`` so the worker
@@ -1154,6 +1263,16 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        enabled_toolsets_value: Optional[list[str]] = None
+        if "enabled_toolsets" in keys and row["enabled_toolsets"]:
+            try:
+                parsed_toolsets = json.loads(row["enabled_toolsets"])
+                if isinstance(parsed_toolsets, list) and all(
+                    isinstance(name, str) for name in parsed_toolsets
+                ):
+                    enabled_toolsets_value = list(parsed_toolsets)
+            except Exception:
+                enabled_toolsets_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1204,6 +1323,8 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
+            enabled_toolsets=enabled_toolsets_value,
+            effective_toolsets=effective_task_toolsets(enabled_toolsets_value),
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
                 row["provider_override"]
@@ -1374,6 +1495,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    -- Optional bounded task-level toolset allowlist, stored as JSON. NULL
+    -- preserves legacy profile inheritance. Mandatory task minimums are
+    -- appended only to the derived effective list.
+    enabled_toolsets     TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -2615,6 +2740,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # worker via --skills. NULL is fine for existing rows.
         _add_column_if_missing(conn, "tasks", "skills", "skills TEXT")
 
+    if "enabled_toolsets" not in cols:
+        # NULL keeps every legacy task on profile-inherited toolsets.
+        _add_column_if_missing(
+            conn, "tasks", "enabled_toolsets", "enabled_toolsets TEXT"
+        )
+
     if "max_retries" not in cols:
         # Per-task override for the consecutive-failure circuit breaker.
         # NULL = fall through to the dispatcher-level ``kanban.failure_limit``
@@ -3172,6 +3303,7 @@ def create_task(
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
+    enabled_toolsets: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
@@ -3207,6 +3339,11 @@ def create_task(
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
 
+    ``enabled_toolsets`` is an optional bounded allowlist for the worker's
+    model-visible tool schema. ``None`` preserves profile inheritance; an
+    explicit list is validated against the assignee profile and receives the
+    mandatory task lifecycle toolsets at dispatch.
+
     ``model_override`` / ``provider_override`` pin the worker to a specific
     model (and optionally its provider) without touching the profile's
     config — passed to the worker as ``-m <model> [--provider <name>]``.
@@ -3229,6 +3366,10 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    enabled_toolsets_list = normalize_enabled_toolsets(
+        enabled_toolsets,
+        hermes_home=_profile_home_for_task(assignee),
+    )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3495,10 +3636,11 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, enabled_toolsets, max_retries,
+                        model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3517,6 +3659,7 @@ def create_task(
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(enabled_toolsets_list) if enabled_toolsets_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
@@ -3549,6 +3692,8 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "enabled_toolsets": enabled_toolsets_list,
+                        "effective_toolsets": effective_task_toolsets(enabled_toolsets_list),
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -3898,6 +4043,50 @@ def set_reasoning_effort(
         )
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("reasoning_effort",))
+    return True
+
+
+def set_enabled_toolsets(
+    conn: sqlite3.Connection,
+    task_id: str,
+    enabled_toolsets: Optional[Iterable[str]],
+) -> bool:
+    """Set or clear a bounded task-level worker toolset allowlist."""
+    existing = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not existing:
+        return False
+    normalized = normalize_enabled_toolsets(
+        enabled_toolsets,
+        hermes_home=_profile_home_for_task(existing["assignee"]),
+    )
+    effective = effective_task_toolsets(normalized)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(
+                f"cannot set enabled toolsets on archived task {task_id}"
+            )
+        conn.execute(
+            "UPDATE tasks SET enabled_toolsets = ? WHERE id = ?",
+            (json.dumps(normalized) if normalized is not None else None, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "enabled_toolsets_set",
+            {
+                "inherit_profile": normalized is None,
+                "requested_count": len(normalized or ()),
+                "effective_count": len(effective or ()),
+            },
+        )
+    notify_task_updated(conn, task_id, ("enabled_toolsets",))
     return True
 
 
@@ -10481,7 +10670,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, enabled_toolsets FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10490,10 +10679,23 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, enabled_toolsets FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
+    toolset_validation_cache: dict[
+        tuple[Optional[str], Optional[str]],
+        tuple[Optional[list[str]], Optional[str]],
+    ] = {}
+
+    def _validate_row_toolsets(row) -> tuple[Optional[list[str]], Optional[str]]:
+        key = (row["assignee"], row["enabled_toolsets"])
+        if key not in toolset_validation_cache:
+            toolset_validation_cache[key] = _validate_task_toolsets_for_spawn(
+                row["enabled_toolsets"], assignee=row["assignee"]
+            )
+        return toolset_validation_cache[key]
+
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work
@@ -10518,6 +10720,9 @@ def _dispatch_once_locked(
             if not row["assignee"]:
                 continue
             if _rpe is not None and not _rpe(row["assignee"]):
+                continue
+            _effective, _error = _validate_row_toolsets(row)
+            if _error is not None:
                 continue
             if dry_run:
                 claimable = _reconcile_legacy_review_skills_before_claim(
@@ -10646,6 +10851,14 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        _effective_toolsets, _toolsets_error = _validate_row_toolsets(row)
+        if _toolsets_error is not None:
+            result.auto_blocked.append(row["id"])
+            if not dry_run:
+                _audit_and_block_invalid_task_toolsets(
+                    conn, row["id"], _toolsets_error
+                )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -10794,6 +11007,14 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        _effective_toolsets, _toolsets_error = _validate_row_toolsets(row)
+        if _toolsets_error is not None:
+            result.auto_blocked.append(row["id"])
+            if not dry_run:
+                _audit_and_block_invalid_task_toolsets(
+                    conn, row["id"], _toolsets_error
+                )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -11146,6 +11367,68 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _validate_task_toolsets_for_spawn(
+    raw_value: Any,
+    *,
+    assignee: Optional[str],
+) -> tuple[Optional[list[str]], Optional[str]]:
+    """Validate one persisted allowlist without leaking raw values to events."""
+    if raw_value is None:
+        return None, None
+    try:
+        parsed = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+    except Exception:
+        return None, "malformed_json"
+    try:
+        requested = normalize_enabled_toolsets(
+            parsed,
+            hermes_home=_profile_home_for_task(assignee),
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "unknown toolset" in message:
+            return None, "unknown_toolset"
+        if "required task toolset" in message:
+            return None, "required_toolset_unavailable"
+        return None, "malformed_value"
+    return effective_task_toolsets(requested), None
+
+
+def _audit_and_block_invalid_task_toolsets(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason_code: str,
+) -> None:
+    """Block invalid task configuration once, before any process is spawned."""
+    reason = (
+        "Invalid enabled_toolsets configuration; edit or clear the task-level "
+        "toolset override before retrying."
+    )
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL, "
+            "block_kind = 'capability', "
+            "block_recurrences = CASE "
+            "WHEN block_kind = 'capability' THEN block_recurrences + 1 ELSE 1 END "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "toolsets_validation_failed",
+            {"field": "enabled_toolsets", "reason_code": reason_code},
+        )
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {"reason": reason, "kind": "capability"},
+        )
+    notify_task_updated(conn, task_id, ("status", "block_kind"))
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -11336,7 +11619,14 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    if task.enabled_toolsets is not None:
+        requested_toolsets = normalize_enabled_toolsets(
+            task.enabled_toolsets,
+            hermes_home=env.get("HERMES_HOME"),
+        )
+        worker_toolsets = effective_task_toolsets(requested_toolsets)
+    else:
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

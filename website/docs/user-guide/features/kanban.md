@@ -245,6 +245,39 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Bound a task's worker tool surface
+
+By default, a task inherits the assignee profile's normal CLI toolsets. For a
+narrow lane, set a task-level allowlist so unrelated MCP servers and media or
+communication tools never enter that worker's model schema:
+
+```bash
+hermes kanban create "implement parser fix" --assignee patch \
+  --toolset terminal --toolset file --toolset context7
+
+# Replace the allowlist on an existing task.
+hermes kanban set-toolsets t_abcd terminal file context7
+
+# Restore legacy profile inheritance.
+hermes kanban set-toolsets t_abcd --clear
+```
+
+The dashboard's create dialog and task drawer expose the same setting, and
+orchestrators can pass `enabled_toolsets` to `kanban_create`. Requested names
+are deduplicated in first-seen order and validated against built-in toolsets,
+registry aliases, and enabled MCP server names from the assignee profile. The
+list is bounded to 32 names of at most 128 characters each.
+
+Hermes adds the mandatory `context7` and `kanban` toolsets to every explicit
+allowlist. `kanban` preserves lifecycle handoff tools; `context7` preserves the
+profile's required documentation lookup lane. Both the requested
+`enabled_toolsets` and computed `effective_toolsets` appear in JSON/API task
+readback for auditing. If an MCP server disappears or a stored row is tampered
+with, dispatch fails closed before process spawn, blocks the card once, and
+records a sanitized `toolsets_validation_failed` event instead of retrying in a
+crash loop. Tasks with no allowlist (`NULL`) retain the previous profile
+inheritance behavior unchanged.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
