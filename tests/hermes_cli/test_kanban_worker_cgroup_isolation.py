@@ -705,3 +705,152 @@ def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_pa
         assert archived.current_run_id is None
     finally:
         conn.close()
+
+
+def test_delete_rejects_unverified_running_scope_cleanup(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="delete scoped worker", assignee="patch")
+        claim_lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+        assert claimed is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                87890,
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+            ),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda _lock: False)
+
+        assert kb.delete_task(conn, task_id) is False
+
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.claim_lock == claim_lock
+        assert held.worker_pid == 87890
+        assert held.current_run_id == claimed.current_run_id
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.id == claimed.current_run_id
+        assert run.status == "running"
+        assert run.ended_at is None
+        deferred = kb.list_events(conn, task_id)[-1]
+        assert deferred.kind == "reclaim_deferred"
+        assert deferred.run_id == claimed.current_run_id
+        assert deferred.payload is not None
+        assert deferred.payload["reason"] == "delete_cleanup_incomplete"
+
+        spawns = []
+        dispatch = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: spawns.append("duplicate") or 90003,
+        )
+        assert dispatch.spawned == []
+        assert spawns == []
+    finally:
+        conn.close()
+
+
+def test_crash_cleanup_identity_swap_defers_replacement_run(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="crash cleanup race", assignee="patch")
+        old_lock = kb._dispatcher_claim_lock(conn, task_id)
+        old_run = kb.claim_task(conn, task_id, claimer=old_lock)
+        assert old_run is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                88901,
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(old_lock),
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (int(time.time()) - 30, task_id),
+        )
+        conn.commit()
+
+        replacement: dict[str, object] = {}
+
+        def cleanup_then_replace(_pid, _claim_lock, **_kwargs):
+            side = kb.connect()
+            try:
+                with kb.write_txn(side):
+                    kb._end_run(
+                        side,
+                        task_id,
+                        outcome="reclaimed",
+                        status="reclaimed",
+                        summary="concurrent replacement",
+                    )
+                    side.execute(
+                        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                        (task_id,),
+                    )
+                new_lock = kb._dispatcher_claim_lock(side, task_id)
+                new_run = kb.claim_task(side, task_id, claimer=new_lock)
+                assert new_run is not None
+                kb._set_worker_pid(
+                    side,
+                    task_id,
+                    kb._SpawnedWorkerPid(
+                        88902,
+                        isolation_mode="systemd_scope",
+                        scope_unit=kb._kanban_worker_scope_unit(new_lock),
+                    ),
+                )
+                replacement.update(lock=new_lock, run_id=new_run.current_run_id)
+            finally:
+                side.close()
+            return {
+                "prev_pid": 88901,
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": True,
+                "sigkill": False,
+                "termination_target": "systemd_scope",
+                "scope_stop_attempted": True,
+                "scope_stopped": True,
+                "scope_expected": True,
+                "cleanup_verified": True,
+            }
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(kb, "_terminate_reclaimed_worker", cleanup_then_replace)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("unknown", None))
+
+        assert kb.detect_crashed_workers(conn) == []
+
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.claim_lock == replacement["lock"]
+        assert held.worker_pid == 88902
+        assert held.current_run_id == replacement["run_id"]
+        replacement_run = kb.latest_run(conn, task_id)
+        assert replacement_run is not None
+        assert replacement_run.id == replacement["run_id"]
+        assert replacement_run.status == "running"
+        assert replacement_run.ended_at is None
+        assert not any(
+            event.kind == "crashed" and event.run_id == replacement["run_id"]
+            for event in kb.list_events(conn, task_id)
+        )
+    finally:
+        conn.close()

@@ -881,6 +881,35 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
+        verified_worker_identity = None
+        if (
+            payload.status is not None
+            and task.status == "running"
+            and payload.status not in {"running", "archived"}
+        ):
+            reason = (
+                "direct_status_cleanup_incomplete"
+                if payload.status in {"ready", "todo", "triage"}
+                else "dashboard_force_cleanup_incomplete"
+            )
+            cleanup_ok, verified_worker_identity = (
+                kanban_db._prepare_running_worker_cleanup(
+                    conn,
+                    task_id,
+                    reason=reason,
+                )
+            )
+            if not cleanup_ok:
+                raise HTTPException(
+                    status_code=409,
+                    detail="running worker cleanup could not be verified",
+                )
+        verified_run_id = (
+            verified_worker_identity[1]
+            if verified_worker_identity is not None
+            else None
+        )
+
         review_assignee_deferred = (
             payload.status == "review" and payload.assignee is not None
         )
@@ -908,11 +937,25 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    expected_run_id=verified_run_id,
+                    expected_worker_identity=verified_worker_identity,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task(
+                    conn,
+                    task_id,
+                    reason=payload.block_reason,
+                    expected_run_id=verified_run_id,
+                    expected_worker_identity=verified_worker_identity,
+                )
             elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.schedule_task(
+                    conn,
+                    task_id,
+                    reason=payload.block_reason,
+                    expected_run_id=verified_run_id,
+                    expected_worker_identity=verified_worker_identity,
+                )
             elif s == "review":
                 # Manual "request review" from the board. Routes through
                 # request_review so it is NOT a
@@ -922,6 +965,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     conn, task_id, summary=payload.summary,
                     metadata=payload.metadata,
                     reviewer=(payload.assignee or None),
+                    expected_run_id=verified_run_id,
+                    expected_worker_identity=verified_worker_identity,
                     # Dashboard PATCH is an explicit human action — allowed
                     # to override a live worker claim (M1 guard).
                     force=True,
@@ -938,7 +983,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 else:
                     reopened = _reopen_if_review(conn, task_id, current)
                     # Direct status write for drag-drop (todo -> ready etc).
-                    ok = reopened if reopened is not None else _set_status_direct(conn, task_id, "ready")
+                    ok = reopened if reopened is not None else _set_status_direct(
+                        conn,
+                        task_id,
+                        "ready",
+                        verified_worker_identity=verified_worker_identity,
+                    )
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
             elif s == "running":
@@ -951,7 +1001,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # transition; fetch lazily so triage/scheduled skip the query.
                 current = kanban_db.get_task(conn, task_id) if s == "todo" else None
                 reopened = _reopen_if_review(conn, task_id, current)
-                ok = reopened if reopened is not None else _set_status_direct(conn, task_id, s)
+                ok = reopened if reopened is not None else _set_status_direct(
+                    conn,
+                    task_id,
+                    s,
+                    verified_worker_identity=verified_worker_identity,
+                )
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
@@ -1082,8 +1137,14 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        existed = kanban_db.get_task(conn, task_id) is not None
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
+            if existed and kanban_db.get_task(conn, task_id) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="task delete refused while running ownership is active",
+                )
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
     finally:
@@ -1116,27 +1177,40 @@ def _parents_blocking_ready(
 def _invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     parent_id: str,
-    terminations: list[tuple[Optional[int], Optional[str]]],
-) -> None:
+    verified_worker_identities=None,
+) -> bool:
     """Delegate to the domain-layer implementation in :mod:`kanban_db`.
 
     Kept as a thin shim so ``_set_status_direct`` stays readable; the actual
     invalidation (recursive-CTE discovery, per-descendant events + comments,
     run closing, failure-counter reset) lives in
     :func:`kanban_db.invalidate_descendants_for_parent_reopen` so every
-    reopen surface shares one implementation. We run inside the caller's
-    open transaction, so the domain function composes via a savepoint and
-    returns the worker terminations for us to perform post-commit (events
-    must be durable BEFORE the kill).
+    reopen surface shares one implementation. Exact worker cleanup is
+    preflighted before the caller's transaction; the domain function then
+    composes via a savepoint and CAS-validates those identities before it
+    clears descendant ownership.
     """
     result = kanban_db.invalidate_descendants_for_parent_reopen(
-        conn, parent_id, author="dashboard",
+        conn,
+        parent_id,
+        author="dashboard",
+        verified_worker_identities=verified_worker_identities,
     )
-    terminations.extend(result["terminations"])
+    if result.get("cleanup_failed"):
+        return False
+    return True
+
+
+class _WorkerCleanupIdentityChanged(RuntimeError):
+    """Abort a direct transition whose verified owner changed before commit."""
 
 
 def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str,
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    verified_worker_identity=None,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
@@ -1148,97 +1222,136 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
-    effective_status = new_status
-    with kanban_db.write_txn(conn):
-        # Snapshot current state so we know whether to close a run.
-        prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if prev is None:
-            return False
-
-        if prev["status"] == "running" and new_status == "ready":
-            resume_status = kanban_db._retry_status_for_run(
-                conn, task_id, prev["current_run_id"]
-            )
-            if resume_status == "review":
-                effective_status = (
-                    "review"
-                    if kanban_db._parents_satisfied(conn, task_id)
-                    else "todo"
+    preflight = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if preflight is None:
+        return False
+    if preflight["status"] == "running" and new_status != "running":
+        if verified_worker_identity is None:
+            cleanup_ok, verified_worker_identity = (
+                kanban_db._prepare_running_worker_cleanup(
+                    conn,
+                    task_id,
+                    reason="direct_status_cleanup_incomplete",
                 )
-
-        # Guard: don't allow promoting to 'ready' unless all parents are done.
-        # Prevents the dispatcher from spawning a child whose upstream work
-        # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
-        if effective_status == "ready":
-            parent_statuses = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if parent_statuses and not all(
-                p["status"] in {"done", "archived"} for p in parent_statuses
-            ):
+            )
+            if not cleanup_ok:
                 return False
 
-        was_running = prev["status"] == "running"
-        reopening_satisfied_parent = (
-            prev["status"] in {"done", "archived"}
-            and effective_status not in {"done", "archived"}
-        )
-
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, "
-            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
-            (
-                effective_status,
-                effective_status,
-                effective_status,
-                effective_status,
-                task_id,
-            ),
-        )
-        if cur.rowcount != 1:
-            return False
-        run_id = None
-        if was_running and effective_status != "running" and prev["current_run_id"]:
-            run_id = kanban_db._end_run(
-                conn, task_id,
-                outcome="reclaimed", status="reclaimed",
-                summary=f"status changed to {effective_status} (dashboard/direct)",
-            )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
-        conn.execute(
-            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-            "VALUES (?, ?, 'status', ?, ?)",
-            (
-                task_id,
-                run_id,
-                json.dumps(
-                    {
-                        "status": effective_status,
-                        "requested_status": new_status,
-                    }
-                ),
-                int(time.time()),
-            ),
-        )
-        if reopening_satisfied_parent:
-            _invalidate_descendants_for_parent_reopen(
+    reopening_satisfied_parent = (
+        preflight["status"] in {"done", "archived"}
+        and new_status not in {"done", "archived"}
+    )
+    verified_descendant_identities = None
+    if reopening_satisfied_parent:
+        cleanup_ok, verified_descendant_identities = (
+            kanban_db._prepare_descendant_worker_cleanup(
                 conn,
                 task_id,
-                terminations,
+                reason="parent_reopen_cleanup_incomplete",
             )
-    for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+        )
+        if not cleanup_ok:
+            return False
+
+    effective_status = new_status
+    try:
+        with kanban_db.write_txn(conn):
+            # Snapshot current state so we know whether to close a run.
+            prev = conn.execute(
+                "SELECT id, status, current_run_id, worker_pid, claim_lock "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if prev is None:
+                return False
+
+            if prev["status"] == "running":
+                current_identity = kanban_db._worker_identity_from_row(prev)
+                if current_identity != verified_worker_identity:
+                    return False
+
+            if prev["status"] == "running" and new_status == "ready":
+                resume_status = kanban_db._retry_status_for_run(
+                    conn, task_id, prev["current_run_id"]
+                )
+                if resume_status == "review":
+                    effective_status = (
+                        "review"
+                        if kanban_db._parents_satisfied(conn, task_id)
+                        else "todo"
+                    )
+
+            # Guard: don't allow promoting to 'ready' unless all parents are done.
+            # Prevents the dispatcher from spawning a child whose upstream work
+            # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
+            if effective_status == "ready":
+                parent_statuses = conn.execute(
+                    "SELECT t.status FROM tasks t "
+                    "JOIN task_links l ON l.parent_id = t.id "
+                    "WHERE l.child_id = ?",
+                    (task_id,),
+                ).fetchall()
+                if parent_statuses and not all(
+                    p["status"] in {"done", "archived"} for p in parent_statuses
+                ):
+                    return False
+
+            was_running = prev["status"] == "running"
+            reopening_satisfied_parent = (
+                prev["status"] in {"done", "archived"}
+                and effective_status not in {"done", "archived"}
+            )
+
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, "
+                "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
+                "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
+                "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+                "WHERE id = ? AND status = ?",
+                (
+                    effective_status,
+                    effective_status,
+                    effective_status,
+                    effective_status,
+                    task_id,
+                    prev["status"],
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = None
+            if was_running and effective_status != "running" and prev["current_run_id"]:
+                run_id = kanban_db._end_run(
+                    conn, task_id,
+                    outcome="reclaimed", status="reclaimed",
+                    summary=f"status changed to {effective_status} (dashboard/direct)",
+                )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'status', ?, ?)",
+                (
+                    task_id,
+                    run_id,
+                    json.dumps(
+                        {
+                            "status": effective_status,
+                            "requested_status": new_status,
+                        }
+                    ),
+                    int(time.time()),
+                ),
+            )
+            if reopening_satisfied_parent and not _invalidate_descendants_for_parent_reopen(
+                conn,
+                task_id,
+                verified_worker_identities=verified_descendant_identities,
+            ):
+                raise _WorkerCleanupIdentityChanged(task_id)
+    except _WorkerCleanupIdentityChanged:
+        return False
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
@@ -1358,21 +1471,52 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
-                    if s == "done":
+                    verified_worker_identity = None
+                    cleanup_ok = True
+                    if task.status == "running" and s != "running":
+                        reason = (
+                            "direct_status_cleanup_incomplete"
+                            if s in {"ready", "todo", "triage"}
+                            else "dashboard_force_cleanup_incomplete"
+                        )
+                        cleanup_ok, verified_worker_identity = (
+                            kanban_db._prepare_running_worker_cleanup(
+                                conn,
+                                tid,
+                                reason=reason,
+                            )
+                        )
+                    verified_run_id = (
+                        verified_worker_identity[1]
+                        if verified_worker_identity is not None
+                        else None
+                    )
+                    if not cleanup_ok:
+                        ok = False
+                    elif s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            expected_run_id=verified_run_id,
+                            expected_worker_identity=verified_worker_identity,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        ok = kanban_db.block_task(
+                            conn,
+                            tid,
+                            expected_run_id=verified_run_id,
+                            expected_worker_identity=verified_worker_identity,
+                        )
                     elif s == "review":
                         # Non-block review handoff (mirror of PATCH /tasks/{id}).
                         ok = kanban_db.request_review(
                             conn, tid, summary=payload.summary,
                             metadata=payload.metadata,
                             reviewer=(payload.assignee or None),
+                            expected_run_id=verified_run_id,
+                            expected_worker_identity=verified_worker_identity,
                             # Bulk dashboard action: explicit human override.
                             force=True,
                         )
@@ -1382,7 +1526,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             ok = kanban_db.unblock_task(conn, tid)
                         else:
                             reopened = _reopen_if_review(conn, tid, cur)
-                            ok = reopened if reopened is not None else _set_status_direct(conn, tid, "ready")
+                            ok = reopened if reopened is not None else _set_status_direct(
+                                conn,
+                                tid,
+                                "ready",
+                                verified_worker_identity=verified_worker_identity,
+                            )
                     elif s == "running":
                         entry.update(
                             ok=False,
@@ -1394,12 +1543,22 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         results.append(entry)
                         continue
                     elif s == "scheduled":
-                        ok = kanban_db.schedule_task(conn, tid)
+                        ok = kanban_db.schedule_task(
+                            conn,
+                            tid,
+                            expected_run_id=verified_run_id,
+                            expected_worker_identity=verified_worker_identity,
+                        )
                     elif s in {"todo", "triage"}:
                         # Fetch lazily: only review->todo needs reopen.
                         cur = kanban_db.get_task(conn, tid) if s == "todo" else None
                         reopened = _reopen_if_review(conn, tid, cur)
-                        ok = reopened if reopened is not None else _set_status_direct(conn, tid, s)
+                        ok = reopened if reopened is not None else _set_status_direct(
+                            conn,
+                            tid,
+                            s,
+                            verified_worker_identity=verified_worker_identity,
+                        )
                     else:
                         entry.update(ok=False, error=f"unknown status {s!r}")
                         results.append(entry)

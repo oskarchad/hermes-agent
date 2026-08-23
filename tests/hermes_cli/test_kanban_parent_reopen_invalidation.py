@@ -6,9 +6,9 @@ assumed its result" (M3). These tests pin:
 
 * done descendants are demoted to ``todo`` with a ``descendant_invalidated``
   event AND a comment naming the ancestor (non-silent),
-* running descendants have their audit trail committed BEFORE their worker
-  is terminated, and the kill routes through ``_terminate_reclaimed_worker``
-  (the same helper the reclaim paths use),
+* running descendants are terminated and verified BEFORE their ownership is
+  cleared, and cleanup routes through ``_terminate_reclaimed_worker`` (the
+  same helper the reclaim paths use),
 * ``consecutive_failures`` resets to 0 (deliberate operator action —
   opposite of the review-loop rule pinned in M2), and
 * the dashboard ``_set_status_direct`` reopen path and the DB function
@@ -89,7 +89,7 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
     assert result["terminations"] == []
 
 
-def test_running_descendant_event_precedes_termination_via_reclaim_helper(
+def test_running_descendant_cleanup_precedes_ownership_release(
     conn, tmp_path, monkeypatch,
 ):
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
@@ -104,14 +104,20 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     kills: list[tuple] = []
 
     def fake_terminate(pid, claim_lock, **kwargs):
-        # The audit trail must already be durable when the kill fires:
-        # standalone calls commit before terminating.
+        # Fail-closed ordering: cleanup happens while the original run still
+        # owns the card, before invalidation clears run/PID/claim identity.
         side = kb.connect(tmp_path / "kanban.db")
         try:
             kinds = [e.kind for e in kb.list_events(side, child_id)]
+            active = kb.get_task(side, child_id)
         finally:
             side.close()
-        assert "descendant_invalidated" in kinds
+        assert "descendant_invalidated" not in kinds
+        assert active is not None
+        assert active.status == "running"
+        assert active.current_run_id == claimed.current_run_id
+        assert active.worker_pid == 424242
+        assert active.claim_lock == claimed.claim_lock
         kills.append((pid, claim_lock))
         return {"terminated": True}
 
@@ -123,7 +129,8 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
 
     assert kills and kills[0][0] == 424242
-    assert result["terminations"] == kills
+    assert result["terminations"] == []
+    assert result["cleanup_failed"] is False
     child = kb.get_task(conn, child_id)
     assert child is not None
     assert child.status == "todo"

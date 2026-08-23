@@ -5690,6 +5690,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_worker_identity: Optional[_WorkerIdentity] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
@@ -5760,6 +5761,9 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    identity_guard, identity_params = _worker_identity_guard(
+        task_id, expected_worker_identity,
+    )
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5785,8 +5789,8 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
-                """,
-                (result, now, task_id),
+                """ + identity_guard,
+                (result, now, task_id, *identity_params),
             )
         else:
             cur = conn.execute(
@@ -5803,8 +5807,14 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
-                """,
-                (result, now, task_id, int(expected_run_id)),
+                """ + identity_guard,
+                (
+                    result,
+                    now,
+                    task_id,
+                    int(expected_run_id),
+                    *identity_params,
+                ),
             )
         if cur.rowcount != 1:
             return False
@@ -6582,6 +6592,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_worker_identity: Optional[_WorkerIdentity] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6615,6 +6626,11 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
+    run_params = () if expected_run_id is None else (int(expected_run_id),)
+    identity_guard, identity_params = _worker_identity_guard(
+        task_id, expected_worker_identity,
+    )
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -6650,9 +6666,8 @@ def block_task(
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                """ + run_guard + identity_guard,
+                (kind, task_id, *run_params, *identity_params),
             )
             if cur.rowcount != 1:
                 return False
@@ -6708,9 +6723,14 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                """ + run_guard + identity_guard,
+                (
+                    kind,
+                    recurrences,
+                    task_id,
+                    *run_params,
+                    *identity_params,
+                ),
             )
             if cur.rowcount != 1:
                 return False
@@ -6735,37 +6755,26 @@ def block_task(
                 run_id=run_id,
             )
         else:
-            if expected_run_id is None:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
-                )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'blocked',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?,
+                       block_recurrences = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + run_guard + identity_guard,
+                (
+                    kind,
+                    recurrences,
+                    task_id,
+                    *run_params,
+                    *identity_params,
+                ),
+            )
             if cur.rowcount != 1:
                 return False
             run_id = _end_run(
@@ -7092,6 +7101,7 @@ def request_review(
     metadata: Optional[dict] = None,
     reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_worker_identity: Optional[_WorkerIdentity] = None,
     force: bool = False,
     with_reason: bool = False,
 ):
@@ -7197,12 +7207,16 @@ def request_review(
         params: list[Any] = []
         if reviewer is not None:
             params.append(reviewer)
+        identity_guard, identity_params = _worker_identity_guard(
+            task_id, expected_worker_identity,
+        )
         if expected_run_id is None:
             params.append(task_id)
             run_guard = ""
         else:
             params.extend((task_id, int(expected_run_id)))
             run_guard = " AND current_run_id = ?"
+        params.extend(identity_params)
         cur = conn.execute(
             """
             UPDATE tasks
@@ -7213,7 +7227,7 @@ def request_review(
             """ + assignee_sql + skills_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
-            """ + run_guard,
+            """ + run_guard + identity_guard,
             tuple(params),
         )
         if cur.rowcount != 1:
@@ -7684,11 +7698,50 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def _prepare_descendant_worker_cleanup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+) -> tuple[bool, dict[str, _WorkerIdentity]]:
+    """Verify every running descendant's exact worker boundary is inactive."""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT child_id FROM task_links WHERE parent_id = ?
+            UNION
+            SELECT l.child_id
+            FROM task_links l
+            JOIN descendants d ON d.id = l.parent_id
+        )
+        SELECT t.id
+        FROM descendants d
+        JOIN tasks t ON t.id = d.id
+        WHERE t.status = 'running'
+        ORDER BY t.id
+        """,
+        (task_id,),
+    ).fetchall()
+    verified: dict[str, _WorkerIdentity] = {}
+    for row in rows:
+        ok, identity = _prepare_running_worker_cleanup(
+            conn,
+            row["id"],
+            reason=reason,
+        )
+        if not ok:
+            return False, verified
+        if identity is not None:
+            verified[row["id"]] = identity
+    return True, verified
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     author: str,
+    verified_worker_identities: Optional[dict[str, _WorkerIdentity]] = None,
 ) -> dict[str, Any]:
     """Retract every dispatchable/completed descendant of a reopened ancestor.
 
@@ -7720,16 +7773,12 @@ def invalidate_descendants_for_parent_reopen(
     * a ``task_comments`` row naming the reopened ancestor, so operators see
       WHY a card moved instead of watching it silently teleport.
 
-    Live ``running`` descendants keep the termination behavior (a running
-    child building on a retracted premise is wasted spend): their run is
-    closed ``reclaimed`` and their worker is killed via
-    :func:`_terminate_reclaimed_worker` — the same helper the reclaim paths
-    use. Events/comments are written inside the transaction and the kill
-    happens strictly post-commit, so the audit trail exists BEFORE the
-    worker dies. When this function opened its own transaction it performs
-    the terminations itself after commit; when composing under a caller's
-    transaction the caller MUST drain the returned ``terminations`` list
-    with ``_terminate_reclaimed_worker`` after its own commit.
+    Live ``running`` descendants are stopped and their exact ownership scope
+    is verified inactive before this transaction clears run/claim/PID state.
+    When composed under a caller transaction, the caller must pass the full
+    identities returned by :func:`_prepare_descendant_worker_cleanup`; an
+    identity mismatch fails closed and lets the caller roll back its parent
+    transition.
 
     ``consecutive_failures`` is reset to 0 on every invalidated descendant:
     ancestor reopen is a deliberate operator action, so demoted work gets a
@@ -7741,11 +7790,26 @@ def invalidate_descendants_for_parent_reopen(
     streak, while an operator invalidating a subtree is an explicit reset
     signal.
 
-    Returns ``{"invalidated": [...], "terminations": [...]}`` where each
+    Returns ``{"invalidated": [...], "terminations": [...],
+    "cleanup_failed": bool}`` where each
     invalidated entry is ``{id, prior_status, new_status, resume_status}``
-    and each termination is a ``(worker_pid, claim_lock)`` tuple.
+    and ``terminations`` remains as an empty compatibility field (cleanup now
+    happens before ownership release rather than after commit).
     """
     caller_owns_txn = bool(getattr(conn, "in_transaction", False))
+    if not caller_owns_txn:
+        cleanup_ok, verified_worker_identities = _prepare_descendant_worker_cleanup(
+            conn,
+            task_id,
+            reason="parent_reopen_cleanup_incomplete",
+        )
+        if not cleanup_ok:
+            return {
+                "invalidated": [],
+                "terminations": [],
+                "cleanup_failed": True,
+            }
+    verified_worker_identities = verified_worker_identities or {}
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str]]] = []
@@ -7766,6 +7830,18 @@ def invalidate_descendants_for_parent_reopen(
             """,
             (task_id,),
         ).fetchall()
+        # Validate every preflight identity before mutating any descendant.
+        # BEGIN IMMEDIATE keeps the rows stable after this point.
+        for row in rows:
+            if row["status"] != "running":
+                continue
+            identity = _worker_identity_from_row(row)
+            if verified_worker_identities.get(row["id"]) != identity:
+                return {
+                    "invalidated": [],
+                    "terminations": [],
+                    "cleanup_failed": True,
+                }
         for row in rows:
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
@@ -7778,7 +7854,6 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = _retry_status_for_run(
                     conn, row["id"], row["current_run_id"]
                 )
-                terminations.append((row["worker_pid"], row["claim_lock"]))
                 run_id = _end_run(
                     conn,
                     row["id"],
@@ -7845,13 +7920,11 @@ def invalidate_descendants_for_parent_reopen(
                     "resume_status": resume_status,
                 }
             )
-    if not caller_owns_txn:
-        # Standalone call: we committed above, so the audit trail is durable
-        # — safe to kill workers now. Composed calls leave this to the
-        # caller (post-commit), preserving events-before-termination.
-        for pid, claim_lock in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock)
-    return {"invalidated": invalidated, "terminations": terminations}
+    return {
+        "invalidated": invalidated,
+        "terminations": terminations,
+        "cleanup_failed": False,
+    }
 
 
 def specify_triage_task(
@@ -8241,11 +8314,43 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     we explicitly delete from child tables first, then the task row.
     This keeps the operation atomic (single ``write_txn``).
 
-    Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
+    A running task is deleted only after exact worker cleanup succeeds.  The
+    delete itself CASes the full snapshotted run/PID/claim identity so a
+    concurrent reclaim+respawn cannot make the verified cleanup authorize
+    deletion of a replacement run.
+
+    Returns ``True`` if the task existed and was deleted, ``False`` if it was
+    not found, changed identity, or could not be cleaned up safely.
     """
+    initial = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if initial is None:
+        return False
+    expected_status = str(initial["status"])
+    worker_identity: Optional[_WorkerIdentity] = None
+    if expected_status == "running":
+        cleanup_ok, worker_identity = _prepare_running_worker_cleanup(
+            conn,
+            task_id,
+            reason="delete_cleanup_incomplete",
+        )
+        if not cleanup_ok or worker_identity is None:
+            return False
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        if worker_identity is not None:
+            _, run_id, worker_pid, claim_lock = worker_identity
+            cur = conn.execute(
+                "DELETE FROM tasks WHERE id = ? AND status = 'running' "
+                "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
+                (task_id, run_id, worker_pid, claim_lock),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM tasks WHERE id = ? AND status = ?",
+                (task_id, expected_status),
+            )
         if cur.rowcount != 1:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
@@ -8587,6 +8692,7 @@ def schedule_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_worker_identity: Optional[_WorkerIdentity] = None,
 ) -> bool:
     """Park a task in ``scheduled`` so it is waiting on time, not human input.
 
@@ -8621,6 +8727,11 @@ def schedule_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params.append(int(expected_run_id))
+        identity_guard, identity_params = _worker_identity_guard(
+            task_id, expected_worker_identity,
+        )
+        sql += identity_guard
+        params.extend(identity_params)
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
@@ -9041,15 +9152,33 @@ def _systemd_worker_scope_inactive(unit_name: str) -> bool:
     }
 
 
-def _worker_scope_expected(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Resolve the active run's persisted worker-isolation contract."""
-    row = conn.execute(
-        "SELECT e.payload FROM tasks t "
-        "LEFT JOIN task_events e ON e.task_id = t.id "
-        "  AND e.run_id = t.current_run_id AND e.kind = 'spawned' "
-        "WHERE t.id = ? ORDER BY e.id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
+def _worker_scope_expected(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int] = None,
+) -> bool:
+    """Resolve one run's persisted worker-isolation contract.
+
+    ``run_id`` pins preflight cleanup to the ownership identity that was
+    snapshotted before any out-of-transaction scope stop.  Omitting it keeps
+    the historical active-run lookup for callers that already hold a stable
+    transaction.
+    """
+    if run_id is None:
+        row = conn.execute(
+            "SELECT e.payload FROM tasks t "
+            "LEFT JOIN task_events e ON e.task_id = t.id "
+            "  AND e.run_id = t.current_run_id AND e.kind = 'spawned' "
+            "WHERE t.id = ? ORDER BY e.id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'spawned' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
     if row is not None and row["payload"]:
         try:
             isolation_mode = json.loads(row["payload"]).get("isolation_mode")
@@ -9187,8 +9316,40 @@ def _worker_survived_termination(termination: dict) -> bool:
     claim/run ownership until the exact scope verifies clean. Older injected
     test payloads without ``cleanup_verified`` retain equivalent semantics.
     """
+    cleanup_verified = _worker_cleanup_verified(termination)
+    return bool(
+        termination.get("termination_attempted")
+        and termination.get("host_local")
+        and not cleanup_verified
+    )
+
+
+_WorkerIdentity = tuple[str, Optional[int], Optional[int], Optional[str]]
+
+
+def _worker_identity_guard(
+    task_id: str,
+    expected_identity: Optional[_WorkerIdentity],
+) -> tuple[str, tuple[Any, ...]]:
+    """Build a SQL CAS guard for one snapshotted running owner."""
+    if expected_identity is None:
+        return "", ()
+    expected_task, run_id, worker_pid, claim_lock = expected_identity
+    if expected_task != task_id:
+        return " AND 0", ()
+    return (
+        " AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
+        (run_id, worker_pid, claim_lock),
+    )
+
+
+def _worker_cleanup_verified(termination: dict) -> bool:
+    """Return whether one exact host-local worker boundary is inactive."""
     cleanup_verified = termination.get("cleanup_verified")
     if cleanup_verified is None:
+        # Compatibility for older injected termination payloads in callers and
+        # plugins: a terminated process is sufficient only when no attempted
+        # scope stop remained unverified.
         cleanup_verified = bool(
             termination.get("terminated")
             and (
@@ -9196,11 +9357,67 @@ def _worker_survived_termination(termination: dict) -> bool:
                 or termination.get("scope_stopped")
             )
         )
-    return bool(
-        termination.get("termination_attempted")
-        and termination.get("host_local")
-        and not cleanup_verified
+    return bool(cleanup_verified)
+
+
+def _worker_identity_from_row(row: sqlite3.Row) -> _WorkerIdentity:
+    return (
+        str(row["id"]),
+        int(row["current_run_id"]) if row["current_run_id"] is not None else None,
+        int(row["worker_pid"]) if row["worker_pid"] is not None else None,
+        str(row["claim_lock"]) if row["claim_lock"] is not None else None,
     )
+
+
+def _running_worker_identity(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[_WorkerIdentity]:
+    row = conn.execute(
+        "SELECT id, current_run_id, worker_pid, claim_lock FROM tasks "
+        "WHERE id = ? AND status = 'running'",
+        (task_id,),
+    ).fetchone()
+    return _worker_identity_from_row(row) if row is not None else None
+
+
+def _prepare_running_worker_cleanup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+) -> tuple[bool, Optional[_WorkerIdentity]]:
+    """Stop one snapshotted running owner before a non-worker mutation.
+
+    The returned identity must be used as a CAS guard by the mutation.  A
+    claimed task whose wrapper PID has not been persisted yet needs no signal,
+    but its all-NULL/PID identity is still returned so a concurrent spawn makes
+    the later CAS fail rather than orphaning the just-started worker.
+    """
+    identity = _running_worker_identity(conn, task_id)
+    if identity is None:
+        return True, None
+    _, run_id, worker_pid, claim_lock = identity
+    if worker_pid is None:
+        return True, identity
+    termination = _terminate_reclaimed_worker(
+        worker_pid,
+        claim_lock,
+        scope_expected=_worker_scope_expected(conn, task_id, run_id),
+    )
+    if _worker_cleanup_verified(termination):
+        return True, identity
+    if termination.get("host_local") and termination.get("termination_attempted"):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            claim_lock,
+            int(time.time()),
+            termination,
+            reason=reason,
+            expected_identity=identity,
+        )
+    return False, identity
 
 
 def _defer_reclaim_for_live_worker(
@@ -9211,6 +9428,7 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    expected_identity: Optional[_WorkerIdentity] = None,
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
@@ -9222,11 +9440,18 @@ def _defer_reclaim_for_live_worker(
     """
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
     with write_txn(conn):
-        cur = conn.execute(
+        sql = (
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
-            (grace, task_id, claim_lock),
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?"
         )
+        params: list[Any] = [grace, task_id, claim_lock]
+        if expected_identity is not None:
+            expected_task, expected_run, expected_pid, expected_lock = expected_identity
+            if expected_task != task_id or expected_lock != claim_lock:
+                return
+            sql += " AND current_run_id IS ? AND worker_pid IS ?"
+            params.extend((expected_run, expected_pid))
+        cur = conn.execute(sql, tuple(params))
         if cur.rowcount != 1:
             return
         run_id = _current_run_id(conn, task_id)
@@ -9752,11 +9977,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
-    cleanup_ready: dict[str, dict[str, Any]] = {}
+    cleanup_ready: dict[str, tuple[_WorkerIdentity, dict[str, Any]]] = {}
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     cleanup_rows = conn.execute(
-        "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+        "SELECT id, current_run_id, worker_pid, claim_lock, started_at FROM tasks "
         "WHERE status = 'running' AND worker_pid IS NOT NULL"
     ).fetchall()
     for row in cleanup_rows:
@@ -9768,10 +9993,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             continue
         if _pid_alive(row["worker_pid"]):
             continue
+        identity = _worker_identity_from_row(row)
         termination = _terminate_reclaimed_worker(
             int(row["worker_pid"]),
             row["claim_lock"],
-            scope_expected=_worker_scope_expected(conn, row["id"]),
+            scope_expected=_worker_scope_expected(
+                conn, row["id"], identity[1],
+            ),
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -9781,9 +10009,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 now,
                 termination,
                 reason="crash_scope_cleanup_incomplete",
+                expected_identity=identity,
             )
             continue
-        cleanup_ready[row["id"]] = termination
+        cleanup_ready[row["id"]] = (identity, termination)
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9797,7 +10026,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, current_run_id, worker_pid, claim_lock, started_at, assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -9819,7 +10048,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # Cleanup is a precondition for releasing ownership. A worker that
             # died after the preflight snapshot waits for the next tick; a
             # failed exact-scope stop was deferred above with claim/run intact.
-            if row["id"] not in cleanup_ready:
+            cleanup_entry = cleanup_ready.get(row["id"])
+            if cleanup_entry is None:
+                continue
+            cleaned_identity, _termination = cleanup_entry
+            if _worker_identity_from_row(row) != cleaned_identity:
                 continue
 
             pid = int(row["worker_pid"])
@@ -9892,8 +10125,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
+                "  AND current_run_id IS ? "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (
+                    retry_status,
+                    row["id"],
+                    row["current_run_id"],
+                    pid,
+                    row["claim_lock"],
+                ),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —

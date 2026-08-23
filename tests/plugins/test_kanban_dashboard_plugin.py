@@ -548,9 +548,288 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         assert next_review is not None
 
 
+def test_direct_status_rejects_unverified_running_scope_cleanup(
+    client, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="scoped worker", assignee="patch")
+        claim_lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+        assert claimed is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                85678,
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+            ),
+        )
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda _lock: False)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "todo"},
+    )
+
+    assert response.status_code == 409, response.text
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.claim_lock == claim_lock
+        assert held.worker_pid == 85678
+        assert held.current_run_id == claimed.current_run_id
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.id == claimed.current_run_id
+        assert run.status == "running"
+        assert run.ended_at is None
+        deferred = kb.list_events(conn, task_id)[-1]
+        assert deferred.kind == "reclaim_deferred"
+        assert deferred.run_id == claimed.current_run_id
+        assert deferred.payload is not None
+        assert deferred.payload["reason"] == "direct_status_cleanup_incomplete"
+
+        spawns = []
+        dispatch = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: spawns.append("duplicate") or 90001,
+        )
+        assert dispatch.spawned == []
+        assert spawns == []
+
+
+@pytest.mark.parametrize("target_status", ["done", "blocked", "scheduled", "review"])
+def test_dashboard_force_transition_rejects_unverified_running_scope_cleanup(
+    client, monkeypatch, target_status,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title=f"force {target_status}", assignee="patch",
+        )
+        claim_lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+        assert claimed is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                86000 + len(target_status),
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+            ),
+        )
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda _lock: False)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": target_status, "summary": "operator transition"},
+    )
+
+    assert response.status_code == 409, response.text
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.claim_lock == claim_lock
+        assert held.current_run_id == claimed.current_run_id
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.status == "running"
+        assert run.ended_at is None
+
+
+def test_dashboard_force_transition_cas_rejects_worker_identity_swap(
+    client, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="force CAS", assignee="patch")
+        old_lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=old_lock)
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 86601)
+
+    replacement_lock = f"{old_lock}-replacement"
+
+    def cleanup_then_swap(_conn, _task_id, *, reason):
+        assert reason == "dashboard_force_cleanup_incomplete"
+        old_identity = (task_id, claimed.current_run_id, 86601, old_lock)
+        side = kb.connect()
+        try:
+            with kb.write_txn(side):
+                side.execute(
+                    "UPDATE tasks SET worker_pid = ?, claim_lock = ? WHERE id = ?",
+                    (86602, replacement_lock, task_id),
+                )
+        finally:
+            side.close()
+        return True, old_identity
+
+    monkeypatch.setattr(kb, "_prepare_running_worker_cleanup", cleanup_then_swap)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "operator transition"},
+    )
+
+    assert response.status_code == 409, response.text
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.current_run_id == claimed.current_run_id
+        assert held.worker_pid == 86602
+        assert held.claim_lock == replacement_lock
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.status == "running"
+        assert run.ended_at is None
+
+
+def test_bulk_force_transition_rejects_unverified_running_scope_cleanup(
+    client, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="bulk force done", assignee="patch")
+        claim_lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+        assert claimed is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                86555,
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+            ),
+        )
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda _lock: False)
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task_id], "status": "done", "summary": "bulk operator"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["results"] == [
+        {"id": task_id, "ok": False, "error": "transition to 'done' refused"}
+    ]
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.claim_lock == claim_lock
+        assert held.current_run_id == claimed.current_run_id
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.status == "running"
+        assert run.ended_at is None
+
+
+def test_parent_reopen_rejects_unverified_descendant_scope_cleanup(
+    client, monkeypatch,
+):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="stable parent", assignee="planner")
+        assert kb.complete_task(conn, parent_id)
+        child_id = kb.create_task(
+            conn,
+            title="scoped descendant",
+            assignee="patch",
+            parents=[parent_id],
+        )
+        claim_lock = kb._dispatcher_claim_lock(conn, child_id)
+        claimed = kb.claim_task(conn, child_id, claimer=claim_lock)
+        assert claimed is not None
+        kb._set_worker_pid(
+            conn,
+            child_id,
+            kb._SpawnedWorkerPid(
+                86789,
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+            ),
+        )
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda _lock: False)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{parent_id}",
+        json={"status": "todo"},
+    )
+
+    assert response.status_code == 409, response.text
+    with kb.connect() as conn:
+        parent = kb.get_task(conn, parent_id)
+        child = kb.get_task(conn, child_id)
+        assert parent is not None and parent.status == "done"
+        assert child is not None
+        assert child.status == "running"
+        assert child.claim_lock == claim_lock
+        assert child.worker_pid == 86789
+        assert child.current_run_id == claimed.current_run_id
+        run = kb.latest_run(conn, child_id)
+        assert run is not None
+        assert run.id == claimed.current_run_id
+        assert run.status == "running"
+        assert run.ended_at is None
+        deferred = kb.list_events(conn, child_id)[-1]
+        assert deferred.kind == "reclaim_deferred"
+        assert deferred.run_id == claimed.current_run_id
+        assert deferred.payload is not None
+        assert deferred.payload["reason"] == "parent_reopen_cleanup_incomplete"
+
+        spawns = []
+        dispatch = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: spawns.append("duplicate") or 90002,
+        )
+        assert dispatch.spawned == []
+        assert spawns == []
+
+
 # ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
+
+def test_delete_running_task_reports_cleanup_conflict(client, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="delete running", assignee="patch")
+        claim_lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+        assert claimed is not None
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                87991,
+                isolation_mode="systemd_scope",
+                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+            ),
+        )
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda _lock: False)
+
+    response = client.delete(f"/api/plugins/kanban/tasks/{task_id}")
+
+    assert response.status_code == 409, response.text
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.claim_lock == claim_lock
+        assert held.worker_pid == 87991
+        assert held.current_run_id == claimed.current_run_id
+
 
 def test_delete_task(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
