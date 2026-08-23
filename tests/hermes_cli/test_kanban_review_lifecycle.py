@@ -765,6 +765,162 @@ def test_dispatch_reconciles_legacy_cross_profile_review_skills_before_spawn(
 
 
 @pytest.mark.parametrize(
+    ("legacy_shape", "expected_reason"),
+    [
+        ("missing_event", "missing_review_handoff"),
+        ("invalid_json", "malformed_review_handoff"),
+        ("non_object", "malformed_review_handoff"),
+        ("missing_implementer", "missing_review_implementer"),
+        ("malformed_task_skills", "malformed_task_skills"),
+        (
+            "malformed_implementation_skills",
+            "malformed_implementation_skill_provenance",
+        ),
+    ],
+)
+def test_dispatch_refuses_unsafe_legacy_review_with_visible_deduped_diagnostic(
+    kanban_home: Path,
+    disjoint_phase_skill_profiles: dict[str, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_shape: str,
+    expected_reason: str,
+) -> None:
+    """Unprovable phase ownership parks the card without leaking skill flags."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name in {"patch", "gauge"})
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+
+    commands: list[list[str]] = []
+
+    class FakeProc:
+        pid = 98767
+
+    def fake_popen(cmd, **kwargs):
+        commands.append(list(cmd))
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    implementation_skills = disjoint_phase_skill_profiles["patch"]
+    marker = "secret-like-legacy-payload-marker"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Unsafe legacy review",
+            assignee="patch",
+            skills=implementation_skills,
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="patch:unsafe-legacy")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="gauge",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        with kb.write_txn(conn):
+            event = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            payload = json.loads(event["payload"])
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(implementation_skills), task_id),
+            )
+            if legacy_shape == "missing_event":
+                conn.execute("DELETE FROM task_events WHERE id = ?", (event["id"],))
+            elif legacy_shape == "invalid_json":
+                conn.execute(
+                    "UPDATE task_events SET payload = ? WHERE id = ?",
+                    ("{not-json:" + marker, event["id"]),
+                )
+            elif legacy_shape == "non_object":
+                conn.execute(
+                    "UPDATE task_events SET payload = ? WHERE id = ?",
+                    (json.dumps([marker]), event["id"]),
+                )
+            elif legacy_shape == "missing_implementer":
+                payload.pop("implementer", None)
+                payload["legacy_marker"] = marker
+                conn.execute(
+                    "UPDATE task_events SET payload = ? WHERE id = ?",
+                    (json.dumps(payload), event["id"]),
+                )
+            elif legacy_shape == "malformed_task_skills":
+                conn.execute(
+                    "UPDATE tasks SET skills = ? WHERE id = ?",
+                    ("{not-json:" + marker, task_id),
+                )
+            elif legacy_shape == "malformed_implementation_skills":
+                payload["implementation_skills"] = {"raw": marker}
+                conn.execute(
+                    "UPDATE task_events SET payload = ? WHERE id = ?",
+                    (json.dumps(payload), event["id"]),
+                )
+            else:  # pragma: no cover - parametrization is exhaustive
+                raise AssertionError(legacy_shape)
+
+        before = conn.execute(
+            "SELECT status, assignee, skills, current_run_id, claim_lock, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+
+        first = kb.dispatch_once(conn)
+        second = kb.dispatch_once(conn)
+
+        assert task_id not in [item[0] for item in first.spawned]
+        assert task_id not in [item[0] for item in second.spawned]
+        assert commands == []
+        after = conn.execute(
+            "SELECT status, assignee, skills, current_run_id, claim_lock, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert tuple(after) == tuple(before)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == run_count
+
+        diagnostic_rows = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_dispatch_refused' ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        diagnostics = [
+            (row["kind"], json.loads(row["payload"])) for row in diagnostic_rows
+        ]
+        assert diagnostics == [
+            (
+                "review_dispatch_refused",
+                {
+                    "phase": "review",
+                    "reason": expected_reason,
+                    "source": "legacy_review_dispatch_reconciliation",
+                },
+            )
+        ]
+        encoded = json.dumps(diagnostics[0][1])
+        assert len(encoded) <= 256
+        assert marker not in encoded
+
+
+@pytest.mark.parametrize(
     ("persisted_skills", "expected_provenance"),
     [(None, None), (json.dumps([]), [])],
 )

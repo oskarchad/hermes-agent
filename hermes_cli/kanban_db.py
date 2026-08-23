@@ -6673,6 +6673,32 @@ def _resolved_implementation_skill_provenance(
     )
 
 
+def _record_review_dispatch_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+) -> None:
+    """Audit one sanitized legacy-review refusal without event spam."""
+    payload = {
+        "phase": "review",
+        "reason": reason,
+        "source": "legacy_review_dispatch_reconciliation",
+    }
+    latest = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["kind"] == "review_dispatch_refused":
+        try:
+            previous = json.loads(latest["payload"]) if latest["payload"] else None
+        except (json.JSONDecodeError, TypeError):
+            previous = None
+        if previous == payload:
+            return
+    _append_event(conn, task_id, "review_dispatch_refused", payload)
+
+
 def _reconcile_legacy_review_skills_before_claim(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6686,11 +6712,15 @@ def _reconcile_legacy_review_skills_before_claim(
     ``assigned`` payload used by explicit reviewer reassignment. Same-profile
     reviews retain their documented shared-skill behavior.
 
-    Returns ``False`` only when a confidently cross-profile handoff carries
-    non-empty or malformed skills that cannot be preserved durably. The caller
-    then leaves the card parked in ``review`` rather than spawning a profile
-    with unsafe flags.
+    Returns ``False`` when non-empty or malformed skills cannot be attributed
+    safely to a phase. The caller then leaves the card parked in ``review``
+    rather than spawning a profile with unsafe flags, and a bounded sanitized
+    diagnostic event makes the refusal visible without repeating every tick.
     """
+    def refuse(reason: str) -> bool:
+        _record_review_dispatch_refusal(conn, task_id, reason)
+        return False
+
     task_row = conn.execute(
         "SELECT assignee, skills FROM tasks "
         "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
@@ -6706,7 +6736,14 @@ def _reconcile_legacy_review_skills_before_claim(
         (task_id,),
     ).fetchone()
     if review_event is None:
-        return True
+        current_skills = _decode_task_skills(task_row["skills"])
+        if current_skills == []:
+            return True
+        return refuse(
+            "malformed_task_skills"
+            if current_skills is None
+            else "missing_review_handoff"
+        )
     try:
         handoff = (
             json.loads(review_event["payload"])
@@ -6714,13 +6751,34 @@ def _reconcile_legacy_review_skills_before_claim(
             else {}
         )
     except (json.JSONDecodeError, TypeError):
-        return True
+        current_skills = _decode_task_skills(task_row["skills"])
+        if current_skills == []:
+            return True
+        return refuse(
+            "malformed_task_skills"
+            if current_skills is None
+            else "malformed_review_handoff"
+        )
     if not isinstance(handoff, dict):
-        return True
+        current_skills = _decode_task_skills(task_row["skills"])
+        if current_skills == []:
+            return True
+        return refuse(
+            "malformed_task_skills"
+            if current_skills is None
+            else "malformed_review_handoff"
+        )
 
     implementer = handoff.get("implementer")
     if not isinstance(implementer, str) or not implementer.strip():
-        return True
+        current_skills = _decode_task_skills(task_row["skills"])
+        if current_skills == []:
+            return True
+        return refuse(
+            "malformed_task_skills"
+            if current_skills is None
+            else "missing_review_implementer"
+        )
     implementer = _canonical_assignee(implementer)
     reviewer = _canonical_assignee(task_row["assignee"])
     if reviewer == implementer:
@@ -6728,7 +6786,7 @@ def _reconcile_legacy_review_skills_before_claim(
 
     current_skills = _decode_task_skills(task_row["skills"])
     if current_skills is None:
-        return False
+        return refuse("malformed_task_skills")
 
     has_provenance, implementation_skills, skill_error = (
         _resolved_implementation_skill_provenance(
@@ -6739,10 +6797,10 @@ def _reconcile_legacy_review_skills_before_claim(
         )
     )
     if skill_error is not None:
-        return False
+        return refuse("malformed_implementation_skill_provenance")
     if not has_provenance:
         if current_skills:
-            return False
+            return refuse("missing_implementation_skill_provenance")
         implementation_skills = current_skills
 
     updated = conn.execute(
@@ -6751,7 +6809,7 @@ def _reconcile_legacy_review_skills_before_claim(
         (task_id,),
     )
     if updated.rowcount != 1:
-        return False
+        return refuse("review_task_changed_before_reconciliation")
     _append_event(
         conn,
         task_id,
