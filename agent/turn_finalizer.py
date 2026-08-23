@@ -135,6 +135,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    persist_assistant_display_metadata=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -448,8 +449,30 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
-        agent._persist_session(messages, conversation_history)
-        _session_persisted = True
+        if (
+            persist_assistant_display_metadata
+            and final_response
+            and not interrupted
+            and not failed
+        ):
+            for _message in reversed(messages):
+                if not isinstance(_message, dict) or _message.get("role") != "assistant":
+                    continue
+                _existing_metadata = _message.get("display_metadata")
+                if not isinstance(_existing_metadata, dict):
+                    _existing_metadata = {}
+                _message["display_metadata"] = {
+                    **_existing_metadata,
+                    **persist_assistant_display_metadata,
+                }
+                if _message.get("_db_persisted"):
+                    _message["_db_display_metadata_dirty"] = True
+                    agent._db_flush_scan_prefix = None
+                break
+
+        _session_persisted = (
+            agent._persist_session(messages, conversation_history) is True
+        )
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)

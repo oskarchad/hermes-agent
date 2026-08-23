@@ -7193,16 +7193,53 @@ def test_run_prompt_submit_requires_explicit_persistence_before_success_emit(
     emitted = []
 
     class _PersistFailureAgent(_RecordingAgent):
-        def run_conversation(self, prompt, **kwargs):
-            kwargs["stream_callback"]("captain report")
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.interim_assistant_callback = None
+            self.reasoning_callback = lambda text: emitted.append(
+                ("reasoning.delta", {"text": text})
+            )
+            self.thinking_callback = lambda text: emitted.append(
+                ("thinking.delta", {"text": text})
+            )
+            self._session_db = type(
+                "_DB", (), {"flush_token_counts": lambda _self: None}
+            )()
+            self._session_persist_lock = None
+            self._persist_disabled = False
+            self._inflight_turn_id = "turn"
+            self._inflight_turn_session_id = "persist-required"
+            self.session_id = "persist-required"
+
+        def _drop_trailing_empty_response_scaffolding(self, _messages):
+            return None
+
+        def _save_session_log(self, _messages):
+            return None
+
+        def _flush_messages_to_session_db(self, _messages, _history):
+            return False
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **kwargs
+        ):
+            assert stream_callback is not None
+            stream_callback("captain report")
+            self.reasoning_callback("captain reasoning")
+            self.thinking_callback("captain thinking")
+            assert self.interim_assistant_callback is not None
+            self.interim_assistant_callback("captain interim")
+            messages = [
+                {"role": "user", "content": "synthetic"},
+                {"role": "assistant", "content": "captain report"},
+            ]
+            from run_agent import AIAgent
+
+            persisted = AIAgent._persist_session(self, messages, [])
             return {
                 "final_response": "captain report",
-                "messages": [
-                    {"role": "user", "content": "synthetic"},
-                    {"role": "assistant", "content": "captain report"},
-                ],
-                "session_persisted": False,
-                "cleanup_errors": ["persist_session: disk full"],
+                "messages": messages,
+                "session_persisted": persisted,
             }
 
     claims = []
@@ -7256,14 +7293,151 @@ def test_run_prompt_submit_requires_explicit_persistence_before_success_emit(
         for event, payload in emitted
     )
     assert not any(event == "message.delta" for event, _payload in emitted)
+    assert not any(event == "message.interim" for event, _payload in emitted)
+    assert not any(
+        event in {"reasoning.delta", "thinking.delta"}
+        for event, _payload in emitted
+    )
+    assert not any(
+        "captain report" in str((payload or {}).get("text") or "")
+        or "captain interim" in str((payload or {}).get("text") or "")
+        for _event, payload in emitted
+    )
     assert all(
         message.get("content") != "captain report"
         for message in session["history"]
     )
+    assert (session.get("inflight_turn") or {}).get("assistant") in {None, ""}
     retry_claims = []
     assert len(
         server._collect_kanban_notifications(session, claim_records=retry_claims)
     ) == 1
+
+
+def test_persisted_turn_releases_interim_delta_and_tts_only_after_settlement(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    order = []
+
+    class _TTSQueue:
+        def __init__(self):
+            self.items = []
+
+        def put(self, item):
+            order.append(("tts", item))
+            self.items.append(item)
+
+    tts_queue = _TTSQueue()
+
+    class _PersistedAgent(_RecordingAgent):
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.run_kwargs = None
+            self.interim_assistant_callback = None
+            self.reasoning_callback = lambda text: order.append(
+                ("reasoning.delta", {"text": text})
+            )
+            self.thinking_callback = lambda text: order.append(
+                ("thinking.delta", {"text": text})
+            )
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_assistant_display_metadata=None,
+            **kwargs,
+        ):
+            self.run_kwargs = {
+                "conversation_history": conversation_history,
+                "stream_callback": stream_callback,
+                "persist_assistant_display_metadata": (
+                    persist_assistant_display_metadata
+                ),
+                **kwargs,
+            }
+            assert stream_callback is not None
+            stream_callback("captain final")
+            self.reasoning_callback("captain reasoning")
+            self.thinking_callback("captain thinking")
+            assert self.interim_assistant_callback is not None
+            self.interim_assistant_callback("captain interim")
+            return {
+                "final_response": "captain final",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "captain final"},
+                ],
+                "session_persisted": True,
+            }
+
+    def record_terminal(ok):
+        order.append(("settled", ok))
+        settled.set()
+
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: tts_queue)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: order.append((event, payload)),
+    )
+    agent = _PersistedAgent([])
+    session = _session(
+        session_key="persist-buffer-success",
+        agent=agent,
+        running=True,
+    )
+    server._sessions["persist-buffer-success"] = session
+    completion_id = "kanban-report:default:success"
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "persist-buffer-success",
+            session,
+            "synthetic",
+            on_terminal=record_terminal,
+            require_persisted=True,
+            completion_id=completion_id,
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("persist-buffer-success", None)
+
+    settled_index = order.index(("settled", True))
+    assistant_events = [
+        (index, event, payload)
+        for index, (event, payload) in enumerate(order)
+        if event
+        in {
+            "message.delta",
+            "reasoning.delta",
+            "thinking.delta",
+            "message.interim",
+            "message.complete",
+        }
+        and (
+            "captain" in str((payload or {}).get("text") or "")
+            or event == "message.complete"
+        )
+    ]
+    assert [(event, (payload or {}).get("text")) for _, event, payload in assistant_events] == [
+        ("message.delta", "captain final"),
+        ("reasoning.delta", "captain reasoning"),
+        ("thinking.delta", "captain thinking"),
+        ("message.interim", "captain interim"),
+        ("message.complete", "captain final"),
+    ]
+    assert all(index > settled_index for index, _event, _payload in assistant_events)
+    assert tts_queue.items == ["captain final", None]
+    assert next(index for index, item in enumerate(order) if item == ("tts", "captain final")) > settled_index
+    assert agent.run_kwargs is not None
+    assert agent.run_kwargs["persist_assistant_display_metadata"] == {
+        "captain_completion_id": completion_id,
+    }
 
 
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(

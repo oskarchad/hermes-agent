@@ -1831,6 +1831,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    persist_assistant_display_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1856,6 +1857,8 @@ def run_conversation(
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
+        persist_assistant_display_metadata: Optional stable presentation
+            metadata to attach to the final assistant row before persistence.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -2012,6 +2015,7 @@ def run_conversation(
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
+            persist_assistant_display_metadata=persist_assistant_display_metadata,
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
@@ -8591,6 +8595,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        persist_assistant_display_metadata=persist_assistant_display_metadata,
     )
 
 

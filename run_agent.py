@@ -287,6 +287,7 @@ _MAX_TOOL_WORKERS = 8
 # agent/context_compressor.py (micro-compaction defrag) for the two canonical
 # pop sites. Mutating without popping leaves the DB silently stale.
 _DB_PERSISTED_MARKER = "_db_persisted"
+_DB_DISPLAY_METADATA_DIRTY_MARKER = "_db_display_metadata_dirty"
 
 
 # Guard so the OpenRouter metadata pre-warm thread is only spawned once per
@@ -2010,7 +2011,11 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(
+        self,
+        messages: List[Dict],
+        conversation_history: List[Dict] = None,
+    ) -> bool:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -2031,24 +2036,27 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain() -> bool:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            committed = (
+                self._flush_messages_to_session_db(messages, conversation_history)
+                is True
+            )
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return committed
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -2150,9 +2158,9 @@ class AIAgent:
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
-            return None
+            return False
         if not self._session_db:
-            return None
+            return False
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -2217,6 +2225,12 @@ class AIAgent:
             # so starting after the matched prefix is behavior-preserving.
             _scan_start = 0
             _prev_prefix = getattr(self, "_db_flush_scan_prefix", None)
+            if any(
+                isinstance(message, dict)
+                and message.get(_DB_DISPLAY_METADATA_DIRTY_MARKER)
+                for message in messages
+            ):
+                _prev_prefix = None
             if isinstance(_prev_prefix, list):
                 _limit = min(len(_prev_prefix), len(messages))
                 while (
@@ -2229,6 +2243,8 @@ class AIAgent:
             # at the end of the scan (see append_messages_batch).
             _batch_rows: List[Dict[str, Any]] = []
             _batch_msgs: List[Dict] = []
+            _metadata_updates: List[Dict[str, Any]] = []
+            _metadata_update_msgs: List[Dict] = []
             for _msg_idx in range(_scan_start, len(messages)):
                 msg = messages[_msg_idx]
                 if not isinstance(msg, dict):
@@ -2243,6 +2259,14 @@ class AIAgent:
                 # context. Skip regardless of position: an answered nudge leaves
                 # the synthetic pair buried mid-list, not just at the tail.
                 if _is_ephemeral_scaffolding(msg):
+                    continue
+                if msg.get(_DB_DISPLAY_METADATA_DIRTY_MARKER):
+                    _metadata_updates.append({
+                        "role": msg.get("role", "unknown"),
+                        "content": msg.get("content"),
+                        "display_metadata": msg.get("display_metadata"),
+                    })
+                    _metadata_update_msgs.append(msg)
                     continue
                 if msg.get(_DB_PERSISTED_MARKER):
                     continue
@@ -2396,10 +2420,12 @@ class AIAgent:
             # NO markers were stamped, so the next flush re-scans and
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
-            if _batch_rows:
-                self._session_db.append_messages_batch(
+            committed_count = 0
+            if _batch_rows or _metadata_updates:
+                committed_count = self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
+                    display_metadata_updates=_metadata_updates,
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
@@ -2413,6 +2439,8 @@ class AIAgent:
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
+                for _updated in _metadata_update_msgs:
+                    _updated.pop(_DB_DISPLAY_METADATA_DIRTY_MARKER, None)
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
@@ -2421,7 +2449,7 @@ class AIAgent:
             # Snapshot for the bounded scan above — only on full success, so
             # a partially-processed list can never be treated as settled.
             self._db_flush_scan_prefix = messages[:]
-            return True
+            return committed_count > 0
         except Exception as e:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
@@ -8557,6 +8585,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        persist_assistant_display_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -8930,6 +8959,9 @@ class AIAgent:
                         persist_user_timestamp=persist_user_timestamp,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
+                        persist_assistant_display_metadata=(
+                            persist_assistant_display_metadata
+                        ),
                         moa_config=moa_config,
                     )
                 finally:
@@ -9047,10 +9079,19 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
+        persist_assistant_display_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
-        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+        return run_codex_app_server_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+            persist_assistant_display_metadata=persist_assistant_display_metadata,
+        )
 
 def main(
     query: str = None,

@@ -13,6 +13,7 @@ and the real poller collector path in ``tui_gateway/server.py``.
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -1050,6 +1051,137 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     run_once()
     assert len(attempts) == 2
     assert _inbox_states() == {"acked": 1}
+
+
+def test_captain_completion_identity_namespaces_board_local_delivery_ids():
+    board_a = [{"board": "alpha", "deliveries": [{"id": "7"}]}]
+    board_b = [{"board": "beta", "deliveries": [{"id": "7"}]}]
+
+    assert server._captain_completion_id(board_a, ["same report"]) != (
+        server._captain_completion_id(board_b, ["same report"])
+    )
+    assert server._captain_completion_id(
+        [
+            {"board": "alpha", "deliveries": [{"id": "8"}]},
+            {"board": "alpha", "deliveries": [{"id": "7"}]},
+        ],
+        [],
+    ) == server._captain_completion_id(
+        [
+            {"board": "alpha", "deliveries": [{"id": "7"}]},
+            {"board": "alpha", "deliveries": [{"id": "8"}]},
+        ],
+        [],
+    )
+
+
+@pytest.mark.parametrize("ack_failure", ["exception", "zero_rows"])
+def test_persisted_captain_report_reconciles_without_duplicate_after_restart(
+    monkeypatch, ack_failure
+):
+    """Transcript commit is the durable idempotency record across ack loss."""
+    from hermes_state import SessionDB
+    from tools.process_registry import process_registry
+
+    session_id = "captain-reconcile-session"
+    db = SessionDB()
+    db.create_session(session_id=session_id, source="tui", model="test")
+    agent = SimpleNamespace(_session_db=db, session_id=session_id)
+    profile = _profile_for(_session(session_id))
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="captain-reconcile", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="durable once")
+    finally:
+        conn.close()
+
+    attempts = []
+    real_ack = kb.ack_captain_reports
+    ack_calls = 0
+
+    def fail_first_ack(conn, **kwargs):
+        nonlocal ack_calls
+        ack_calls += 1
+        if ack_calls == 1:
+            if ack_failure == "exception":
+                raise RuntimeError("ack connection lost")
+            return 0
+        return real_ack(conn, **kwargs)
+
+    def submit(_rid, _sid, _session, text, **kwargs):
+        completion_id = kwargs["completion_id"]
+        attempts.append(completion_id)
+        db.append_messages_batch(
+            session_id,
+            [
+                {"role": "user", "content": text},
+                {
+                    "role": "assistant",
+                    "content": "Captain durable report",
+                    "display_metadata": {
+                        "captain_completion_id": completion_id,
+                    },
+                },
+            ],
+        )
+        kwargs["on_terminal"](True)
+        return True
+
+    monkeypatch.setattr(kb, "ack_captain_reports", fail_first_ack)
+    monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+
+    first = {
+        **_session(session_id),
+        "agent": agent,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "running": False,
+    }
+    _register_live("first-runtime", first)
+    server._notification_poller_loop(_StopAfterOnePoll(), "first-runtime", first)
+    assert len(attempts) == 1
+    assert _inbox_states() == {"pending": 1}
+
+    # Process restart: no process-local delivery memory survives. The canonical
+    # transcript is the only idempotency record available to the next poller.
+    server._sessions.clear()
+    durable_history = db.get_messages_as_conversation(session_id)
+    restarted = {
+        **_session(session_id),
+        "agent": agent,
+        "history": durable_history,
+        "history_lock": threading.Lock(),
+        "running": False,
+    }
+    _register_live("restarted-runtime", restarted)
+    server._notification_poller_loop(
+        _StopAfterOnePoll(), "restarted-runtime", restarted
+    )
+
+    assert len(attempts) == 1
+    assert _inbox_states() == {"acked": 1}
+    rows = db.get_messages_as_conversation(session_id)
+    captain_rows = [
+        row
+        for row in rows
+        if row.get("role") == "assistant"
+        and (row.get("display_metadata") or {}).get("captain_completion_id")
+        == attempts[0]
+    ]
+    assert [row["content"] for row in captain_rows] == ["Captain durable report"]
+    visible = server._history_to_messages(rows)
+    assert [
+        row["text"]
+        for row in visible
+        if row.get("role") == "assistant"
+        and row.get("text") == "Captain durable report"
+    ] == ["Captain durable report"]
+    db.close()
 
 
 # ── Gauge repair: cross-process ownership / tenant / bounds / retention ────

@@ -683,6 +683,7 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    persist_assistant_display_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -824,11 +825,30 @@ def run_codex_app_server_turn(
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
+    _codex_flush_ok = False
     if turn.projected_messages:
         from agent.message_metadata import append_message
 
         for projected_message in turn.projected_messages:
             append_message(messages, projected_message)
+
+        if (
+            persist_assistant_display_metadata
+            and turn.final_text
+            and not turn.interrupted
+            and turn.error is None
+        ):
+            for message in reversed(messages):
+                if message.get("role") != "assistant":
+                    continue
+                metadata = message.get("display_metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                message["display_metadata"] = {
+                    **metadata,
+                    **persist_assistant_display_metadata,
+                }
+                break
 
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose
@@ -947,6 +967,7 @@ def run_codex_app_server_turn(
         # would re-INSERT the already-flushed user turn (append_message has no
         # dedup), reintroducing the #860 / #42039 duplicate-write bug.
         "agent_persisted": True,
+        "session_persisted": _codex_flush_ok is True,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
         **usage_result,

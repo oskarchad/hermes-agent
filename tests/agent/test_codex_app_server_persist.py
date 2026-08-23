@@ -75,6 +75,7 @@ def test_codex_success_flushes_and_reports_persisted():
     assert isinstance(result["messages"][-1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+    assert result["session_persisted"] is False
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():
@@ -145,8 +146,12 @@ def test_codex_turn_persists_each_message_exactly_once():
             original_user_message="USER_TURN",
             messages=messages,
             effective_task_id="task-1",
+            persist_assistant_display_metadata={
+                "captain_completion_id": "kanban-report:default:codex",
+            },
         )
         assert result["agent_persisted"] is True
+        assert result["session_persisted"] is True
 
         rows = db.get_messages(sid, include_inactive=True)
         contents = [r["content"] for r in rows]
@@ -157,6 +162,9 @@ def test_codex_turn_persists_each_message_exactly_once():
             row for row in rows if row["content"] == "CODEX_ASSISTANT"
         )
         assert isinstance(assistant_row["timestamp"], float)
+        assert assistant_row["display_metadata"] == {
+            "captain_completion_id": "kanban-report:default:codex",
+        }
         # session_search can now see the codex conversation.
         hits = {r["session_id"] for r in db.search_messages("CODEX_ASSISTANT")}
         assert sid in hits

@@ -11316,6 +11316,95 @@ def _settle_kanban_notification_claims(
         raise RuntimeError(f"Kanban notification settlement failed: {detail}") from errors[0]
 
 
+_CAPTAIN_COMPLETION_METADATA_KEY = "captain_completion_id"
+
+
+def _captain_completion_id(
+    claim_records: list[dict], report_texts: list[str]
+) -> str:
+    delivery_keys = sorted({
+        f"{record.get('board') or 'default'}:{delivery.get('id')}"
+        for record in claim_records
+        for delivery in (record.get("deliveries") or ())
+        if delivery.get("id")
+    })
+    receipt_material = "\n".join(delivery_keys or report_texts)
+    return (
+        "kanban-report:"
+        + hashlib.sha256(receipt_material.encode("utf-8")).hexdigest()[:24]
+    )
+
+
+def _persisted_captain_report(session: dict, completion_id: str):
+    """Return the canonical assistant row for a committed Captain event."""
+    agent = session.get("agent")
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None) or session.get("session_key")
+    if db is None or not session_id or not completion_id:
+        return None
+    try:
+        messages = db.get_messages_as_conversation(session_id)
+    except Exception:
+        logger.warning(
+            "Captain transcript reconciliation read failed for %s",
+            session_id,
+            exc_info=True,
+        )
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        metadata = message.get("display_metadata")
+        if (
+            isinstance(metadata, dict)
+            and metadata.get(_CAPTAIN_COMPLETION_METADATA_KEY) == completion_id
+        ):
+            return message
+    return None
+
+
+def _reconcile_persisted_captain_report(
+    sid: str,
+    session: dict,
+    claim_records: list[dict],
+    completion_id: str,
+) -> bool:
+    """Ack a durable Captain report without running the model a second time."""
+    report = _persisted_captain_report(session, completion_id)
+    if report is None:
+        return False
+
+    _settle_kanban_notification_claims(claim_records, accepted=True)
+
+    with session["history_lock"]:
+        if not any(
+            isinstance(message, dict)
+            and isinstance(message.get("display_metadata"), dict)
+            and message["display_metadata"].get(_CAPTAIN_COMPLETION_METADATA_KEY)
+            == completion_id
+            for message in session.get("history") or ()
+        ):
+            session.setdefault("history", []).append(report)
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+
+    pending = session.get("_captain_pending_projection_ids")
+    if isinstance(pending, set) and completion_id in pending:
+        pending.discard(completion_id)
+        text = str(report.get("content") or "")
+        payload = {
+            "id": completion_id,
+            "text": text,
+            "status": "complete",
+            "usage": _get_usage(session.get("agent")),
+        }
+        rendered = render_message(text, session.get("cols", 80))
+        if rendered:
+            payload["rendered"] = rendered
+        _emit("message.start", sid)
+        _emit("message.complete", sid, payload)
+    return True
+
+
 def _start_captain_lease_renewer(claim_records: list[dict]):
     """Keep Captain ownership fenced for an otherwise unbounded model turn."""
     if not any(record.get("route") == "captain" for record in claim_records):
@@ -11443,19 +11532,22 @@ def _notification_poller_loop(
                         rid = f"__notif__{int(time.time() * 1000)}"
                         _settled = threading.Event()
                         _settled_lock = threading.Lock()
+                        _lease_renewer = None
+                        completion_id = _captain_completion_id(
+                            _kanban_claims,
+                            _kanban_texts,
+                        )
+                        if _reconcile_persisted_captain_report(
+                            sid,
+                            session,
+                            _kanban_claims,
+                            completion_id,
+                        ):
+                            with session["history_lock"]:
+                                session["running"] = False
+                            continue
                         _lease_renewer = _start_captain_lease_renewer(
                             _kanban_claims
-                        )
-                        delivery_ids = sorted({
-                            str(delivery.get("id"))
-                            for record in _kanban_claims
-                            for delivery in (record.get("deliveries") or ())
-                            if delivery.get("id")
-                        })
-                        receipt_material = "\n".join(delivery_ids or _kanban_texts)
-                        completion_id = (
-                            "kanban-report:"
-                            + hashlib.sha256(receipt_material.encode("utf-8")).hexdigest()[:24]
                         )
 
                         def _settle_after_terminal(succeeded: bool) -> None:
@@ -12300,21 +12392,45 @@ def _run_prompt_submit(
             # state, so it cannot live in the (byte-stable) system prompt.
             run_message = _prepend_note(run_message, _hud_surface_note(session))
 
-            def _stream(delta):
-                with session["history_lock"]:
-                    _append_inflight_delta(session, delta)
-                # Captain reports are not user-visible until their transcript
-                # is durable and their fenced inbox lease is authoritatively
-                # acknowledged. Keep the draft buffered so a failed settlement
-                # cannot leave text (or TTS audio) that a retry duplicates.
-                if require_persisted:
-                    return
+            _deferred_assistant_events = []
+            _original_model_callbacks = {}
+            if require_persisted:
+                for _callback_name in ("reasoning_callback", "thinking_callback"):
+                    _callback = getattr(agent, _callback_name, None)
+                    if not callable(_callback):
+                        continue
+                    _original_model_callbacks[_callback_name] = _callback
+
+                    def _defer_model_callback(
+                        *args,
+                        _callback=_callback,
+                        **kwargs,
+                    ):
+                        _deferred_assistant_events.append(
+                            ("callback", (_callback, args, kwargs))
+                        )
+
+                    setattr(agent, _callback_name, _defer_model_callback)
+
+            def _publish_stream_delta(delta):
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
                 if tts_queue is not None and isinstance(delta, str):
                     tts_queue.put(delta)
                 _emit("message.delta", sid, payload)
+
+            def _stream(delta):
+                # Captain reports are not user-visible until their transcript
+                # is durable and their fenced inbox lease is authoritatively
+                # acknowledged. Keep the ordered draft buffered so a failed
+                # settlement cannot leave text or TTS audio that a retry duplicates.
+                if require_persisted:
+                    _deferred_assistant_events.append(("delta", delta))
+                    return
+                with session["history_lock"]:
+                    _append_inflight_delta(session, delta)
+                _publish_stream_delta(delta)
 
             # Surface interim assistant text (commentary emitted alongside
             # tool calls, or the attempted final answer before a verify-on-stop
@@ -12323,10 +12439,14 @@ def _run_prompt_submit(
             # Gated on display.interim_assistant_messages (default true).
             if _load_interim_assistant_messages():
                 def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-                    _emit("message.interim", sid, {
+                    payload = {
                         "text": text,
                         "already_streamed": already_streamed,
-                    })
+                    }
+                    if require_persisted:
+                        _deferred_assistant_events.append(("interim", payload))
+                        return
+                    _emit("message.interim", sid, payload)
 
                 agent.interim_assistant_callback = _interim_assistant_cb
             else:
@@ -12354,6 +12474,14 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if (
+                require_persisted
+                and completion_id
+                and "persist_assistant_display_metadata" in _run_params
+            ):
+                run_kwargs["persist_assistant_display_metadata"] = {
+                    _CAPTAIN_COMPLETION_METADATA_KEY: completion_id,
+                }
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -12633,6 +12761,18 @@ def _run_prompt_submit(
                 terminal_callback_called = True
                 on_terminal(turn_succeeded)
                 terminal_callback_committed = turn_succeeded
+            if require_persisted and turn_succeeded:
+                for event_kind, event_payload in _deferred_assistant_events:
+                    if event_kind == "delta":
+                        with session["history_lock"]:
+                            _append_inflight_delta(session, event_payload)
+                        _publish_stream_delta(event_payload)
+                    elif event_kind == "callback":
+                        callback, callback_args, callback_kwargs = event_payload
+                        callback(*callback_args, **callback_kwargs)
+                    else:
+                        _emit("message.interim", sid, event_payload)
+                _deferred_assistant_events.clear()
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
@@ -12820,6 +12960,15 @@ def _run_prompt_submit(
                 # Keep the partial turn available to the next prompt; the durable
                 # inflight record still carries the recoverable error state.
                 _restore_agent_history_after_turn_error(session, agent)
+                if (
+                    require_persisted
+                    and completion_id
+                    and _persisted_captain_report(session, completion_id) is not None
+                ):
+                    with session["history_lock"]:
+                        session.setdefault(
+                            "_captain_pending_projection_ids", set()
+                        ).add(completion_id)
                 try:
                     # Close the turn with the same terminal error frame shape as
                     # the returned-error path (uniform client handling), retaining
@@ -12886,6 +13035,10 @@ def _run_prompt_submit(
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
+            for callback_name, callback in (
+                locals().get("_original_model_callbacks") or {}
+            ).items():
+                setattr(agent, callback_name, callback)
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()

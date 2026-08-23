@@ -10647,6 +10647,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        display_metadata_updates: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -10656,6 +10657,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         finish_reason, reasoning*, codex_*, timestamp, api_content,
         display_kind, display_metadata, ...). Reusing that helper keeps ONE
         row-serialization path for every multi-row writer.
+
+        ``display_metadata_updates`` merges presentation metadata into the
+        latest active row matching ``role`` + ``content`` under that same
+        guarded transaction. A missing target aborts the whole write.
 
         A turn-boundary flush writes the whole turn (user + assistant + tool
         rows, typically 3-8 messages) as one BEGIN IMMEDIATE / commit pair
@@ -10673,12 +10678,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the batch commits in chunks of at most that many rows — same
         recovery semantics as the old per-row loops (a mid-copy failure
         leaves a partial seed), just with bounded lock holds. A turn flush
-        never needs it. Returns the inserted row count.
+        never needs it. Returns the committed insert + metadata-update count.
         """
-        if not messages:
+        metadata_updates = list(display_metadata_updates or ())
+        if not messages and not metadata_updates:
             return 0
 
         if chunk_rows is not None and len(messages) > chunk_rows:
+            if metadata_updates:
+                raise ValueError(
+                    "display_metadata_updates cannot be combined with chunked writes"
+                )
             inserted_total = 0
             for start in range(0, len(messages), chunk_rows):
                 inserted_total += self.append_messages_batch(
@@ -10701,6 +10711,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
             )
+            updated = 0
+            for update in metadata_updates:
+                row = conn.execute(
+                    "SELECT id, display_metadata FROM messages "
+                    "WHERE session_id = ? AND role = ? AND content = ? "
+                    "AND active = 1 ORDER BY id DESC LIMIT 1",
+                    (
+                        session_id,
+                        update.get("role"),
+                        self._encode_content(update.get("content")),
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "canonical display metadata update target is missing"
+                    )
+                metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+                patch = update.get("display_metadata")
+                if not isinstance(patch, dict):
+                    raise TypeError("display metadata update must be a mapping")
+                metadata.update(patch)
+                cursor = conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (self._encode_display_metadata(metadata), row["id"]),
+                )
+                updated += cursor.rowcount
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
                 conn.execute(
@@ -10713,7 +10749,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
-            return inserted
+            return inserted + updated
 
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
