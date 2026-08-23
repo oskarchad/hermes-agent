@@ -193,6 +193,296 @@ def test_expired_lease_is_reclaimed_and_acked_once():
     assert _inbox_states() == {"acked": 1}
 
 
+def test_live_owner_renews_lease_past_original_expiry(monkeypatch):
+    """A controlled slow turn cannot be re-leased by a second live session."""
+    clock = [1_000]
+    monkeypatch.setattr(server.time, "time", lambda: clock[0])
+    profile = _profile_for(_session("slow-owner"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="slow-turn", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="still running")
+    finally:
+        conn.close()
+
+    owner = _session("slow-owner")
+    contender = _session("slow-contender")
+    _register_live("slow-owner", owner)
+    _register_live("slow-contender", contender)
+
+    claims = []
+    assert len(_collect_kanban_notifications(owner, claim_records=claims)) == 1
+    original_expiry = clock[0] + server._CAPTAIN_LEASE_SECONDS
+
+    clock[0] = original_expiry - 10
+    server._renew_kanban_notification_claims(
+        claims,
+        lease_seconds=server._CAPTAIN_LEASE_SECONDS,
+        now=clock[0],
+    )
+
+    # Past the original expiry, the renewed owner still fences the row.
+    clock[0] = original_expiry + 1
+    contender_claims = []
+    assert _collect_kanban_notifications(
+        contender, claim_records=contender_claims
+    ) == []
+    assert contender_claims == []
+
+    server._settle_kanban_notification_claims(claims, accepted=True)
+    assert _inbox_states() == {"acked": 1}
+
+
+def test_expired_owner_cannot_ack_before_a_contender_reclaims(monkeypatch):
+    clock = [1_000]
+    monkeypatch.setattr(server.time, "time", lambda: clock[0])
+    profile = _profile_for(_session("expired-owner"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="expired-owner", assignee="worker")
+        kb.register_captain_owner(
+            conn, tid, profile=profile, origin_session_key=None
+        )
+        kb.complete_task(conn, tid, summary="expires before settlement")
+    finally:
+        conn.close()
+
+    claims = []
+    assert len(
+        _collect_kanban_notifications(_session("expired-owner"), claim_records=claims)
+    ) == 1
+    clock[0] = 1_121
+    with pytest.raises(RuntimeError, match="expected 1 row"):
+        server._settle_kanban_notification_claims(claims, accepted=True)
+
+    conn = kb.connect()
+    try:
+        state = conn.execute(
+            "SELECT state FROM kanban_captain_inbox WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert state == "pending"
+
+
+def test_captain_lease_renewer_stops_and_propagates_fence_loss(monkeypatch):
+    attempted = threading.Event()
+
+    def lose_fence(_claims):
+        attempted.set()
+        raise RuntimeError("lease fence lost")
+
+    monkeypatch.setattr(server, "_CAPTAIN_LEASE_RENEW_SECONDS", 0.01)
+    monkeypatch.setattr(server, "_renew_kanban_notification_claims", lose_fence)
+    handle = server._start_captain_lease_renewer([{"route": "captain"}])
+    assert attempted.wait(timeout=1.0)
+    with pytest.raises(RuntimeError, match="lease renewal failed"):
+        server._stop_captain_lease_renewer(handle)
+    assert handle[1].is_alive() is False
+
+
+def test_ack_exception_releases_claim_for_retry(monkeypatch):
+    profile = _profile_for(_session("ack-error"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="ack-error", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="retry after exception")
+    finally:
+        conn.close()
+
+    session = _session("ack-error")
+    _register_live("ack-error", session)
+    claims = []
+    assert len(_collect_kanban_notifications(session, claim_records=claims)) == 1
+
+    monkeypatch.setattr(
+        kb,
+        "ack_captain_reports",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db locked")),
+    )
+    with pytest.raises(RuntimeError, match="db locked"):
+        server._settle_kanban_notification_claims(claims, accepted=True)
+
+    assert _inbox_states() == {"pending": 1}
+    retry_claims = []
+    assert len(_collect_kanban_notifications(session, claim_records=retry_claims)) == 1
+
+
+def test_zero_row_ack_is_failure_and_releases_claim_for_retry(monkeypatch):
+    profile = _profile_for(_session("zero-ack"))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="zero-ack", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="zero rows is not success")
+    finally:
+        conn.close()
+
+    session = _session("zero-ack")
+    _register_live("zero-ack", session)
+    claims = []
+    assert len(_collect_kanban_notifications(session, claim_records=claims)) == 1
+    monkeypatch.setattr(kb, "ack_captain_reports", lambda *_args, **_kwargs: 0)
+
+    with pytest.raises(RuntimeError, match="expected 1 row"):
+        server._settle_kanban_notification_claims(claims, accepted=True)
+
+    assert _inbox_states() == {"pending": 1}
+
+
+def test_partial_multi_board_ack_releases_only_unsettled_token(monkeypatch):
+    """A committed first board never makes a failed second-board ack successful."""
+    profile = _profile_for(_session("partial-boards"))
+    second_board = "captain-partial-second"
+    kb.create_board(second_board)
+    claims = []
+    tokens = []
+    for board in (kb.DEFAULT_BOARD, second_board):
+        conn = kb.connect(board=board)
+        try:
+            tid = kb.create_task(conn, title=board, assignee="worker")
+            kb.register_captain_owner(
+                conn, tid, profile=profile, origin_session_key=None
+            )
+            kb.complete_task(conn, tid, summary=f"report from {board}")
+            candidate = kb.read_captain_candidates(conn, profile=profile)[0]
+            token, events = kb.lease_captain_reports(
+                conn,
+                profile=profile,
+                owner="partial-boards",
+                event_ids=[candidate["event_id"]],
+            )
+            assert len(events) == 1
+            tokens.append(token)
+            claims.append(
+                {
+                    "route": "captain",
+                    "board": board,
+                    "token": token,
+                    "owner": "partial-boards",
+                    "expected_count": 1,
+                    "task_ids": {tid},
+                    "deliveries": [
+                        {
+                            "id": f"kanban:{board}:{events[0].id}",
+                            "event_id": events[0].id,
+                        }
+                    ],
+                }
+            )
+        finally:
+            conn.close()
+
+    real_ack = kb.ack_captain_reports
+
+    def fail_second_ack(conn, **kwargs):
+        if kwargs["token"] == tokens[1]:
+            raise RuntimeError("second board locked")
+        return real_ack(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "ack_captain_reports", fail_second_ack)
+    with pytest.raises(RuntimeError, match="second board locked"):
+        server._settle_kanban_notification_claims(claims, accepted=True)
+
+    first = kb.connect(board=kb.DEFAULT_BOARD)
+    second = kb.connect(board=second_board)
+    try:
+        assert first.execute(
+            "SELECT state FROM kanban_captain_inbox WHERE lease_token = ?",
+            (tokens[0],),
+        ).fetchone()[0] == "acked"
+        assert second.execute(
+            "SELECT state FROM kanban_captain_inbox"
+        ).fetchone()[0] == "pending"
+    finally:
+        first.close()
+        second.close()
+
+
+def test_captain_delivery_uses_one_event_per_turn_across_boards():
+    """One stable event identity per turn removes partial-batch UI ambiguity."""
+    profile = _profile_for(_session("one-event-turn"))
+    second_board = "captain-one-event-second"
+    kb.create_board(second_board)
+    for board in (kb.DEFAULT_BOARD, second_board):
+        conn = kb.connect(board=board)
+        try:
+            tid = kb.create_task(conn, title=board, assignee="worker")
+            kb.register_captain_owner(
+                conn, tid, profile=profile, origin_session_key=None
+            )
+            kb.complete_task(conn, tid, summary=f"one from {board}")
+        finally:
+            conn.close()
+
+    session = _session("one-event-turn")
+    _register_live("one-event-turn", session)
+    first_claims = []
+    first_texts = _collect_kanban_notifications(session, claim_records=first_claims)
+    assert len(first_texts) == 1
+    first_ids = [
+        delivery["id"]
+        for record in first_claims
+        for delivery in record.get("deliveries") or ()
+    ]
+    assert len(first_ids) == 1
+    server._settle_kanban_notification_claims(first_claims, accepted=True)
+
+    second_claims = []
+    second_texts = _collect_kanban_notifications(session, claim_records=second_claims)
+    assert len(second_texts) == 1
+    second_ids = [
+        delivery["id"]
+        for record in second_claims
+        for delivery in record.get("deliveries") or ()
+    ]
+    assert len(second_ids) == 1
+    assert second_ids != first_ids
+
+
+def test_captain_turn_does_not_batch_an_ordinary_subscription_event():
+    profile = _profile_for(_session("captain-plus-ordinary"))
+    second_board = "captain-ordinary-second"
+    kb.create_board(second_board)
+
+    conn = kb.connect()
+    try:
+        captain_tid = kb.create_task(conn, title="captain", assignee="worker")
+        kb.register_captain_owner(
+            conn, captain_tid, profile=profile, origin_session_key=None
+        )
+        kb.complete_task(conn, captain_tid, summary="captain event")
+    finally:
+        conn.close()
+
+    conn = kb.connect(board=second_board)
+    try:
+        ordinary_tid = kb.create_task(conn, title="ordinary", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=ordinary_tid,
+            platform="tui",
+            chat_id="captain-plus-ordinary",
+            notifier_profile=profile,
+        )
+        kb.complete_task(conn, ordinary_tid, summary="ordinary event")
+    finally:
+        conn.close()
+
+    session = _session("captain-plus-ordinary")
+    _register_live("captain-plus-ordinary", session)
+    first_claims = []
+    first = _collect_kanban_notifications(session, claim_records=first_claims)
+    assert len(first) == 1 and "captain event" in first[0]
+    server._settle_kanban_notification_claims(first_claims, accepted=True)
+
+    second_claims = []
+    second = _collect_kanban_notifications(session, claim_records=second_claims)
+    assert len(second) == 1 and "ordinary event" in second[0]
+
+
 # ── requirement 5: synthetic turn rejection releases and retries ───────────
 def test_dispatch_failure_releases_then_accepted_retry_no_replay():
     profile = _profile_for(_session("live-f"))
@@ -317,10 +607,14 @@ def test_reopen_creates_new_report_without_replaying_acked():
 
     c2 = []
     t2 = _collect_kanban_notifications(s, claim_records=c2)
-    joined = "\n".join(t2)
+    assert len(t2) == 1 and "→ ready" in t2[0]
+    server._settle_kanban_notification_claims(c2, accepted=True)
+    c3 = []
+    t3 = _collect_kanban_notifications(s, claim_records=c3)
+    joined = "\n".join(t2 + t3)
     assert "second pass" in joined
     assert "first pass" not in joined  # acked cycle never replays
-    server._settle_kanban_notification_claims(c2, accepted=True)
+    server._settle_kanban_notification_claims(c3, accepted=True)
     assert _collect_kanban_notifications(s, claim_records=[]) == []
 
 
@@ -994,10 +1288,10 @@ def test_row_cap_is_global_across_multiple_boards():
     claims = []
     texts = _collect_kanban_notifications(session, claim_records=claims)
 
-    assert len(texts) == server._CAPTAIN_POLL_ROW_CAP
+    assert len(texts) == server._CAPTAIN_TURN_ROW_CAP
     assert sum(
         1 for record in claims if record.get("route") == "captain"
-    ) == server._CAPTAIN_POLL_ROW_CAP
+    ) == server._CAPTAIN_TURN_ROW_CAP
 
 
 def test_ineligible_first_page_cannot_starve_later_fallback_report():
@@ -1106,6 +1400,10 @@ def test_gc_compacts_old_acked_rows_and_reopen_gets_new_event():
         conn.close()
 
     claims = []
-    texts = _collect_kanban_notifications(session, claim_records=claims)
-    assert len(texts) == 2
-    assert "second" in "\n".join(texts)
+    first = _collect_kanban_notifications(session, claim_records=claims)
+    assert len(first) == 1 and "→ ready" in first[0]
+    server._settle_kanban_notification_claims(claims, accepted=True)
+    claims = []
+    second = _collect_kanban_notifications(session, claim_records=claims)
+    assert len(second) == 1
+    assert "second" in second[0]

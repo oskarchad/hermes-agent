@@ -7182,6 +7182,90 @@ def test_run_prompt_submit_settles_success_before_terminal_emit_can_fail(
     assert order == ["settled:True", "visible"]
 
 
+def test_run_prompt_submit_requires_explicit_persistence_before_success_emit(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    results = []
+    emitted = []
+
+    class _PersistFailureAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            kwargs["stream_callback"]("captain report")
+            return {
+                "final_response": "captain report",
+                "messages": [
+                    {"role": "user", "content": "synthetic"},
+                    {"role": "assistant", "content": "captain report"},
+                ],
+                "session_persisted": False,
+                "cleanup_errors": ["persist_session: disk full"],
+            }
+
+    claims = []
+
+    def record_terminal(ok):
+        server._settle_kanban_notification_claims(claims, accepted=ok)
+        results.append(ok)
+        settled.set()
+
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, payload)),
+    )
+    session = _session(
+        session_key="persist-required",
+        agent=_PersistFailureAgent([]),
+        running=True,
+    )
+    server._sessions["persist-required"] = session
+    try:
+        profile = server._session_captain_profile(session)
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(conn, title="persist-required", assignee="worker")
+            kb.register_captain_owner(
+                conn, tid, profile=profile, origin_session_key=None
+            )
+            kb.complete_task(conn, tid, summary="must survive persistence failure")
+        finally:
+            conn.close()
+        assert len(
+            server._collect_kanban_notifications(session, claim_records=claims)
+        ) == 1
+        assert server._run_prompt_submit(
+            "rid",
+            "persist-required",
+            session,
+            "synthetic",
+            on_terminal=record_terminal,
+            require_persisted=True,
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("persist-required", None)
+
+    assert results == [False]
+    assert not any(
+        event == "message.complete" and (payload or {}).get("status") == "complete"
+        for event, payload in emitted
+    )
+    assert not any(event == "message.delta" for event, _payload in emitted)
+    assert all(
+        message.get("content") != "captain report"
+        for message in session["history"]
+    )
+    retry_claims = []
+    assert len(
+        server._collect_kanban_notifications(session, claim_records=retry_claims)
+    ) == 1
+
+
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     monkeypatch, tmp_path
 ):

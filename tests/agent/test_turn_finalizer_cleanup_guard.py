@@ -154,6 +154,7 @@ def test_single_cleanup_step_raises_does_not_skip_others(step):
         )
     ]
     assert len(result["cleanup_errors"]) == 1
+    assert result["session_persisted"] is (step != "persist_session")
 
 
 def test_clean_turn_has_no_cleanup_errors_key():
@@ -161,6 +162,7 @@ def test_clean_turn_has_no_cleanup_errors_key():
     result = _run(agent)
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
+    assert result["session_persisted"] is True
     assert "cleanup_errors" not in result
 
 

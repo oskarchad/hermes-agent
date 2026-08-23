@@ -14139,28 +14139,67 @@ def lease_captain_reports(
     return token, events
 
 
-def ack_captain_reports(conn: sqlite3.Connection, *, token: str) -> int:
-    """Mark a leased batch ``acked`` after the synthetic turn was accepted."""
-    now = int(time.time())
+def renew_captain_reports(
+    conn: sqlite3.Connection,
+    *,
+    token: str,
+    owner: str,
+    lease_seconds: int = 120,
+    now: Optional[int] = None,
+) -> int:
+    """Extend a live lease only while ``token`` still belongs to ``owner``.
+
+    Expired leases are never resurrected: once the owner's fence lapses, a
+    contender may already have replaced the opaque token. The caller must treat
+    a zero rowcount as lost ownership and must not publish that turn's result.
+    """
+    current = int(time.time()) if now is None else int(now)
+    expires = current + max(1, int(lease_seconds))
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE kanban_captain_inbox SET state = 'acked', updated_at = ? "
-            "WHERE lease_token = ? AND state = 'leased'",
-            (now, token),
+            "UPDATE kanban_captain_inbox SET lease_expires = ?, updated_at = ? "
+            "WHERE lease_token = ? AND lease_owner = ? AND state = 'leased' "
+            "AND lease_expires >= ?",
+            (expires, current, token, owner, current),
         )
     return int(cur.rowcount or 0)
 
 
-def release_captain_reports(conn: sqlite3.Connection, *, token: str) -> int:
+def ack_captain_reports(
+    conn: sqlite3.Connection, *, token: str, owner: Optional[str] = None
+) -> int:
+    """Mark a leased batch ``acked`` after verified transcript persistence."""
+    now = int(time.time())
+    owner_sql = " AND lease_owner = ?" if owner is not None else ""
+    params = (
+        (now, token, now, owner)
+        if owner is not None
+        else (now, token, now)
+    )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_captain_inbox SET state = 'acked', updated_at = ? "
+            "WHERE lease_token = ? AND state = 'leased' AND lease_expires >= ?"
+            + owner_sql,
+            params,
+        )
+    return int(cur.rowcount or 0)
+
+
+def release_captain_reports(
+    conn: sqlite3.Connection, *, token: str, owner: Optional[str] = None
+) -> int:
     """Release a leased batch back to ``pending`` after a failed delivery."""
     now = int(time.time())
+    owner_sql = " AND lease_owner = ?" if owner is not None else ""
+    params = (now, token, owner) if owner is not None else (now, token)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE kanban_captain_inbox "
             "SET state = 'pending', lease_token = NULL, lease_owner = NULL, "
             "    lease_expires = NULL, updated_at = ? "
-            "WHERE lease_token = ? AND state = 'leased'",
-            (now, token),
+            "WHERE lease_token = ? AND state = 'leased'" + owner_sql,
+            params,
         )
     return int(cur.rowcount or 0)
 

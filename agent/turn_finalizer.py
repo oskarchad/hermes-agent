@@ -296,6 +296,7 @@ def finalize_turn(
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    _session_persisted = False
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -448,6 +449,7 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+        _session_persisted = True
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -745,6 +747,9 @@ def finalize_turn(
             result["failure_reason"] = (
                 "session_persistence_failed:" + (_cause or "unknown")
             )
+    # Durable consumers need an explicit commit receipt. Ordinary callers still
+    # receive the generated response on a final cleanup failure (#8049).
+    result["session_persisted"] = _session_persisted
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

@@ -60,10 +60,16 @@ destination. A gateway subscription and a Captain report are independent paths
 that never duplicate each other — a task can notify its gateway chat *and*
 report to its local Captain without either standing in for the other.
 
-After a successful synthetic turn, Hermes persists the transcript and acks the
-Captain lease before emitting the visible assistant `message.complete` with a
-stable event-derived ID. A transport crash therefore cannot leave a pending row
-that replays a second assistant response; reconnect hydration recovers a frame
-missed after transcript commit, and both TUI and Desktop defensively deduplicate
-the stable ID. The row cap is global across all boards in one poll, as is the
-UTF-8 byte cap.
+During an unbounded synthetic model turn, Hermes renews the durable lease and
+fences every renewal and acknowledgement by both opaque token and owner. Each
+turn carries one Captain event, so retries keep one stable event-derived ID even
+when another board settles independently. Model deltas remain buffered (including
+TTS) and a visible assistant `message.complete` is emitted only after an explicit
+successful transcript-persistence receipt and a verified, unexpired owner-fenced
+acknowledgement rowcount; persistence, lock, ownership, and settlement failures
+propagate as recoverable errors and leave every still-owned unsettled token
+retryable. A transport crash after
+that commit therefore cannot leave a pending row that replays a second assistant
+response; reconnect hydration recovers a frame missed after transcript commit,
+and both TUI and Desktop defensively deduplicate the stable ID. The candidate row
+cap is global across all boards in one poll, as is the UTF-8 byte cap.

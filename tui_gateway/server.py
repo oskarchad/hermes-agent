@@ -10528,10 +10528,12 @@ _LOOP_POLL_SECONDS = 5.0
 # between lease and ack strands the row only until this elapses; the next
 # poll after a restart reclaims it (see hermes_cli/kanban_db.py).
 _CAPTAIN_LEASE_SECONDS = 120
+_CAPTAIN_LEASE_RENEW_SECONDS = max(1.0, _CAPTAIN_LEASE_SECONDS / 3)
 _CAPTAIN_RECEIVER_TTL_SECONDS = 15
 # Hard context/SQLite guards. One poll leases at most this many event rows and
 # the joined synthetic prompt never exceeds this UTF-8 byte budget.
 _CAPTAIN_POLL_ROW_CAP = 16
+_CAPTAIN_TURN_ROW_CAP = 1
 _CAPTAIN_POLL_BYTE_CAP = 8 * 1024
 
 
@@ -10636,7 +10638,13 @@ def _collect_captain_reports(
     if claim_records is None:
         return 0
 
-    row_limit = max(0, min(int(row_limit), _CAPTAIN_POLL_ROW_CAP))
+    # A synthetic turn carries one Captain event, giving every retry the same
+    # event-derived completion identity even when another board's settlement
+    # fails independently.
+    row_limit = max(
+        0,
+        min(int(row_limit), _CAPTAIN_POLL_ROW_CAP, _CAPTAIN_TURN_ROW_CAP),
+    )
     if row_limit == 0:
         return 0
 
@@ -10676,10 +10684,11 @@ def _collect_captain_reports(
         # One event per lease token makes byte paging lossless: rows that do
         # not fit this prompt remain pending/unleased for the next poll instead
         # of sharing an ack token with the visible prefix.
+        owner = this_key or captain_profile
         token, events = _kb.lease_captain_reports(
             conn,
             profile=captain_profile,
-            owner=this_key or captain_profile,
+            owner=owner,
             event_ids=[event_id],
             now=now,
             lease_seconds=_CAPTAIN_LEASE_SECONDS,
@@ -10696,6 +10705,8 @@ def _collect_captain_reports(
                 "route": "captain",
                 "board": slug,
                 "token": token,
+                "owner": owner,
+                "expected_count": len(events),
                 "task_ids": {ev.task_id},
                 "deliveries": deliveries,
             })
@@ -10720,7 +10731,7 @@ def _collect_captain_reports(
             text = redact_sensitive_text(text, force=True)
             remaining = _CAPTAIN_POLL_BYTE_CAP - used_bytes
             if remaining <= 0:
-                _kb.release_captain_reports(conn, token=token)
+                _kb.release_captain_reports(conn, token=token, owner=owner)
                 break
             encoded = text.encode("utf-8")
             if len(encoded) > remaining:
@@ -10732,7 +10743,7 @@ def _collect_captain_reports(
                     except UnicodeDecodeError:
                         encoded = encoded[:-1]
                 if not encoded:
-                    _kb.release_captain_reports(conn, token=token)
+                    _kb.release_captain_reports(conn, token=token, owner=owner)
                     break
             claimed_event_ids.add(ev.id)
             texts.append(text)
@@ -10746,6 +10757,8 @@ def _collect_captain_reports(
             "route": "captain",
             "board": slug,
             "token": token,
+            "owner": owner,
+            "expected_count": len(events),
             "task_ids": {ev.task_id},
             "deliveries": deliveries,
         })
@@ -11058,7 +11071,10 @@ def _collect_kanban_notifications(
                 subs = _kb.list_notify_subs(conn)
             except Exception:
                 subs = []
-            for sub in subs:
+            # Once this poll has leased its one Captain event, leave ordinary
+            # subscription cursors untouched for the next turn. Conversely, an
+            # earlier ordinary delivery prevents leasing a Captain row below.
+            for sub in (() if captain_rows_leased else subs):
                 if (sub.get("platform") or "").lower() != "tui":
                     continue
                 if sub.get("chat_id") != session_key:
@@ -11142,7 +11158,11 @@ def _collect_kanban_notifications(
                 captain_rows_leased += _collect_captain_reports(
                     conn, slug, session, captain_profile,
                     claimed_event_ids, claim_records, texts,
-                    row_limit=_CAPTAIN_POLL_ROW_CAP - captain_rows_leased,
+                    row_limit=(
+                        0
+                        if texts
+                        else _CAPTAIN_TURN_ROW_CAP - captain_rows_leased
+                    ),
                 )
             except Exception as exc:
                 print(
@@ -11155,32 +11175,89 @@ def _collect_kanban_notifications(
     return texts
 
 
+def _renew_kanban_notification_claims(
+    claim_records: list[dict],
+    *,
+    lease_seconds: int = _CAPTAIN_LEASE_SECONDS,
+    now: int | None = None,
+) -> None:
+    """Renew every Captain token and fail closed if any ownership fence is lost."""
+    from hermes_cli import kanban_db as _kb
+
+    for record in claim_records:
+        if record.get("route") != "captain":
+            continue
+        conn = _kb.connect(board=record["board"])
+        try:
+            expected = max(1, int(record.get("expected_count") or 1))
+            renewed = _kb.renew_captain_reports(
+                conn,
+                token=record["token"],
+                owner=record["owner"],
+                lease_seconds=lease_seconds,
+                now=now,
+            )
+            if renewed != expected:
+                raise RuntimeError(
+                    f"Captain lease renewal expected {expected} row(s), got {renewed}"
+                )
+        finally:
+            conn.close()
+
+
 def _settle_kanban_notification_claims(
     claim_records: list[dict], *, accepted: bool
 ) -> None:
-    """Rewind rejected claims or finalize archive cleanup after acceptance."""
+    """Authoritatively ack accepted claims or rewind every rejected claim.
+
+    Captain rowcounts are ownership receipts, not diagnostics. Any exception or
+    mismatch is propagated after the still-owned failed token is released, so a
+    caller cannot emit a success frame for a settlement it did not commit.
+    """
     from hermes_cli import kanban_db as _kb
 
+    errors: list[Exception] = []
+    failed_captain_records: list[dict] = []
     for record in claim_records:
         if record.get("route") == "captain":
             conn = None
             try:
                 conn = _kb.connect(board=record["board"])
+                expected = max(1, int(record.get("expected_count") or 1))
+                owner = record.get("owner")
+                if not owner:
+                    raise RuntimeError("Captain settlement claim has no fenced owner")
                 if accepted:
-                    _kb.ack_captain_reports(conn, token=record["token"])
-                    # Once an archived task's report is accepted and nothing
-                    # else is pending, drop its registration + settled rows.
+                    settled = _kb.ack_captain_reports(
+                        conn,
+                        token=record["token"],
+                        owner=owner,
+                    )
+                    if settled != expected:
+                        raise RuntimeError(
+                            f"Captain ack expected {expected} row(s), got {settled}"
+                        )
+                    # GC is retention-only after the authoritative ack. A GC
+                    # failure must not turn a committed delivery into a retry.
                     for tid in record.get("task_ids") or ():
-                        _kb.captain_gc_task_if_settled(conn, tid)
+                        try:
+                            _kb.captain_gc_task_if_settled(conn, tid)
+                        except Exception:
+                            logger.warning(
+                                "Captain settled-task GC failed for %s",
+                                tid,
+                                exc_info=True,
+                            )
                 else:
-                    _kb.release_captain_reports(conn, token=record["token"])
+                    _kb.release_captain_reports(
+                        conn,
+                        token=record["token"],
+                        owner=owner,
+                    )
             except Exception as exc:
-                action = "ack" if accepted else "release"
-                print(
-                    f"[tui_gateway] captain report {action} failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                )
+                errors.append(exc)
+                if accepted:
+                    failed_captain_records.append(record)
             finally:
                 if conn is not None:
                     conn.close()
@@ -11210,15 +11287,63 @@ def _settle_kanban_notification_claims(
                     old_cursor=record["old_cursor"],
                 )
         except Exception as exc:
-            action = "archive cleanup" if accepted else "rewind"
-            print(
-                f"[tui_gateway] kanban notification {action} failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
+            errors.append(exc)
         finally:
             if conn is not None:
                 conn.close()
+
+    # Cross-board settlement cannot be one SQLite transaction. Release only
+    # tokens whose ack failed; already-acked siblings stay committed and each
+    # normal delivery turn carries one stable event identity.
+    if accepted:
+        for record in failed_captain_records:
+            conn = None
+            try:
+                conn = _kb.connect(board=record["board"])
+                _kb.release_captain_reports(
+                    conn,
+                    token=record["token"],
+                    owner=record.get("owner"),
+                )
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    if errors:
+        detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+        raise RuntimeError(f"Kanban notification settlement failed: {detail}") from errors[0]
+
+
+def _start_captain_lease_renewer(claim_records: list[dict]):
+    """Keep Captain ownership fenced for an otherwise unbounded model turn."""
+    if not any(record.get("route") == "captain" for record in claim_records):
+        return None
+    stop = threading.Event()
+    failures: list[Exception] = []
+
+    def _renew_loop() -> None:
+        while not stop.wait(_CAPTAIN_LEASE_RENEW_SECONDS):
+            try:
+                _renew_kanban_notification_claims(claim_records)
+            except Exception as exc:
+                failures.append(exc)
+                return
+
+    thread = _RealThread(target=_renew_loop, daemon=True)
+    thread.start()
+    return stop, thread, failures
+
+
+def _stop_captain_lease_renewer(handle) -> None:
+    if handle is None:
+        return
+    stop, thread, failures = handle
+    stop.set()
+    thread.join()
+    if failures:
+        raise RuntimeError("Captain lease renewal failed") from failures[0]
 
 
 def _notification_poller_loop(
@@ -11291,14 +11416,20 @@ def _notification_poller_loop(
                     except Exception as exc:
                         _kb_exc = exc
                     if _kb_exc is not None:
-                        _settle_kanban_notification_claims(
-                            _kanban_claims, accepted=False
-                        )
+                        try:
+                            _settle_kanban_notification_claims(
+                                _kanban_claims, accepted=False
+                            )
+                        except Exception as settle_exc:
+                            _kb_exc = settle_exc
                         session["running"] = False
                     elif not _kanban_texts:
-                        _settle_kanban_notification_claims(
-                            _kanban_claims, accepted=True
-                        )
+                        try:
+                            _settle_kanban_notification_claims(
+                                _kanban_claims, accepted=True
+                            )
+                        except Exception as settle_exc:
+                            _kb_exc = settle_exc
                         session["running"] = False
             if _reserved:
                 if _kb_exc is not None:
@@ -11311,6 +11442,10 @@ def _notification_poller_loop(
                     if _kanban_texts:
                         rid = f"__notif__{int(time.time() * 1000)}"
                         _settled = threading.Event()
+                        _settled_lock = threading.Lock()
+                        _lease_renewer = _start_captain_lease_renewer(
+                            _kanban_claims
+                        )
                         delivery_ids = sorted({
                             str(delivery.get("id"))
                             for record in _kanban_claims
@@ -11324,12 +11459,29 @@ def _notification_poller_loop(
                         )
 
                         def _settle_after_terminal(succeeded: bool) -> None:
-                            if _settled.is_set():
-                                return
-                            _settled.set()
-                            _settle_kanban_notification_claims(
-                                _kanban_claims, accepted=bool(succeeded)
-                            )
+                            with _settled_lock:
+                                if _settled.is_set():
+                                    return
+                                try:
+                                    _stop_captain_lease_renewer(_lease_renewer)
+                                except Exception:
+                                    try:
+                                        _settle_kanban_notification_claims(
+                                            _kanban_claims, accepted=False
+                                        )
+                                    finally:
+                                        _settled.set()
+                                    raise
+                                try:
+                                    _settle_kanban_notification_claims(
+                                        _kanban_claims, accepted=bool(succeeded)
+                                    )
+                                finally:
+                                    # Mark after the authoritative attempt, not
+                                    # before it. Callback failures must propagate
+                                    # through _run_prompt_submit and suppress the
+                                    # visible success frame.
+                                    _settled.set()
 
                         try:
                             _emit("message.start", sid)
@@ -11340,6 +11492,7 @@ def _notification_poller_loop(
                                 "\n".join(_kanban_texts),
                                 on_terminal=_settle_after_terminal,
                                 completion_id=completion_id,
+                                require_persisted=True,
                             )
                             if accepted is False:
                                 raise RuntimeError("synthetic turn was not accepted")
@@ -11859,6 +12012,7 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     on_terminal: Optional[Callable[[bool], None]] = None,
     completion_id: str | None = None,
+    require_persisted: bool = False,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -11932,6 +12086,7 @@ def _run_prompt_submit(
         turn_error_retained = False
         turn_succeeded = False
         terminal_callback_called = False
+        terminal_callback_committed = False
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -12148,6 +12303,12 @@ def _run_prompt_submit(
             def _stream(delta):
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
+                # Captain reports are not user-visible until their transcript
+                # is durable and their fenced inbox lease is authoritatively
+                # acknowledged. Keep the draft buffered so a failed settlement
+                # cannot leave text (or TTS audio) that a retry duplicates.
+                if require_persisted:
+                    return
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
@@ -12282,7 +12443,11 @@ def _run_prompt_submit(
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
-                if isinstance(result.get("messages"), list):
+                result_is_durable = (
+                    not require_persisted
+                    or result.get("session_persisted") is True
+                )
+                if isinstance(result.get("messages"), list) and result_is_durable:
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
@@ -12391,6 +12556,18 @@ def _run_prompt_submit(
             else:
                 raw = str(result)
                 status = "complete"
+            if require_persisted and status == "complete" and not (
+                isinstance(result, dict)
+                and result.get("session_persisted") is True
+            ):
+                status = "error"
+                raw = (
+                    "Captain report could not be committed to session storage; "
+                    "the durable inbox claim was released for retry."
+                )
+                if isinstance(result, dict):
+                    result["error"] = raw
+                    result["failed"] = True
             turn_succeeded = status == "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
@@ -12455,6 +12632,7 @@ def _run_prompt_submit(
             if on_terminal is not None:
                 terminal_callback_called = True
                 on_terminal(turn_succeeded)
+                terminal_callback_committed = turn_succeeded
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
@@ -12618,7 +12796,7 @@ def _run_prompt_submit(
             # Once the transcript and Captain claim were committed, a transport
             # write failure must not manufacture a second terminal assistant
             # frame. Reconnect hydration recovers the durable reply.
-            terminal_committed = terminal_callback_called and turn_succeeded
+            terminal_committed = terminal_callback_committed and turn_succeeded
             if not terminal_committed:
                 turn_succeeded = False
             trace = traceback.format_exc()
