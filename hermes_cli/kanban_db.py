@@ -3759,16 +3759,19 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             if skill_error is not None:
                 raise RuntimeError(f"cannot reassign review task {task_id}: {skill_error}")
             if not has_provenance:
-                if _canonical_assignee(row["assignee"]) != implementer:
-                    raise RuntimeError(
-                        f"cannot reassign review task {task_id}: review handoff has "
-                        "no durable implementation skill provenance"
-                    )
                 implementation_skills = _decode_task_skills(row["skills"])
                 if row["skills"] is not None and implementation_skills is None:
                     raise RuntimeError(
                         f"cannot reassign review task {task_id}: task has malformed "
                         "implementation skill provenance"
+                    )
+                if (
+                    implementation_skills
+                    and _canonical_assignee(row["assignee"]) != implementer
+                ):
+                    raise RuntimeError(
+                        f"cannot reassign review task {task_id}: review handoff has "
+                        "no durable implementation skill provenance"
                     )
             routed_skills = implementation_skills if profile == implementer else None
             conn.execute(
@@ -4828,6 +4831,10 @@ def claim_review_task(
     Parent dependencies are re-checked because a previously completed parent
     may have been reopened while this task waited in review.
 
+    Already-persisted pre-fix cross-profile handoffs are reconciled in the same
+    transaction before the claim: durable implementation skill provenance is
+    recorded and prior-phase flags are removed before spawn can observe them.
+
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
@@ -4851,6 +4858,8 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        if not _reconcile_legacy_review_skills_before_claim(conn, task_id):
             return None
         cur = conn.execute(
             """
@@ -6664,6 +6673,101 @@ def _resolved_implementation_skill_provenance(
     )
 
 
+def _reconcile_legacy_review_skills_before_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Sanitize a pre-fix cross-profile review inside its claim transaction.
+
+    Old ``review_requested`` rows recorded the implementer/reviewer but left
+    the implementer's task-forced skills on ``tasks.skills``. Once upgraded,
+    the first review claim resolves the durable implementation provenance,
+    removes those cross-profile flags, and records the same phase-aware
+    ``assigned`` payload used by explicit reviewer reassignment. Same-profile
+    reviews retain their documented shared-skill behavior.
+
+    Returns ``False`` only when a confidently cross-profile handoff carries
+    non-empty or malformed skills that cannot be preserved durably. The caller
+    then leaves the card parked in ``review`` rather than spawning a profile
+    with unsafe flags.
+    """
+    task_row = conn.execute(
+        "SELECT assignee, skills FROM tasks "
+        "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+        (task_id,),
+    ).fetchone()
+    if task_row is None or task_row["skills"] is None:
+        return task_row is not None
+
+    review_event = conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if review_event is None:
+        return True
+    try:
+        handoff = (
+            json.loads(review_event["payload"])
+            if review_event["payload"]
+            else {}
+        )
+    except (json.JSONDecodeError, TypeError):
+        return True
+    if not isinstance(handoff, dict):
+        return True
+
+    implementer = handoff.get("implementer")
+    if not isinstance(implementer, str) or not implementer.strip():
+        return True
+    implementer = _canonical_assignee(implementer)
+    reviewer = _canonical_assignee(task_row["assignee"])
+    if reviewer == implementer:
+        return True
+
+    current_skills = _decode_task_skills(task_row["skills"])
+    if current_skills is None:
+        return False
+
+    has_provenance, implementation_skills, skill_error = (
+        _resolved_implementation_skill_provenance(
+            conn,
+            task_id,
+            handoff,
+            review_event_id=int(review_event["id"]),
+        )
+    )
+    if skill_error is not None:
+        return False
+    if not has_provenance:
+        if current_skills:
+            return False
+        implementation_skills = current_skills
+
+    updated = conn.execute(
+        "UPDATE tasks SET skills = NULL "
+        "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+        (task_id,),
+    )
+    if updated.rowcount != 1:
+        return False
+    _append_event(
+        conn,
+        task_id,
+        "assigned",
+        {
+            "assignee": reviewer,
+            "phase": "review",
+            "implementer": implementer,
+            "reviewer": reviewer,
+            "implementation_skills": implementation_skills,
+            "source": "legacy_review_dispatch_reconciliation",
+        },
+    )
+    return True
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6855,9 +6959,10 @@ def request_changes(
     that reviewer run, restores the implementer recorded by the latest
     ``review_requested`` event, restores that handoff's implementation skillset,
     reapplies parent gating, and emits an auditable ``changes_requested`` event.
-    Legacy review events without skill provenance preserve the task's current
-    skills. The second tuple item is the implementer on success or a diagnostic
-    reason on failure.
+    Legacy review events recover skill provenance from later phase-aware
+    assignments or the immutable creation event; truly old rows without either
+    preserve the task's current skills. The second tuple item is the implementer
+    on success or a diagnostic reason on failure.
     """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:

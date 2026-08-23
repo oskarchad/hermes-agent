@@ -660,6 +660,249 @@ def test_cross_profile_review_cycle_routes_only_phase_owned_skill_flags(
     assert len(commands) == 3
 
 
+def test_dispatch_reconciles_legacy_cross_profile_review_skills_before_spawn(
+    kanban_home: Path,
+    disjoint_phase_skill_profiles: dict[str, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upgraded dispatcher must sanitize already-parked pre-fix reviews."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name in {"patch", "gauge"})
+    monkeypatch.setattr(
+        cfgmod,
+        "load_config",
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+    )
+
+    commands: list[list[str]] = []
+
+    class FakeProc:
+        pid = 98766
+
+    def fake_popen(cmd, **kwargs):
+        commands.append(list(cmd))
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    def skill_flags(command: list[str]) -> list[str]:
+        return [
+            command[index + 1]
+            for index, arg in enumerate(command[:-1])
+            if arg == "--skills"
+        ]
+
+    implementation_skills = disjoint_phase_skill_profiles["patch"]
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Legacy OAuth review",
+            assignee="patch",
+            skills=implementation_skills,
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="patch:legacy")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="gauge",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        # Recreate a pre-fix cross-profile handoff persisted before upgrade:
+        # the event lacks phase provenance and tasks.skills still carries the
+        # implementer's profile-local flags.
+        with kb.write_txn(conn):
+            event = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            payload = json.loads(event["payload"])
+            payload.pop("implementation_skills", None)
+            payload.pop("review_skills", None)
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), event["id"]),
+            )
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(implementation_skills), task_id),
+            )
+
+        dispatched = kb.dispatch_once(conn)
+        assert task_id in [item[0] for item in dispatched.spawned]
+        assert skill_flags(commands[-1]) == ["sdlc-review"]
+        assert not (set(skill_flags(commands[-1])) & set(implementation_skills))
+
+        claimed = kb.get_task(conn, task_id)
+        assert claimed is not None
+        assert claimed.assignee == "gauge"
+        assert claimed.skills is None
+        reconciled = _events(conn, task_id, kind="assigned")[-1][1]
+        assert reconciled == {
+            "assignee": "gauge",
+            "phase": "review",
+            "implementer": "patch",
+            "reviewer": "gauge",
+            "implementation_skills": implementation_skills,
+            "source": "legacy_review_dispatch_reconciliation",
+        }
+        assert claimed.current_run_id is not None
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Exercise the repaired legacy handoff.",
+            expected_run_id=claimed.current_run_id,
+        ) == (True, "patch")
+        repair = kb.get_task(conn, task_id)
+        assert repair is not None
+        assert repair.assignee == "patch"
+        assert repair.skills == implementation_skills
+
+
+@pytest.mark.parametrize(
+    ("persisted_skills", "expected_provenance"),
+    [(None, None), (json.dumps([]), [])],
+)
+def test_legacy_review_reassignment_accepts_provably_empty_skills(
+    kanban_home: Path,
+    persisted_skills: str | None,
+    expected_provenance: list[str] | None,
+) -> None:
+    """Old no-custom-skill reviews remain safely reassignable after upgrade."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Legacy empty review", assignee="builder")
+        implementation = kb.claim_task(conn, task_id, claimer="builder:legacy-empty")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="reviewer-one",
+            expected_run_id=implementation.current_run_id,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = json_remove(payload, '$.skills') "
+                "WHERE task_id = ? AND kind = 'created'",
+                (task_id,),
+            )
+            event = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            payload = json.loads(event["payload"])
+            payload.pop("implementation_skills", None)
+            payload.pop("review_skills", None)
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), event["id"]),
+            )
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (persisted_skills, task_id),
+            )
+
+        assert kb.assign_task(conn, task_id, "reviewer-two")
+        reassigned = kb.get_task(conn, task_id)
+        assert reassigned is not None
+        assert reassigned.assignee == "reviewer-two"
+        assert reassigned.skills is None
+        assigned = _events(conn, task_id, kind="assigned")[-1][1]
+        assert isinstance(assigned, dict)
+        assert assigned["phase"] == "review"
+        assert assigned["implementation_skills"] == expected_provenance
+
+
+def test_legacy_review_reassignment_rejects_malformed_current_skills(
+    kanban_home: Path,
+) -> None:
+    """The empty-skill compatibility path must still fail closed on garbage."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Legacy malformed review", assignee="builder")
+        implementation = kb.claim_task(conn, task_id, claimer="builder:legacy-bad")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="reviewer-one",
+            expected_run_id=implementation.current_run_id,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = json_remove(payload, '$.skills') "
+                "WHERE task_id = ? AND kind = 'created'",
+                (task_id,),
+            )
+            event = conn.execute(
+                "SELECT id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            payload = json.loads(event["payload"])
+            payload.pop("implementation_skills", None)
+            payload.pop("review_skills", None)
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), event["id"]),
+            )
+            conn.execute(
+                "UPDATE tasks SET skills = '{not-json' WHERE id = ?",
+                (task_id,),
+            )
+
+        with pytest.raises(RuntimeError, match="malformed implementation skill provenance"):
+            kb.assign_task(conn, task_id, "reviewer-two")
+        unchanged = kb.get_task(conn, task_id)
+        assert unchanged is not None
+        assert unchanged.assignee == "reviewer-one"
+
+
+def test_legacy_reconciliation_does_not_change_same_profile_review_contract(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only confidently cross-profile legacy reviews are reconciled."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: name == "builder")
+    captured: list[list[str]] = []
+
+    def spawn(task, workspace):
+        captured.append(list(task.skills or []))
+        return None
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Legacy same-profile review",
+            assignee="builder",
+            skills=["shared-domain-skill"],
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="builder:legacy-shared")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            expected_run_id=implementation.current_run_id,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET skills = '{not-json' WHERE id = ?",
+                (task_id,),
+            )
+
+        dispatched = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert task_id in [item[0] for item in dispatched.spawned]
+        assert captured == [["sdlc-review"]]
+
+
 def test_review_dispatch_honors_global_and_per_profile_caps(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
