@@ -11795,6 +11795,12 @@ def run_daemon(
 
 _ACCEPTED_DISPOSITIONS = {"accepted", "approved", "pass", "passed"}
 _VERSION_METADATA_KEYS = ("commit", "sha", "version", "tree", "artifact_id", "release")
+_OPERATIONAL_FAILURE_OUTCOMES = {
+    "crashed",
+    "reclaimed",
+    "spawn_failed",
+    "timed_out",
+}
 
 
 def _context_cap(value: Any, limit: int = _CTX_MAX_FIELD_BYTES) -> str:
@@ -11960,6 +11966,25 @@ def _append_run_projection(
         lines.append(f"Metadata: `{metadata}`")
 
 
+def _latest_operational_failure_after(
+    runs: list[Run], anchor_run_id: Optional[int]
+) -> Optional[Run]:
+    """Return one actionable operational failure newer than a phase anchor."""
+    if anchor_run_id is None:
+        return None
+    return max(
+        (
+            run
+            for run in runs
+            if run.id > int(anchor_run_id)
+            and run.outcome in _OPERATIONAL_FAILURE_OUTCOMES
+            and (run.error or run.summary)
+        ),
+        key=lambda run: run.id,
+        default=None,
+    )
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return a bounded, phase-specific spawn projection for one task.
 
@@ -12042,12 +12067,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         )
     lines.append("")
 
+    phase_anchor_run_id: Optional[int] = None
     if phase == "closure review":
         target_run = next(
             (run for run in reversed(prior_runs) if run.outcome == "review_requested"),
             None,
         )
         if target_run is not None:
+            phase_anchor_run_id = target_run.id
             lines.append("## Review target")
             lines.append(f"Run: {target_run.id}")
             if target_run.summary:
@@ -12066,6 +12093,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         )
         lines.append("## Latest material delta")
         if changes_event is not None:
+            phase_anchor_run_id = changes_event.run_id
             age = _relative_age(changes_event.created_at, now)
             lines.append(
                 f"Changes requested" + (f" {age}" if age else "")
@@ -12084,6 +12112,16 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     elif prior_runs:
         lines.append("## Latest material delta")
         _append_run_projection(lines, prior_runs[-1], now=now, label="Latest closed run")
+        lines.append("")
+
+    latest_failure = _latest_operational_failure_after(
+        prior_runs, phase_anchor_run_id
+    )
+    if latest_failure is not None:
+        lines.append("## Latest operational failure")
+        _append_run_projection(
+            lines, latest_failure, now=now, label="Failed attempt"
+        )
         lines.append("")
 
     parent_count = len(parent_ids(conn, task_id))

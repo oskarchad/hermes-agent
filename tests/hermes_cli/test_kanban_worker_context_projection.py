@@ -287,6 +287,170 @@ def test_closure_review_context_projects_exact_review_target(kanban_home: Path) 
     assert _line_count(context) < 53
 
 
+def test_repair_retry_retains_newer_protocol_violation_diagnostic(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Repair retry after protocol violation",
+            body="Repair the reviewed implementation without replaying all attempts.",
+            assignee="builder",
+        )
+        stale = kb.claim_task(conn, task_id, claimer=f"{host}:stale-implementation")
+        assert stale is not None
+        assert kb.reclaim_task(
+            conn,
+            task_id,
+            reason="STALE PRE-REVIEW FAILURE",
+            signal_fn=lambda *_args: None,
+        )
+
+        implementation = kb.claim_task(conn, task_id, claimer="builder:implementation")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="reviewer",
+            summary="Candidate version repair-1 is ready.",
+            metadata={"commit": "repair-1"},
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="reviewer:review")
+        assert review is not None
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Fix the retry lifecycle regression.",
+            expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+
+        failed_repair = kb.claim_task(conn, task_id, claimer=f"{host}:repair")
+        assert failed_repair is not None
+        fake_pid = 991_777
+        kb._set_worker_pid(conn, task_id, fake_pid)
+        kb._record_worker_exit(fake_pid, 0)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        assert kb.detect_crashed_workers(conn) == [task_id]
+
+        retry = kb.claim_task(conn, task_id, claimer="builder:retry")
+        assert retry is not None
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "Phase: repair" in context
+    assert "Fix the retry lifecycle regression." in context
+    assert "Candidate version repair-1 is ready." in context
+    assert "## Latest operational failure" in context
+    assert "worker exited cleanly (rc=0) without calling" in context
+    assert "If the prior run already did the work, verify it" in context
+    assert "report the result via kanban_complete" in context
+    assert "STALE PRE-REVIEW FAILURE" not in context
+    assert context.count("## Latest operational failure") == 1
+    assert _line_count(context) < 105
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["spawn_failed", "timed_out", "reclaimed", "crashed"],
+)
+def test_closure_review_retry_retains_only_newer_operational_failure(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Closure review retry after operational failure",
+            body="Review the exact candidate without replaying all attempts.",
+            assignee="builder",
+            max_runtime_seconds=1 if failure_kind == "timed_out" else None,
+        )
+        stale = kb.claim_task(conn, task_id, claimer="builder:stale")
+        assert stale is not None
+        assert kb.reclaim_task(
+            conn,
+            task_id,
+            reason="STALE PRE-TARGET FAILURE",
+            signal_fn=lambda *_args: None,
+        )
+
+        implementation = kb.claim_task(conn, task_id, claimer="builder:implementation")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="gauge",
+            summary="Review exact candidate closure-2.",
+            metadata={"commit": "closure-2"},
+            expected_run_id=implementation.current_run_id,
+        )
+        failed_review = kb.claim_review_task(
+            conn, task_id, claimer=f"{host}:failed-review"
+        )
+        assert failed_review is not None
+        assert failed_review.current_run_id is not None
+        if failure_kind == "spawn_failed":
+            assert not kb._record_spawn_failure(
+                conn,
+                task_id,
+                "NEW REVIEW SPAWN FAILURE",
+                failure_limit=5,
+            )
+        elif failure_kind == "timed_out":
+            old = int(time.time()) - 1_000
+            fake_pid = 991_779
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
+                    (fake_pid, old, task_id),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
+                    (fake_pid, old, failed_review.current_run_id),
+                )
+            monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+            assert task_id in kb.enforce_max_runtime(
+                conn, signal_fn=lambda *_args: None
+            )
+        elif failure_kind == "reclaimed":
+            assert kb.reclaim_task(
+                conn,
+                task_id,
+                reason="NEW REVIEW RECLAIM FAILURE",
+                signal_fn=lambda *_args: None,
+            )
+        else:
+            fake_pid = 991_778
+            kb._set_worker_pid(conn, task_id, fake_pid)
+            kb._record_worker_exit(fake_pid, 256)
+            monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+            monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+            assert kb.detect_crashed_workers(conn) == [task_id]
+
+        failed_run = kb.get_run(conn, failed_review.current_run_id)
+        assert failed_run is not None
+        assert failed_run.outcome == failure_kind
+        assert failed_run.error
+        expected_error = failed_run.error
+        retry = kb.claim_review_task(conn, task_id, claimer="gauge:retry")
+        assert retry is not None
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "Phase: closure review" in context
+    assert "Review exact candidate closure-2." in context
+    assert "Version: commit=closure-2" in context
+    assert "## Latest operational failure" in context
+    assert expected_error in context
+    assert "STALE PRE-TARGET FAILURE" not in context
+    assert context.count("## Latest operational failure") == 1
+    assert _line_count(context) < 53
+
+
 def test_legacy_done_parents_without_pass_pointer_do_not_gain_authority(
     kanban_home: Path,
 ) -> None:
