@@ -3292,6 +3292,26 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _dispatcher_claim_lock(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return a host-local claim identity unique to one board task.
+
+    A dispatcher process claims several tasks concurrently, so its plain
+    ``host:pid`` identity cannot also identify a worker scope. Hashing the
+    canonical board database path with the task id keeps the suffix sanitized,
+    stable across gateway restarts, and distinct across boards.
+    """
+    database = conn.execute("PRAGMA database_list").fetchall()
+    main_path = next(
+        (str(row["file"]) for row in database if row["name"] == "main"),
+        "",
+    )
+    board_identity = str(Path(main_path).resolve()) if main_path else get_current_board()
+    digest = hashlib.sha256(
+        f"{board_identity}\0{task_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{_claimer_id()}:{digest}"
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -8898,6 +8918,97 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _systemd_worker_scope_required() -> bool:
+    """Return whether this dispatcher is owned by a systemd service cgroup.
+
+    ``start_new_session=True`` isolates a worker's POSIX session/process group,
+    but systemd still places that child in the dispatcher's service cgroup.
+    Stopping the service then kills the worker despite the new session. Only a
+    service-owned dispatcher needs a sibling transient scope; interactive and
+    already-scoped processes keep the portable session-only path.
+    """
+    if _IS_WINDOWS or sys.platform != "linux" or not os.environ.get("INVOCATION_ID"):
+        return False
+    try:
+        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        # INVOCATION_ID is systemd's explicit process provenance. Fail closed
+        # when procfs is unavailable rather than launching into a service that
+        # may reap the worker on restart.
+        return True
+    return any(
+        line.partition("::")[2].rstrip().endswith(".service")
+        for line in cgroup.splitlines()
+        if "::" in line
+    )
+
+
+def _systemd_run_user_scope_available() -> bool:
+    """Reuse the bounded, cached user-scope probe used by terminal workers."""
+    from tools.process_registry import _systemd_run_user_scope_available as _probe
+
+    return bool(_probe())
+
+
+def _kanban_worker_scope_unit(claim_lock: str) -> str:
+    """Return a deterministic, sanitized transient scope name for one claim."""
+    digest = hashlib.sha256(str(claim_lock).encode("utf-8")).hexdigest()[:16]
+    return f"hermes-kanban-worker-{digest}.scope"
+
+
+def _build_kanban_worker_scope_argv(cmd: list[str], claim_lock: str) -> list[str]:
+    """Wrap a worker command in its task-owned transient user scope."""
+    binary = shutil.which("systemd-run")
+    if binary is None:
+        raise RuntimeError(
+            "kanban worker transient scope is unavailable: systemd-run not found"
+        )
+    return [
+        binary,
+        "--user",
+        "--scope",
+        "--quiet",
+        "--unit",
+        _kanban_worker_scope_unit(claim_lock),
+        "--collect",
+        "--property",
+        "KillMode=control-group",
+        "--",
+        *cmd,
+    ]
+
+
+def _stop_kanban_worker_scope(claim_lock: str) -> bool:
+    """Stop the exact transient scope derived from an owned worker claim."""
+    from tools.process_registry import _stop_systemd_unit
+
+    return bool(_stop_systemd_unit(_kanban_worker_scope_unit(claim_lock)))
+
+
+def _signal_owned_worker(
+    pid: int,
+    sig: int,
+    *,
+    signal_fn=None,
+) -> str:
+    """Signal one worker's owned process group, falling back safely to its PID."""
+    if signal_fn is not None:
+        signal_fn(int(pid), sig)
+        return "pid"
+    if os.name != "nt" and hasattr(os, "killpg"):
+        try:
+            pgid = os.getpgid(int(pid))
+            # Workers launch with start_new_session=True, so pgid==pid is the
+            # ownership proof. Never group-signal when that invariant is absent.
+            if pgid == int(pid):
+                os.killpg(pgid, sig)
+                return "process_group"
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    os.kill(int(pid), sig)
+    return "pid"
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -8913,6 +9024,9 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "termination_target": None,
+        "scope_stop_attempted": False,
+        "scope_stopped": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -8922,23 +9036,37 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
-    if kill is None:
-        return info
-
     info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
-        info["terminated"] = True
-        return info
-    except OSError:
-        return info
+    if _systemd_worker_scope_required():
+        info["scope_stop_attempted"] = True
+        info["scope_stopped"] = _stop_kanban_worker_scope(str(claim_lock))
+        if info["scope_stopped"]:
+            info["termination_target"] = "systemd_scope"
+
+    if info["scope_stopped"]:
+        for _ in range(10):
+            if not _pid_alive(pid):
+                info["terminated"] = True
+                return info
+            time.sleep(0.5)
+
+    # Preserve the historical ``signal_fn`` test-hook contract: an injected
+    # signal function observes the initial SIGTERM even when its companion
+    # liveness stub already reports the PID gone. A successfully stopped scope
+    # remains authoritative and needs no redundant PID signal.
+    should_signal = (
+        signal_fn is not None and not info["scope_stopped"]
+    ) or _pid_alive(pid)
+    if should_signal:
+        try:
+            info["termination_target"] = _signal_owned_worker(
+                int(pid), signal.SIGTERM, signal_fn=signal_fn,
+            )
+        except ProcessLookupError:
+            info["terminated"] = True
+            return info
+        except (PermissionError, OSError):
+            return info
 
     for _ in range(10):
         if not _pid_alive(pid):
@@ -8948,12 +9076,12 @@ def _terminate_reclaimed_worker(
 
     if _pid_alive(pid):
         try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
             _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
+            info["termination_target"] = _signal_owned_worker(
+                int(pid), _sigkill, signal_fn=signal_fn,
+            )
             info["sigkill"] = True
-        except (ProcessLookupError, OSError):
+        except (ProcessLookupError, PermissionError, OSError):
             return info
 
     info["terminated"] = not _pid_alive(pid)
@@ -9085,7 +9213,6 @@ def enforce_max_runtime(
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -9114,31 +9241,24 @@ def enforce_max_runtime(
         pid = int(row["worker_pid"])
         tid = row["id"]
         run_id: Optional[int] = None
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid,
+            row["claim_lock"],
+            signal_fn=signal_fn,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        # A timeout is not permission to launch a duplicate beside a worker
+        # that survived cleanup. Preserve the claim and retry termination on a
+        # later dispatcher tick, exactly like stale/manual reclaim paths.
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                row["claim_lock"],
+                now,
+                termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
@@ -9155,9 +9275,9 @@ def enforce_max_runtime(
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                payload.update(termination)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -9183,8 +9303,8 @@ def enforce_max_runtime(
                 trigger_run_id=run_id,
                 event_payload_extra={
                     "pid": pid,
-                    "sigkill": killed,
                     "retry_status": retry_status,
+                    **termination,
                 },
             )
     return timed_out
@@ -9537,6 +9657,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str, Optional[int]]] = []
     # (task_id, pid, claimer, protocol_violation, error_text, trigger_run_id)
+    scope_cleanup_details: list[tuple[int, str]] = []
+    # (pid, claim_lock)
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
@@ -9652,6 +9774,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
+                scope_cleanup_details.append((pid, row["claim_lock"]))
                 exited_hook_payloads.append({
                     "task_id": row["id"],
                     "assignee": row["assignee"],
@@ -9691,7 +9814,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text, run_id)
                     )
-    # Outside the main txn: account each crashed task and maybe trip the
+    # Outside the main txn: a dead worker parent can leave descendants alive
+    # inside its task-owned transient scope. Stop that exact scope before this
+    # dispatch tick can spawn a retry. Keep event ordering/lineage unchanged:
+    # ``crashed`` / ``rate_limited`` remains the authoritative exit event.
+    for pid, claim_lock in scope_cleanup_details:
+        _terminate_reclaimed_worker(pid, claim_lock)
+
+    # Account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
     # on top of the event we already emitted).
     #
@@ -10000,6 +10130,25 @@ def _record_spawn_failure(
     )
 
 
+class _SpawnedWorkerPid(int):
+    """Int-compatible worker PID carrying sanitized spawn audit metadata."""
+
+    isolation_mode: str
+    scope_unit: Optional[str]
+
+    def __new__(
+        cls,
+        pid: int,
+        *,
+        isolation_mode: str,
+        scope_unit: Optional[str],
+    ):
+        value = int.__new__(cls, int(pid))
+        value.isolation_mode = isolation_mode
+        value.scope_unit = scope_unit
+        return value
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -10018,7 +10167,14 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload: dict[str, Any] = {"pid": int(pid)}
+        isolation_mode = getattr(pid, "isolation_mode", None)
+        if isolation_mode:
+            payload["isolation_mode"] = isolation_mode
+        scope_unit = getattr(pid, "scope_unit", None)
+        if scope_unit:
+            payload["scope_unit"] = scope_unit
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10934,7 +11090,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            claimer=_dispatcher_claim_lock(conn, row["id"]),
+        )
         if claimed is None:
             continue
         try:
@@ -10971,7 +11132,7 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(conn, claimed.id, pid)
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -11069,7 +11230,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            claimer=_dispatcher_claim_lock(conn, row["id"]),
+        )
         if claimed is None:
             continue
         try:
@@ -11111,7 +11277,7 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(conn, claimed.id, pid)
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -11686,6 +11852,24 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    isolation_mode = "process_session"
+    scope_unit: Optional[str] = None
+    if _systemd_worker_scope_required():
+        if not _systemd_run_user_scope_available():
+            raise RuntimeError(
+                "kanban worker transient scope is unavailable under a "
+                "systemd-owned dispatcher; refusing to spawn inside the "
+                "external controller's service cgroup"
+            )
+        if not task.claim_lock:
+            raise RuntimeError(
+                "kanban worker transient scope is unavailable: claimed task "
+                "has no claim identity"
+            )
+        scope_unit = _kanban_worker_scope_unit(task.claim_lock)
+        cmd = _build_kanban_worker_scope_argv(cmd, task.claim_lock)
+        isolation_mode = "systemd_scope"
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
@@ -11710,7 +11894,11 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    return proc.pid
+    return _SpawnedWorkerPid(
+        proc.pid,
+        isolation_mode=isolation_mode,
+        scope_unit=scope_unit,
+    )
 
 
 # ---------------------------------------------------------------------------
