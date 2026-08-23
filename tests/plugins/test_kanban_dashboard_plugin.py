@@ -427,6 +427,7 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         )
         active_review = kb.claim_review_task(conn, child_id)
         assert active_review is not None
+        kb._set_worker_pid(conn, child_id, 86301)
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
@@ -489,6 +490,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         )
         grandchild_run = kb.claim_task(conn, grandchild_id)
         assert grandchild_run is not None
+        kb._set_worker_pid(conn, grandchild_id, 86302)
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
@@ -532,6 +534,7 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
         )
         review = kb.claim_review_task(conn, task_id)
         assert review is not None
+        kb._set_worker_pid(conn, task_id, 86303)
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{task_id}",
@@ -689,6 +692,171 @@ def test_dashboard_force_transition_cas_rejects_worker_identity_swap(
         assert run is not None
         assert run.status == "running"
         assert run.ended_at is None
+
+
+@pytest.mark.parametrize("target_status", ["done", "todo"])
+def test_dashboard_transition_during_spawn_waits_for_pid_persistence(
+    client, monkeypatch, tmp_path, target_status,
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=f"pre-pid {target_status}",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+
+    attempted = {}
+
+    def spawn_during_transition(claimed, _workspace):
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{claimed.id}",
+            json={"status": target_status, "summary": "raced operator transition"},
+        )
+        attempted["status_code"] = response.status_code
+        attempted["body"] = response.json()
+        return kb._SpawnedWorkerPid(
+            86420,
+            isolation_mode="process_session",
+            scope_unit=None,
+        )
+
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn, spawn_fn=spawn_during_transition)
+
+    assert attempted["status_code"] == 409, attempted["body"]
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.worker_pid == 86420
+        assert held.current_run_id is not None
+        spawned = [event for event in kb.list_events(conn, task_id) if event.kind == "spawned"]
+        assert len(spawned) == 1
+        assert spawned[0].run_id == held.current_run_id
+        assert [item[0] for item in result.spawned] == [task_id]
+
+
+def test_parent_reopen_during_descendant_spawn_waits_for_pid_persistence(
+    client, monkeypatch, tmp_path,
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="stable parent", assignee="planner")
+        assert kb.complete_task(conn, parent_id)
+        child_id = kb.create_task(
+            conn,
+            title="pre-pid descendant",
+            assignee="patch",
+            parents=[parent_id],
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+
+    attempted = {}
+
+    def spawn_during_parent_reopen(_claimed, _workspace):
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{parent_id}",
+            json={"status": "todo"},
+        )
+        attempted["status_code"] = response.status_code
+        return 86421
+
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn, spawn_fn=spawn_during_parent_reopen)
+
+    assert attempted["status_code"] == 409
+    with kb.connect() as conn:
+        parent = kb.get_task(conn, parent_id)
+        child = kb.get_task(conn, child_id)
+        assert parent is not None and parent.status == "done"
+        assert child is not None and child.status == "running"
+        assert child.worker_pid == 86421
+        assert [item[0] for item in result.spawned] == [child_id]
+
+
+def test_delete_during_spawn_waits_for_pid_persistence(
+    client, monkeypatch, tmp_path,
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="pre-pid delete",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+
+    attempted = {}
+
+    def spawn_during_delete(claimed, _workspace):
+        response = client.delete(f"/api/plugins/kanban/tasks/{claimed.id}")
+        attempted["status_code"] = response.status_code
+        return 86422
+
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn, spawn_fn=spawn_during_delete)
+
+    assert attempted["status_code"] == 409
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None and held.status == "running"
+        assert held.worker_pid == 86422
+        assert [item[0] for item in result.spawned] == [task_id]
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+@pytest.mark.parametrize("payload", [
+    {"status": "not-a-status"},
+    {"status": "done", "assignee": "gauge"},
+])
+def test_invalid_running_mutation_is_rejected_before_worker_cleanup(
+    client, monkeypatch, bulk, payload,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="invalid running mutation", assignee="patch")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 86423)
+
+    cleanups = []
+    monkeypatch.setattr(
+        kb,
+        "_prepare_running_worker_cleanup",
+        lambda *_args, **_kwargs: cleanups.append("cleanup") or (True, None),
+    )
+
+    if bulk:
+        response = client.post(
+            "/api/plugins/kanban/tasks/bulk",
+            json={"ids": [task_id], **payload},
+        )
+        assert response.status_code == 200
+        assert response.json()["results"][0]["ok"] is False
+    else:
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json=payload,
+        )
+        assert response.status_code in {400, 409}
+
+    assert cleanups == []
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.worker_pid == 86423
+        assert held.current_run_id == claimed.current_run_id
 
 
 def test_bulk_force_transition_rejects_unverified_running_scope_cleanup(

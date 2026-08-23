@@ -854,3 +854,78 @@ def test_crash_cleanup_identity_swap_defers_replacement_run(monkeypatch, tmp_pat
         )
     finally:
         conn.close()
+
+
+def test_dispatch_stops_exact_spawn_when_pid_persistence_cas_loses(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="pid CAS loss",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        stopped = []
+
+        def cleanup_spawn(pid, claim_lock, *, scope_expected=None, **_kwargs):
+            stopped.append((int(pid), claim_lock, scope_expected))
+            return {
+                "prev_pid": int(pid),
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": True,
+                "scope_stop_attempted": False,
+                "scope_stopped": False,
+                "cleanup_verified": True,
+            }
+
+        def spawn_then_lose_claim(claimed, _workspace):
+            side = kb.connect()
+            try:
+                with kb.write_txn(side):
+                    side.execute(
+                        "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
+                        "ended_at = ?, claim_lock = NULL, claim_expires = NULL, "
+                        "worker_pid = NULL WHERE id = ?",
+                        (int(time.time()), claimed.current_run_id),
+                    )
+                    side.execute(
+                        "UPDATE tasks SET status = 'done', completed_at = ?, "
+                        "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, "
+                        "worker_pid = NULL WHERE id = ?",
+                        (int(time.time()), claimed.id),
+                    )
+            finally:
+                side.close()
+            return kb._SpawnedWorkerPid(
+                89123,
+                isolation_mode="process_session",
+                scope_unit=None,
+            )
+
+        monkeypatch.setattr(kb, "_terminate_reclaimed_worker", cleanup_spawn)
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn_then_lose_claim)
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "done"
+        assert task.current_run_id is None
+        assert task.worker_pid is None
+        assert result.spawned == []
+        assert len(stopped) == 1
+        assert stopped[0][0] == 89123
+        assert stopped[0][2] is False
+        assert not any(
+            event.kind == "spawned" for event in kb.list_events(conn, task_id)
+        )
+    finally:
+        conn.close()

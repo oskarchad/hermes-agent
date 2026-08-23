@@ -872,6 +872,19 @@ def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
     return None
 
 
+def _mutation_prevalidation_error(task, status, assignee) -> Optional[tuple[int, str]]:
+    """Reject deterministic status/assignment errors before worker cleanup."""
+    if status is None:
+        return None
+    if status not in kanban_db.VALID_STATUSES:
+        return 400, f"unknown status: {status}"
+    if status == "running":
+        return 400, "Cannot set status to 'running' directly; use the dispatcher/claim path"
+    if task.status == "running" and assignee is not None and status != "review":
+        return 409, "cannot combine assignee change with this running-task transition"
+    return None
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -880,6 +893,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        prevalidation_error = _mutation_prevalidation_error(
+            task, payload.status, payload.assignee,
+        )
+        if prevalidation_error is not None:
+            status_code, detail = prevalidation_error
+            raise HTTPException(status_code=status_code, detail=detail)
 
         verified_worker_identity = None
         if (
@@ -1464,6 +1483,13 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 task = kanban_db.get_task(conn, tid)
                 if task is None:
                     entry.update(ok=False, error="not found")
+                    results.append(entry)
+                    continue
+                prevalidation_error = _mutation_prevalidation_error(
+                    task, payload.status, payload.assignee,
+                )
+                if prevalidation_error is not None:
+                    entry.update(ok=False, error=prevalidation_error[1])
                     results.append(entry)
                     continue
                 if payload.archive:

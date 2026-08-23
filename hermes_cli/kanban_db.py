@@ -9389,17 +9389,17 @@ def _prepare_running_worker_cleanup(
 ) -> tuple[bool, Optional[_WorkerIdentity]]:
     """Stop one snapshotted running owner before a non-worker mutation.
 
-    The returned identity must be used as a CAS guard by the mutation.  A
-    claimed task whose wrapper PID has not been persisted yet needs no signal,
-    but its all-NULL/PID identity is still returned so a concurrent spawn makes
-    the later CAS fail rather than orphaning the just-started worker.
+    The returned identity must be used as a CAS guard by the mutation. A
+    claimed task whose wrapper PID has not been persisted is an unresolved
+    spawn boundary: the child may already be live, so ownership-clearing
+    mutations must fail closed until PID persistence completes.
     """
     identity = _running_worker_identity(conn, task_id)
     if identity is None:
         return True, None
     _, run_id, worker_pid, claim_lock = identity
     if worker_pid is None:
-        return True, identity
+        return False, identity
     termination = _terminate_reclaimed_worker(
         worker_pid,
         claim_lock,
@@ -10519,24 +10519,49 @@ class _SpawnedWorkerPid(int):
         return value
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    if expected_run_id is None or expected_claim_lock is None:
+        current = _running_worker_identity(conn, task_id)
+        if current is None:
+            return False
+        _, expected_run_id, _worker_pid, expected_claim_lock = current
+    if expected_run_id is None or expected_claim_lock is None:
+        return False
     with write_txn(conn):
+        owner = conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ? AND t.status = 'running' "
+            "AND t.current_run_id IS ? AND t.claim_lock IS ? AND t.worker_pid IS NULL "
+            "AND r.task_id = t.id AND r.status = 'running' AND r.ended_at IS NULL "
+            "AND r.claim_lock IS ? AND r.worker_pid IS NULL",
+            (task_id, expected_run_id, expected_claim_lock, expected_claim_lock),
+        ).fetchone()
+        if owner is None:
+            return False
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+            "UPDATE tasks SET worker_pid = ? WHERE id = ? AND status = 'running' "
+            "AND current_run_id IS ? AND claim_lock IS ? AND worker_pid IS NULL",
+            (int(pid), task_id, expected_run_id, expected_claim_lock),
         )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
-            )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? WHERE id = ? AND task_id = ? "
+            "AND status = 'running' AND ended_at IS NULL "
+            "AND claim_lock IS ? AND worker_pid IS NULL",
+            (int(pid), expected_run_id, task_id, expected_claim_lock),
+        )
         payload: dict[str, Any] = {"pid": int(pid)}
         isolation_mode = getattr(pid, "isolation_mode", None)
         if isolation_mode:
@@ -10544,7 +10569,25 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         scope_unit = getattr(pid, "scope_unit", None)
         if scope_unit:
             payload["scope_unit"] = scope_unit
-        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
+        _append_event(conn, task_id, "spawned", payload, run_id=expected_run_id)
+        return True
+
+
+def _stop_spawn_after_pid_persistence_loss(task: Task, pid: int) -> None:
+    """Stop and verify a child whose exact claimed owner no longer exists."""
+    isolation_mode = getattr(pid, "isolation_mode", None)
+    scope_expected = (
+        isolation_mode == "systemd_scope"
+        if isolation_mode in {"systemd_scope", "process_session"}
+        else _systemd_worker_scope_required()
+    )
+    termination = _terminate_reclaimed_worker(
+        int(pid), task.claim_lock, scope_expected=scope_expected,
+    )
+    if not _worker_cleanup_verified(termination):
+        raise RuntimeError(
+            f"spawned worker cleanup could not be verified after PID CAS loss: {task.id}"
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -11501,8 +11544,15 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, pid)
+            if pid and not _set_worker_pid(
+                conn,
+                claimed.id,
+                pid,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+            ):
+                _stop_spawn_after_pid_persistence_loss(claimed, pid)
+                continue
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -11646,8 +11696,15 @@ def _dispatch_once_locked(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, pid)
+            if pid and not _set_worker_pid(
+                conn,
+                claimed.id,
+                pid,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+            ):
+                _stop_spawn_after_pid_persistence_loss(claimed, pid)
+                continue
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
