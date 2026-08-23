@@ -11814,11 +11814,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ).fetchone()
                 return int(row["id"]) if row is not None else assistant_id
 
+            turn_start = _turn_start(source_session_id, canonical_id)
+            source_turn_rows = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ? "
+                "ORDER BY id",
+                (source_session_id, turn_start, canonical_id),
+            ).fetchall()
+            source_turn_ids = [int(row["id"]) for row in source_turn_rows]
+            if not source_turn_ids or canonical_id not in source_turn_ids:
+                raise RuntimeError("Captain receipt lost its canonical source rows")
+
+            affected_session_ids = {
+                source_session_id,
+                destination_session_id,
+            }
+
             # Old affected builds could already have copied one completion into
             # multiple sessions. Soft-delete every non-canonical synthetic turn
             # so normal resume/export projections expose only the chosen receipt.
             for duplicate in receipt_rows[1:]:
                 duplicate_session_id = str(duplicate["session_id"])
+                affected_session_ids.add(duplicate_session_id)
                 duplicate_id = int(duplicate["id"])
                 duplicate_start = _turn_start(duplicate_session_id, duplicate_id)
                 conn.execute(
@@ -11827,43 +11844,51 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (duplicate_session_id, duplicate_start, duplicate_id),
                 )
 
-            turn_start = _turn_start(source_session_id, canonical_id)
             moved = source_session_id != destination_session_id
             if moved:
-                moved_count = int(
-                    conn.execute(
-                        "SELECT COUNT(*) AS n FROM messages "
-                        "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ?",
-                        (source_session_id, turn_start, canonical_id),
-                    ).fetchone()["n"]
-                )
+                placeholders = ",".join("?" for _ in source_turn_ids)
                 conn.execute(
                     "UPDATE messages SET session_id = ? "
-                    "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ?",
-                    (
-                        destination_session_id,
-                        source_session_id,
-                        turn_start,
-                        canonical_id,
-                    ),
+                    f"WHERE active = 1 AND id IN ({placeholders})",
+                    (destination_session_id, *source_turn_ids),
                 )
-                if moved_count:
-                    conn.execute(
-                        "UPDATE sessions SET message_count = "
-                        "CASE WHEN message_count >= ? THEN message_count - ? ELSE 0 END "
-                        "WHERE id = ?",
-                        (moved_count, moved_count, source_session_id),
-                    )
-                    conn.execute(
-                        "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
-                        (moved_count, destination_session_id),
-                    )
 
+            # Moving the canonical turn and soft-deleting legacy duplicates is
+            # one transaction. Recompute both counters from the surviving rows
+            # before exposing its receipt so the read model cannot lag the data.
+            for session_id in sorted(affected_session_ids):
+                active_rows = conn.execute(
+                    "SELECT tool_calls FROM messages "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                ).fetchall()
+                tool_call_count = 0
+                for row in active_rows:
+                    raw_tool_calls = row["tool_calls"]
+                    if not raw_tool_calls:
+                        continue
+                    try:
+                        decoded_tool_calls = json.loads(raw_tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        tool_call_count += 1
+                    else:
+                        tool_call_count += (
+                            len(decoded_tool_calls)
+                            if isinstance(decoded_tool_calls, list)
+                            else 1
+                        )
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                    "WHERE id = ?",
+                    (len(active_rows), tool_call_count, session_id),
+                )
+
+            placeholders = ",".join("?" for _ in source_turn_ids)
             turn_rows = conn.execute(
                 f"SELECT {self._CONVERSATION_ROW_COLUMNS} FROM messages "
-                "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ? "
+                f"WHERE active = 1 AND id IN ({placeholders}) "
                 "ORDER BY id",
-                (destination_session_id, turn_start, canonical_id),
+                source_turn_ids,
             ).fetchall()
             messages = self._rows_to_conversation(
                 turn_rows,

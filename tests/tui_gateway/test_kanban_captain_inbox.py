@@ -1099,6 +1099,7 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
         conn.close()
 
     attempts = []
+    submitted_prompts = []
     real_ack = kb.ack_captain_reports
     ack_calls = 0
 
@@ -1114,19 +1115,25 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
     def submit(_rid, _sid, active_session, text, **kwargs):
         completion_id = kwargs["completion_id"]
         attempts.append(completion_id)
+        submitted_prompts.append(text)
         active_session_id = active_session["agent"].session_id
+        # Persist the source turn across separate writes so ordinary rows from
+        # the fallback session interleave in the global AUTOINCREMENT id range.
+        # Reconciliation must append only the exact source row ids, not every
+        # destination row whose id happens to lie between them.
+        db.append_message(active_session_id, "user", content=text)
         db.append_messages_batch(
-            active_session_id,
+            fallback_session_id,
             [
-                {"role": "user", "content": text},
-                {
-                    "role": "assistant",
-                    "content": "Captain durable report",
-                    "display_metadata": {
-                        "captain_completion_id": completion_id,
-                    },
-                },
+                {"role": "user", "content": "fallback ordinary question"},
+                {"role": "assistant", "content": "fallback ordinary answer"},
             ],
+        )
+        db.append_message(
+            active_session_id,
+            "assistant",
+            content="Captain durable report",
+            display_metadata={"captain_completion_id": completion_id},
         )
         kwargs["on_terminal"](True)
         return True
@@ -1178,7 +1185,13 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
     assert [row["content"] for row in captain_rows] == ["Captain durable report"]
     assert all(row.get("content") != "Captain durable report" for row in first_rows)
     assert db.get_session(first_session_id)["message_count"] == 0
-    assert db.get_session(fallback_session_id)["message_count"] == 2
+    assert db.get_session(fallback_session_id)["message_count"] == 4
+    assert [row.get("content") for row in fallback["history"]] == [
+        "fallback ordinary question",
+        "fallback ordinary answer",
+        submitted_prompts[0],
+        "Captain durable report",
+    ]
     visible = server._history_to_messages(fallback["history"])
     assert [
         row["text"]

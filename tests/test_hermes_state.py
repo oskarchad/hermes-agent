@@ -5350,3 +5350,85 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+class TestCaptainReportRehome:
+    def test_rehome_recomputes_counts_for_tool_turn_and_legacy_duplicate(self, db):
+        source = "captain-source"
+        destination = "captain-destination"
+        duplicate = "captain-legacy-duplicate"
+        completion_id = "kanban-report:count-reconciliation"
+        for session_id in (source, destination, duplicate):
+            db.create_session(session_id=session_id, source="tui", model="test")
+
+        db.append_messages_batch(
+            source,
+            [
+                {"role": "user", "content": "Captain task"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        },
+                        {
+                            "id": "call-2",
+                            "function": {"name": "search_files", "arguments": "{}"},
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+                {
+                    "role": "assistant",
+                    "content": "Canonical Captain report",
+                    "display_metadata": {"captain_completion_id": completion_id},
+                },
+            ],
+        )
+        db.append_messages_batch(
+            destination,
+            [
+                {"role": "user", "content": "ordinary question"},
+                {"role": "assistant", "content": "ordinary answer"},
+            ],
+        )
+        db.append_messages_batch(
+            duplicate,
+            [
+                {"role": "user", "content": "legacy copied task"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "legacy-call",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "legacy-call", "content": "legacy ok"},
+                {
+                    "role": "assistant",
+                    "content": "Legacy duplicate report",
+                    "display_metadata": {"captain_completion_id": completion_id},
+                },
+            ],
+        )
+
+        receipt = db.rehome_captain_report(completion_id, destination)
+
+        assert receipt is not None
+        assert [message["content"] for message in receipt["messages"]] == [
+            "Captain task",
+            "",
+            "ok",
+            "Canonical Captain report",
+        ]
+        assert db.get_session(source)["message_count"] == 0
+        assert db.get_session(source)["tool_call_count"] == 0
+        assert db.get_session(destination)["message_count"] == 6
+        assert db.get_session(destination)["tool_call_count"] == 2
+        assert db.get_session(duplicate)["message_count"] == 0
+        assert db.get_session(duplicate)["tool_call_count"] == 0

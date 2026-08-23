@@ -776,7 +776,19 @@ def build_turn_context(
 
     # ── System prompt (cached per session for prefix caching) ──
     if agent._cached_system_prompt is None:
-        restore_or_build_system_prompt(agent, system_message, conversation_history)
+        if task_only_context:
+            restore_or_build_system_prompt(
+                agent,
+                system_message,
+                conversation_history,
+                task_only_context=True,
+            )
+        else:
+            restore_or_build_system_prompt(
+                agent,
+                system_message,
+                conversation_history,
+            )
 
     active_system_prompt = agent._cached_system_prompt
 
@@ -836,7 +848,12 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        not task_only_context
+        and agent.compression_enabled
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -914,7 +931,8 @@ def build_turn_context(
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
     if (
-        agent.compression_enabled
+        not task_only_context
+        and agent.compression_enabled
         and not _review_fork_first_request_pending(agent)
         and _should_run_preflight_estimate(
             messages,

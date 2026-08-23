@@ -487,6 +487,110 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_task_only_turn_bypasses_dynamic_context_and_finalization_hooks(
+        self, wire_env
+    ):
+        """A Captain-style turn reaches the provider and persistence seams cleanly.
+
+        This is intentionally production-shaped: a real ``AIAgent`` sends one
+        request to the in-process provider while an overriding context engine,
+        lifecycle plugins, and external-memory/review doubles all attempt to
+        observe or rewrite the synthetic turn.
+        """
+        from agent.context_engine import ContextEngine
+
+        make_agent, handler, _db, _sid = wire_env
+        dynamic_calls = []
+        ordinary_marker = "ORDINARY_HISTORY_MUST_NOT_REACH_CAPTAIN"
+
+        class _OrdinaryHistoryEngine(ContextEngine):
+            @property
+            def name(self):
+                return "ordinary-history"
+
+            def update_from_response(self, usage):
+                dynamic_calls.append("update_from_response")
+
+            def should_compress(self, prompt_tokens=None):
+                dynamic_calls.append("should_compress")
+                return False
+
+            def note_request_rough_estimate(self, request_tokens):
+                dynamic_calls.append("note_request_rough_estimate")
+
+            def compress(
+                self,
+                messages,
+                current_tokens=None,
+                focus_topic=None,
+                force=False,
+                memory_context="",
+            ):
+                return messages
+
+            def select_context(self, request_messages, **kwargs):
+                dynamic_calls.append("select_context")
+                return [
+                    request_messages[0],
+                    {"role": "user", "content": ordinary_marker},
+                    {"role": "assistant", "content": "ordinary reply"},
+                    request_messages[-1],
+                ]
+
+            def on_turn_complete(self, messages, usage=None, **kwargs):
+                dynamic_calls.append("on_turn_complete")
+
+            _micro_compact_enabled = True
+
+            def _micro_compact(self, messages):
+                dynamic_calls.append("micro_compact")
+                return messages
+
+        def invoke_dynamic_hook(name, **kwargs):
+            dynamic_calls.append(name)
+            if name == "transform_llm_output":
+                return [f"TRANSFORMED WITH {ordinary_marker}"]
+            if name == "pre_llm_call":
+                return [{"context": ordinary_marker}]
+            return []
+
+        agent = make_agent()
+        agent.compression_enabled = True
+        agent.context_compressor = _OrdinaryHistoryEngine()
+        agent.prefill_messages = [
+            {"role": "assistant", "content": ordinary_marker},
+        ]
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = ""
+        agent._memory_manager.prefetch_all.return_value = ordinary_marker
+        agent._sync_external_memory_for_turn = MagicMock()
+        agent._spawn_background_review = MagicMock()
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 1
+        agent.valid_tool_names = {"skill_manage"}
+        handler.response_queue.append(_text_resp("Captain bounded report"))
+
+        with patch("hermes_cli.lifecycle.invoke_hook", side_effect=invoke_dynamic_hook):
+            result = agent.run_conversation(
+                "Captain bounded task",
+                conversation_history=[],
+                task_id="captain-task",
+                task_only_context=True,
+            )
+
+        requests = _chat_requests(handler)
+        assert len(requests) == 1
+        assert dynamic_calls == []
+        sent_messages = requests[0]["messages"]
+        assert [message["role"] for message in sent_messages] == ["system", "user"]
+        assert sent_messages[-1]["content"] == "Captain bounded task"
+        assert ordinary_marker not in json.dumps(sent_messages)
+        assert result["final_response"] == "Captain bounded report"
+        agent._memory_manager.on_turn_start.assert_not_called()
+        agent._memory_manager.prefetch_all.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+        agent._spawn_background_review.assert_not_called()
+
     def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,
         the sidecar equals the sent bytes exactly, the field never reaches the
