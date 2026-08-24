@@ -723,12 +723,47 @@ def build_turn_context(
     # build strips both fields from every outgoing copy.
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-        if persist_user_display_metadata:
-            user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_display_metadata:
+        user_msg["display_metadata"] = persist_user_display_metadata
 
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+
+    # A process may die after the crash-resilient early persist but before a
+    # task-only provider result settles. On retry, represent that exact durable
+    # Captain input with this fresh in-memory dict instead of appending another
+    # identical user row. The SessionDB helper also collapses residue from older
+    # affected builds and refuses reuse once a canonical assistant receipt exists.
+    if task_only_context and isinstance(persist_user_display_metadata, dict):
+        _captain_completion_id = persist_user_display_metadata.get(
+            "captain_completion_id"
+        )
+        _session_db = getattr(agent, "_session_db", None)
+        if _captain_completion_id and _session_db is not None:
+            try:
+                # A fresh fallback agent lazily creates its SessionDB row in
+                # the early persist below. Profile-wide staged-input rehome
+                # needs that destination one step sooner so it can atomically
+                # append after any existing destination transcript rows.
+                agent._ensure_db_session()
+                _persisted_content = (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else user_msg.get("content")
+                )
+                if _session_db.reuse_staged_captain_input(
+                    _captain_completion_id,
+                    agent.session_id,
+                    _persisted_content,
+                ):
+                    user_msg["_db_persisted"] = True
+            except Exception:
+                logger.warning(
+                    "Captain staged-input reuse failed for session=%s",
+                    agent.session_id or "none",
+                    exc_info=True,
+                )
 
     # Track user turns for memory flush and periodic nudge logic.
     if not task_only_context:

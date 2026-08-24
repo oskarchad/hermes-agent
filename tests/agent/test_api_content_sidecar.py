@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
@@ -446,14 +447,14 @@ def wire_env():
     db = SessionDB(db_path=Path(test_home) / "state.db")
     sid = "sess-wire"
 
-    def make_agent():
+    def make_agent(session_id=sid):
         agent = AIAgent(
             api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
             provider="openai-compat", model="test-model",
             max_iterations=10, enabled_toolsets=[],
             quiet_mode=True, skip_context_files=True, skip_memory=True,
             save_trajectories=False, platform="cli",
-            session_db=db, session_id=sid,
+            session_db=db, session_id=session_id,
         )
         agent.valid_tool_names = {"read_file"}
         return agent
@@ -670,6 +671,138 @@ class TestWireInvariant:
         agent._memory_manager.assert_not_called()
         agent._sync_external_memory_for_turn.assert_not_called()
         agent._spawn_background_review.assert_not_called()
+
+    def test_task_only_rollback_failure_marks_claim_unsafe_to_release(self, wire_env):
+        """A transient cleanup failure must keep the durable claim fenced."""
+        make_agent, handler, db, _sid = wire_env
+        agent = make_agent()
+        completion_id = "kanban-report:rollback-failed"
+        metadata = {"captain_completion_id": completion_id}
+        handler.response_queue.append(_tc_resp("fabricated_tool"))
+
+        with patch.object(
+            db,
+            "rollback_staged_captain_input",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            result = agent.run_conversation(
+                "Captain rollback failure",
+                conversation_history=[],
+                task_id="captain-rollback-failure",
+                task_only_context=True,
+                persist_user_display_kind="kanban_report",
+                persist_user_display_metadata=metadata,
+                persist_assistant_display_metadata=metadata,
+            )
+
+        assert result["failed"] is True
+        assert result["captain_retry_safe"] is False
+        assert [
+            (message["role"], message["content"])
+            for message in db.get_messages_as_conversation(agent.session_id)
+        ] == [("user", "Captain rollback failure")]
+
+    def test_task_only_retry_leaves_one_durable_captain_pair(self, wire_env):
+        """A dirty failed turn retries in another session as one canonical pair."""
+        from hermes_cli import kanban_db as kb
+        import tui_gateway.server as server
+
+        make_agent, handler, db, sid = wire_env
+        fallback_sid = "sess-wire-fallback"
+        session = {"session_key": sid}
+        profile = server._session_captain_profile(session)
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="captain retry residue", assignee="worker"
+            )
+            kb.register_captain_owner(
+                conn, task_id, profile=profile, origin_session_key=None
+            )
+            kb.complete_task(conn, task_id, summary="stable durable retry")
+        finally:
+            conn.close()
+
+        first_claims = []
+        first_texts = server._collect_kanban_notifications(
+            session, claim_records=first_claims
+        )
+        assert len(first_texts) == 1
+        completion_id = server._captain_completion_id(first_claims, first_texts)
+        metadata = {"captain_completion_id": completion_id}
+
+        first_agent = make_agent()
+        handler.response_queue.append(_tc_resp("memory"))
+        with patch.object(
+            db,
+            "rollback_staged_captain_input",
+            side_effect=RuntimeError("transient rollback lock"),
+        ):
+            first = first_agent.run_conversation(
+                first_texts[0],
+                conversation_history=[],
+                task_id="captain-retry-first",
+                task_only_context=True,
+                persist_user_display_kind="kanban_report",
+                persist_user_display_metadata=metadata,
+                persist_assistant_display_metadata=metadata,
+            )
+        assert first["failed"] is True
+        assert first["captain_retry_safe"] is False
+        assert [message["role"] for message in db.get_messages_as_conversation(sid)] == [
+            "user"
+        ]
+
+        # The unsafe terminal outcome keeps the claim leased. Model the bounded
+        # lease expiry/restart before a different same-profile session retries.
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE kanban_captain_inbox SET lease_expires = ? "
+                    "WHERE state = 'leased'",
+                    (int(time.time()) - 1,),
+                )
+        finally:
+            conn.close()
+
+        retry_claims = []
+        retry_texts = server._collect_kanban_notifications(
+            {"session_key": fallback_sid}, claim_records=retry_claims
+        )
+        assert retry_texts == first_texts
+        assert server._captain_completion_id(retry_claims, retry_texts) == completion_id
+
+        second_agent = make_agent(fallback_sid)
+        handler.response_queue.append(_text_resp("Captain retry settled"))
+        second = second_agent.run_conversation(
+            retry_texts[0],
+            conversation_history=[],
+            task_id="captain-retry-second",
+            task_only_context=True,
+            persist_user_display_kind="kanban_report",
+            persist_user_display_metadata=metadata,
+            persist_assistant_display_metadata=metadata,
+        )
+        assert second["session_persisted"] is True
+        server._settle_kanban_notification_claims(retry_claims, accepted=True)
+
+        assert db.get_messages_as_conversation(sid) == []
+        reloaded = db.get_messages_as_conversation(fallback_sid)
+        assert [message["role"] for message in reloaded] == ["user", "assistant"]
+        assert [message["content"] for message in reloaded] == [
+            first_texts[0],
+            "Captain retry settled",
+        ]
+        assert all(
+            (message.get("display_metadata") or {}).get("captain_completion_id")
+            == completion_id
+            for message in reloaded
+        )
+        assert all(
+            left["role"] != right["role"]
+            for left, right in zip(reloaded, reloaded[1:])
+        )
 
     def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,

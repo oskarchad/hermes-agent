@@ -11763,6 +11763,156 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             return best if best is not None else session_id
 
+    def reuse_staged_captain_input(
+        self,
+        completion_id: str,
+        session_id: str,
+        content: Any,
+    ) -> bool:
+        """Reuse one unpaired Captain input row after a crashed attempt.
+
+        The completion identity is profile-local because each ``SessionDB`` is
+        rooted under one resolved ``HERMES_HOME``. If a canonical assistant
+        receipt already exists, no input row is changed. Otherwise duplicate
+        active inputs from older failed attempts are collapsed atomically and
+        the survivor can be represented by a fresh in-memory persisted dict.
+        A residue owned by an earlier same-profile session is copied to the
+        current session at the end of its transcript and retired at the source
+        in the same transaction; moving its old row id would reorder a fallback
+        session's ordinary conversation.
+        """
+        if not completion_id or not session_id:
+            return False
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            destination = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if destination is None:
+                raise RuntimeError("Captain staged-input destination session is missing")
+
+            committed = conn.execute(
+                "SELECT 1 FROM messages "
+                "WHERE role = 'assistant' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ? "
+                "LIMIT 1",
+                (completion_id,),
+            ).fetchone()
+            if committed is not None:
+                return False
+
+            rows = conn.execute(
+                "SELECT id, session_id, content FROM messages "
+                "WHERE role = 'user' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ? "
+                "ORDER BY CASE WHEN content = ? THEN 0 ELSE 1 END, "
+                "CASE WHEN session_id = ? THEN 0 ELSE 1 END, id",
+                (completion_id, stored_content, session_id),
+            ).fetchall()
+            matching_rows = [row for row in rows if row["content"] == stored_content]
+            if not matching_rows:
+                return False
+
+            keep_id = int(matching_rows[0]["id"])
+            source_session_id = str(matching_rows[0]["session_id"])
+            affected_session_ids = {str(row["session_id"]) for row in rows}
+            affected_session_ids.add(session_id)
+            if source_session_id != session_id:
+                cursor = conn.execute(
+                    """INSERT INTO messages (
+                           session_id, role, content, tool_call_id, tool_calls,
+                           tool_name, effect_disposition, timestamp, token_count,
+                           finish_reason, reasoning, reasoning_content,
+                           reasoning_details, codex_reasoning_items,
+                           codex_message_items, platform_message_id, observed,
+                           active, compacted, api_content, display_kind,
+                           display_metadata
+                       )
+                       SELECT ?, role, content, tool_call_id, tool_calls,
+                           tool_name, effect_disposition, timestamp, token_count,
+                           finish_reason, reasoning, reasoning_content,
+                           reasoning_details, codex_reasoning_items,
+                           codex_message_items, platform_message_id, observed,
+                           1, compacted, api_content, display_kind,
+                           display_metadata
+                       FROM messages WHERE id = ? AND active = 1""",
+                    (session_id, keep_id),
+                )
+                if int(cursor.rowcount) != 1:
+                    raise RuntimeError("Captain staged input disappeared during rehome")
+                keep_id = int(cursor.lastrowid)
+
+            conn.execute(
+                "UPDATE messages SET active = 0 "
+                "WHERE role = 'user' AND active = 1 AND id != ? "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ?",
+                (keep_id, completion_id),
+            )
+            for affected_session_id in sorted(affected_session_ids):
+                conn.execute(
+                    "UPDATE sessions SET message_count = ("
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1"
+                    ") WHERE id = ?",
+                    (affected_session_id, affected_session_id),
+                )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def rollback_staged_captain_input(
+        self,
+        completion_id: str,
+        session_id: str,
+    ) -> int:
+        """Soft-delete profile-wide unpaired inputs, never a committed report."""
+        if not completion_id or not session_id:
+            return 0
+
+        def _do(conn):
+            committed = conn.execute(
+                "SELECT 1 FROM messages "
+                "WHERE role = 'assistant' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ? "
+                "LIMIT 1",
+                (completion_id,),
+            ).fetchone()
+            if committed is not None:
+                return 0
+
+            rows = conn.execute(
+                "SELECT DISTINCT session_id FROM messages "
+                "WHERE role = 'user' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ?",
+                (completion_id,),
+            ).fetchall()
+            cursor = conn.execute(
+                "UPDATE messages SET active = 0 "
+                "WHERE role = 'user' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ?",
+                (completion_id,),
+            )
+            removed = int(cursor.rowcount)
+            if removed:
+                for row in rows:
+                    affected_session_id = str(row["session_id"])
+                    conn.execute(
+                        "UPDATE sessions SET message_count = ("
+                        "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1"
+                        ") WHERE id = ?",
+                        (affected_session_id, affected_session_id),
+                    )
+            return removed
+
+        return int(self._execute_write(_do) or 0)
+
     def rehome_captain_report(
         self,
         completion_id: str,

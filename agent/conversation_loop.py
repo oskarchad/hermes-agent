@@ -7081,12 +7081,34 @@ def run_conversation(
                     # No Hermes tool schema is exposed for Captain synthesis.
                     # A provider may still fabricate a call; reject it before
                     # validation, repair, middleware, hooks, persistence, or
-                    # handler dispatch can observe it. The caller releases the
-                    # durable inbox claim and retries the event later.
+                    # handler dispatch can observe it. Roll back the crash-staged
+                    # synthetic input before the caller releases the durable
+                    # inbox claim. A profile-wide canonical assistant receipt is
+                    # an atomic guard inside SessionDB and is never removed.
                     error = (
                         "Task-only Captain response included an unexpected tool "
                         "call; the report remains retryable."
                     )
+                    _captain_completion_id = (
+                        persist_user_display_metadata.get("captain_completion_id")
+                        if isinstance(persist_user_display_metadata, dict)
+                        else None
+                    )
+                    _session_db = getattr(agent, "_session_db", None)
+                    _captain_retry_safe = True
+                    if _captain_completion_id and _session_db is not None:
+                        try:
+                            _session_db.rollback_staged_captain_input(
+                                _captain_completion_id,
+                                agent.session_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Captain staged-input rollback failed for session=%s",
+                                agent.session_id or "none",
+                                exc_info=True,
+                            )
+                            _captain_retry_safe = False
                     return {
                         "final_response": "",
                         "messages": messages,
@@ -7097,6 +7119,7 @@ def run_conversation(
                         "interrupted": False,
                         "error": error,
                         "session_persisted": False,
+                        "captain_retry_safe": _captain_retry_safe,
                     }
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")

@@ -7526,6 +7526,262 @@ def test_persisted_captain_turn_excludes_unrelated_session_history(
     ]
 
 
+def test_captain_turn_does_not_drive_goal_or_loop_controllers(
+    monkeypatch, tmp_path
+):
+    """A durable Captain success cannot spend or continue unrelated controllers."""
+    import hermes_cli.goals as goals
+    import hermes_cli.loops as loops
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    controller_state = {
+        "goal_turns_used": 7,
+        "goal_judges": 0,
+        "goal_continuations": 0,
+        "loop_awaiting": True,
+        "loop_completions": 0,
+    }
+
+    class _ActiveGoalManager:
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, *_args, **_kwargs):
+            controller_state["goal_turns_used"] += 1
+            controller_state["goal_judges"] += 1
+            controller_state["goal_continuations"] += 1
+            return {
+                "should_continue": True,
+                "continuation_prompt": "ordinary tools-enabled goal continuation",
+            }
+
+    class _AwaitingLoopManager:
+        def __init__(self, **_kwargs):
+            self.state = types.SimpleNamespace(
+                awaiting_response=controller_state["loop_awaiting"]
+            )
+
+        def complete_tick(self, _response):
+            controller_state["loop_awaiting"] = False
+            controller_state["loop_completions"] += 1
+            return {"message": "loop completed"}
+
+    class _CaptainAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            return {
+                "final_response": "Captain report",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "Captain report"},
+                ],
+                "session_persisted": True,
+            }
+
+    monkeypatch.setattr(goals, "GoalManager", _ActiveGoalManager)
+    monkeypatch.setattr(loops, "LoopManager", _AwaitingLoopManager)
+    monkeypatch.setattr(
+        server,
+        "_plan_goal_compression_recovery",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Captain reached compression-goal recovery")
+        ),
+    )
+    turns = []
+    session = _session(
+        session_key="captain-controller-isolation",
+        agent=_CaptainAgent(turns),
+        running=True,
+    )
+    server._sessions["captain-controller-isolation"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "captain-controller-isolation",
+            session,
+            "Captain event",
+            require_persisted=True,
+            completion_id="kanban-report:controller-isolation",
+            turn_purpose="captain_report",
+        ) is True
+    finally:
+        server._sessions.pop("captain-controller-isolation", None)
+
+    assert turns == ["Captain event"]
+    assert controller_state == {
+        "goal_turns_used": 7,
+        "goal_judges": 0,
+        "goal_continuations": 0,
+        "loop_awaiting": True,
+        "loop_completions": 0,
+    }
+
+
+def test_captain_turn_preserves_next_user_and_recovery_controls(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    marker_calls = []
+    restore_calls = []
+    monkeypatch.setattr(
+        server,
+        "record_turn_start",
+        lambda *_args, **_kwargs: marker_calls.append("record"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_retire_turn_marker",
+        lambda *_args, **_kwargs: marker_calls.append("retire"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_restore_agent_model_runtime",
+        lambda *_args, **_kwargs: restore_calls.append("restore"),
+    )
+
+    run_kwargs = {}
+
+    class _CaptainAgent(_RecordingAgent):
+        def run_conversation(
+            self,
+            prompt,
+            persist_user_display_metadata=None,
+            **kwargs,
+        ):
+            run_kwargs.update(kwargs)
+            run_kwargs["persist_user_display_metadata"] = (
+                persist_user_display_metadata
+            )
+            return {
+                "final_response": "Captain report",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "Captain report"},
+                ],
+                "session_persisted": True,
+            }
+
+    once_restore = {"model": "ordinary-model", "provider": "ordinary-provider"}
+    agent = _CaptainAgent([])
+    session = _session(
+        session_key="captain-control-preservation",
+        agent=agent,
+        running=True,
+        one_turn_model_restore=once_restore,
+        _auto_continue_attempt=2,
+        _auto_continue_prompt="original interrupted user prompt",
+        _auto_continue_scheduled=True,
+    )
+    server._sessions["captain-control-preservation"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "captain-control-preservation",
+            session,
+            "Captain event",
+            require_persisted=True,
+            completion_id="kanban-report:control-preservation",
+            turn_purpose="captain_report",
+        ) is True
+    finally:
+        server._sessions.pop("captain-control-preservation", None)
+
+    assert session["one_turn_model_restore"] is once_restore
+    assert session["_auto_continue_attempt"] == 2
+    assert session["_auto_continue_prompt"] == "original interrupted user prompt"
+    assert session["_auto_continue_scheduled"] is True
+    assert run_kwargs["persist_user_display_metadata"] == {
+        "captain_completion_id": "kanban-report:control-preservation"
+    }
+    assert marker_calls == []
+    assert restore_calls == []
+
+
+@pytest.mark.parametrize(
+    ("control_key", "control_value"),
+    [
+        (
+            "one_turn_model_restore",
+            {"model": "ordinary-model", "provider": "ordinary-provider"},
+        ),
+        (
+            "moa_one_shot_restore",
+            {"model": "ordinary-model", "provider": "ordinary-provider"},
+        ),
+    ],
+)
+def test_captain_defers_bot_capability_rebuild_and_preserves_one_shot_runtime(
+    monkeypatch, tmp_path, control_key, control_value
+):
+    """Captain cannot consume a pending Bot Chat rebuild or one-shot model."""
+    from tools import bot_mode_probe
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    observed_models = []
+
+    class _BotAgent(_RecordingAgent):
+        def __init__(self, model):
+            super().__init__([])
+            self.model = model
+            self.provider = "test-provider"
+            self.api_key = "test-key"
+            self.base_url = "https://example.invalid/v1"
+            self.api_mode = "chat_completions"
+            self._session_title_hint = "Bot Chat"
+
+        def switch_model(self, *, new_model, new_provider, **_kwargs):
+            self.model = new_model
+            self.provider = new_provider
+
+        def run_conversation(self, prompt, **_kwargs):
+            observed_models.append((self.model, prompt))
+            return {
+                "final_response": "Captain report",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "Captain report"},
+                ],
+                "session_persisted": True,
+            }
+
+    def _build_agent(*_args, **kwargs):
+        override = kwargs.get("model_override")
+        model = override.get("model") if isinstance(override, dict) else "config-model"
+        return _BotAgent(model)
+
+    active_agent = _BotAgent("pending-one-shot-model")
+    session = _session(
+        session_key="captain-bot-rebuild",
+        agent=active_agent,
+        running=True,
+        bot_caps_seen="old-fingerprint",
+        **{control_key: control_value},
+    )
+    monkeypatch.setattr(bot_mode_probe, "capability_fingerprint", lambda _home: "new-fingerprint")
+    monkeypatch.setattr(server, "_make_agent", _build_agent)
+    server._sessions["captain-bot-rebuild"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "captain-bot-rebuild",
+            session,
+            "Captain event",
+            require_persisted=True,
+            completion_id="kanban-report:bot-rebuild",
+            turn_purpose="captain_report",
+        ) is True
+    finally:
+        server._sessions.pop("captain-bot-rebuild", None)
+
+    assert observed_models == [("pending-one-shot-model", "Captain event")]
+    assert session[control_key] is control_value
+    assert session["agent"].model == "pending-one-shot-model"
+    assert session["bot_caps_seen"] == "old-fingerprint"
+
+
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     monkeypatch, tmp_path
 ):

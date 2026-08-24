@@ -1012,10 +1012,12 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
 
     attempts: list[str] = []
     completion_ids: list[str | None] = []
+    turn_purposes: list[str | None] = []
 
     def submit(_rid, _sid, _session, text, **kwargs):
         attempts.append(text)
         completion_ids.append(kwargs.get("completion_id"))
+        turn_purposes.append(kwargs.get("turn_purpose"))
         if len(attempts) == 1:
             return False
         kwargs["on_terminal"](True)
@@ -1043,6 +1045,7 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     assert attempts[1] == attempts[0]
     assert completion_ids[0]
     assert completion_ids[1] == completion_ids[0]
+    assert turn_purposes == ["captain_report", "captain_report"]
     assert _inbox_states() == {"acked": 1}
 
     # Turn finishes; a later idle poll must not replay the acked report.
@@ -1051,6 +1054,42 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     run_once()
     assert len(attempts) == 2
     assert _inbox_states() == {"acked": 1}
+
+
+def test_poller_keeps_lease_when_failed_turn_could_not_rollback_input(monkeypatch):
+    from tools.process_registry import process_registry
+
+    loop_key = "captain-rollback-failed"
+    session = {
+        "session_key": loop_key,
+        "history_lock": threading.Lock(),
+        "running": False,
+    }
+    profile = _profile_for(session)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-rollback", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="rollback failed")
+    finally:
+        conn.close()
+
+    terminal_values = []
+
+    def submit(_rid, _sid, _session, _text, **kwargs):
+        terminal_values.append(None)
+        kwargs["on_terminal"](None)
+        return True
+
+    monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+
+    server._notification_poller_loop(_StopAfterOnePoll(), "sid-rollback", session)
+
+    assert terminal_values == [None]
+    assert _inbox_states() == {"leased": 1}
 
 
 def test_poller_defers_captain_claim_for_codex_app_server(monkeypatch):

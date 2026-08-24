@@ -5729,21 +5729,35 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
 
     # Capability surface changed — rebuild the agent in place. Same
     # session_id/key, so the DB-backed history and (epoch-refreshed) system
-    # prompt carry over; only tool definitions and prompt bytes change.
+    # prompt carry over; only tool definitions and prompt bytes change. Preserve
+    # the exact live runtime as well: /model --once and /moa install a transient
+    # model without pinning ``session['model_override']``, and rebuilding from
+    # config would silently spend that control before the intended user turn.
     try:
+        live_runtime = _snapshot_agent_model_runtime(agent)
         tokens = _set_session_context(sid, cwd=_session_cwd(session))
         try:
             new_agent = _make_agent(
                 sid,
                 session["session_key"],
                 session_id=session["session_key"],
+                model_override=live_runtime,
                 platform_override=_session_source(session),
             )
         finally:
             _clear_session_context(tokens)
         new_agent._session_title_hint = "Bot Chat"
         session["agent"] = new_agent
-        session["config_model_seen"] = _config_model_target()
+        config_target = _config_model_target()
+        if (
+            config_target[0]
+            and live_runtime.get("model") == config_target[0]
+            and (
+                not config_target[1]
+                or live_runtime.get("provider") == config_target[1]
+            )
+        ):
+            session["config_model_seen"] = config_target
         _emit(
             "notice",
             sid,
@@ -11317,6 +11331,7 @@ def _settle_kanban_notification_claims(
 
 
 _CAPTAIN_COMPLETION_METADATA_KEY = "captain_completion_id"
+_CAPTAIN_TURN_PURPOSE = "captain_report"
 
 
 def _captain_completion_id(
@@ -11599,13 +11614,16 @@ def _notification_poller_loop(
                             _kanban_claims
                         )
 
-                        def _settle_after_terminal(succeeded: bool) -> None:
+                        def _settle_after_terminal(succeeded: Optional[bool]) -> None:
                             with _settled_lock:
                                 if _settled.is_set():
                                     return
                                 try:
                                     _stop_captain_lease_renewer(_lease_renewer)
                                 except Exception:
+                                    if succeeded is None:
+                                        _settled.set()
+                                        raise
                                     try:
                                         _settle_kanban_notification_claims(
                                             _kanban_claims, accepted=False
@@ -11613,6 +11631,13 @@ def _notification_poller_loop(
                                     finally:
                                         _settled.set()
                                     raise
+                                if succeeded is None:
+                                    # Rollback of the crash-staged input failed.
+                                    # Leave the claim leased rather than making a
+                                    # dirty retry immediately eligible; normal
+                                    # lease expiry provides the bounded retry.
+                                    _settled.set()
+                                    return
                                 try:
                                     _settle_kanban_notification_claims(
                                         _kanban_claims, accepted=bool(succeeded)
@@ -11634,6 +11659,7 @@ def _notification_poller_loop(
                                 on_terminal=_settle_after_terminal,
                                 completion_id=completion_id,
                                 require_persisted=True,
+                                turn_purpose=_CAPTAIN_TURN_PURPOSE,
                             )
                             if accepted is False:
                                 raise RuntimeError("synthetic turn was not accepted")
@@ -12151,10 +12177,12 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
-    on_terminal: Optional[Callable[[bool], None]] = None,
+    on_terminal: Optional[Callable[[Optional[bool]], None]] = None,
     completion_id: str | None = None,
     require_persisted: bool = False,
+    turn_purpose: str = "ordinary",
 ) -> bool:
+    captain_turn = turn_purpose == _CAPTAIN_TURN_PURPOSE
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -12225,13 +12253,21 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
-        one_turn_restore = session.pop("one_turn_model_restore", None)
+        # Captain is a task-only background report, not the user's next turn.
+        # Leave every one-shot/recovery controller exactly where the user turn
+        # expects it; the synthetic turn neither consumes nor retires them.
+        one_turn_restore = (
+            None
+            if captain_turn
+            else session.pop("one_turn_model_restore", None)
+        )
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
         turn_succeeded = False
         terminal_callback_called = False
         terminal_callback_committed = False
+        terminal_settlement: Optional[bool] = False
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -12240,9 +12276,21 @@ def _run_prompt_submit(
         # session_key mid-turn, so remember the key we wrote under.
         marker_home = _session_home(session)
         marker_key = str(session.get("session_key") or "")
-        marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
-        marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
+        marker_attempt = (
+            0
+            if captain_turn
+            else int(session.pop("_auto_continue_attempt", 0) or 0)
+        )
+        marker_text = (
+            text
+            if captain_turn
+            else session.pop("_auto_continue_prompt", None) or text
+        )
+        if (
+            not captain_turn
+            and isinstance(marker_text, str)
+            and marker_text.strip()
+        ):
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
             from tools.approval import (
@@ -12273,7 +12321,7 @@ def _run_prompt_submit(
             # once-override back to the config model before the turn runs
             # (#29923 review defect). Any config.yaml change is adopted on
             # the NEXT turn, after the finally-restore below.
-            if not one_turn_restore:
+            if not captain_turn and not one_turn_restore:
                 # A model picked mid-turn was queued (not applied in-place) —
                 # apply it now, on the turn thread before the first model call,
                 # so this turn runs on the model the user chose. Runs before the
@@ -12282,8 +12330,11 @@ def _run_prompt_submit(
                 _sync_agent_model_with_config(sid, session)
             # Bot Chat capability sync — adopt Settings→Capabilities edits
             # (skills/toolsets/MCP/SOUL) into the eternal bot session before
-            # the turn runs. No-op for every other session shape.
-            _sync_bot_capabilities(sid, session)
+            # an ordinary turn runs. Captain is deliberately excluded: its
+            # minimal no-tools prompt cannot use the refreshed surface, and a
+            # rebuild here would mutate controls reserved for the next user.
+            if not captain_turn:
+                _sync_bot_capabilities(sid, session)
             agent = session["agent"]
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.
@@ -12540,6 +12591,14 @@ def _run_prompt_submit(
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
             if (
+                captain_turn
+                and completion_id
+                and "persist_user_display_metadata" in _run_params
+            ):
+                run_kwargs["persist_user_display_metadata"] = {
+                    _CAPTAIN_COMPLETION_METADATA_KEY: completion_id,
+                }
+            if (
                 require_persisted
                 and completion_id
                 and "persist_assistant_display_metadata" in _run_params
@@ -12591,7 +12650,7 @@ def _run_prompt_submit(
                             if display_metadata:
                                 message["display_metadata"] = display_metadata
                             break
-            if "moa_one_shot_restore" in session:
+            if not captain_turn and "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
                 # The one-shot did a real in-place agent.switch_model() to MoA
@@ -12767,6 +12826,16 @@ def _run_prompt_submit(
                     result["error"] = raw
                     result["failed"] = True
             turn_succeeded = status == "complete"
+            terminal_settlement = turn_succeeded
+            if (
+                captain_turn
+                and isinstance(result, dict)
+                and result.get("captain_retry_safe") is False
+            ):
+                # The staged durable input may still be active. Keep the inbox
+                # row fenced until its lease expires instead of releasing an
+                # immediate retry that would race unresolved cleanup.
+                terminal_settlement = None
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if completion_id:
@@ -12829,8 +12898,8 @@ def _run_prompt_submit(
                     payload["error_surface"] = _error_surface
             if on_terminal is not None:
                 terminal_callback_called = True
-                on_terminal(turn_succeeded)
-                terminal_callback_committed = turn_succeeded
+                on_terminal(terminal_settlement)
+                terminal_callback_committed = terminal_settlement is True
             if require_persisted and turn_succeeded:
                 for event_kind, event_payload in _deferred_assistant_events:
                     if event_kind == "delta":
@@ -12843,7 +12912,8 @@ def _run_prompt_submit(
                     else:
                         _emit("message.interim", sid, event_payload)
                 _deferred_assistant_events.clear()
-            _retire_turn_marker(session, marker_key)
+            if not captain_turn:
+                _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -12857,32 +12927,35 @@ def _run_prompt_submit(
             compression_exhausted = bool(
                 isinstance(result, dict) and result.get("compression_exhausted")
             )
-            try:
-                recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
-                    session,
-                    result,
-                    status=status,
-                    raw=raw,
-                )
-                if recovery_notice:
-                    _emit(
-                        "status.update",
-                        sid,
-                        {"kind": "goal", "text": recovery_notice},
+            if not captain_turn:
+                try:
+                    recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
+                        session,
+                        result,
+                        status=status,
+                        raw=raw,
                     )
-                if recovery_prompt:
-                    goal_followup = recovery_prompt
-            except Exception as _goal_recovery_exc:
-                print(
-                    f"[tui_gateway] goal compression recovery failed: "
-                    f"{type(_goal_recovery_exc).__name__}: {_goal_recovery_exc}",
-                    file=sys.stderr,
-                )
+                    if recovery_notice:
+                        _emit(
+                            "status.update",
+                            sid,
+                            {"kind": "goal", "text": recovery_notice},
+                        )
+                    if recovery_prompt:
+                        goal_followup = recovery_prompt
+                except Exception as _goal_recovery_exc:
+                    print(
+                        f"[tui_gateway] goal compression recovery failed: "
+                        f"{type(_goal_recovery_exc).__name__}: {_goal_recovery_exc}",
+                        file=sys.stderr,
+                    )
 
             # Compression failures are never judge input: the error text is
             # not work toward the goal, and evaluating it would spend a turn.
-            if not compression_exhausted and _is_successful_goal_turn(
-                result, status, raw
+            if (
+                not captain_turn
+                and not compression_exhausted
+                and _is_successful_goal_turn(result, status, raw)
             ):
                 try:
                     from hermes_cli.goals import GoalManager
@@ -12931,7 +13004,7 @@ def _run_prompt_submit(
             # If the turn that just finished was a /loop wakeup (fired by
             # the notification poller), evaluate it: LOOP_COMPLETE marker,
             # --until judge, --times / max_ticks caps, next-tick schedule.
-            if status == "complete":
+            if not captain_turn and status == "complete":
                 try:
                     from hermes_cli.loops import LoopManager
 
@@ -13141,13 +13214,15 @@ def _run_prompt_submit(
                 time.monotonic() - _turn_started_monotonic,
             )
             # Backstop for turns that never reached a terminal frame (the
-            # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
-            session.pop("_auto_continue_scheduled", None)
+            # frame paths retire the marker as they emit). Captain reports do
+            # not own the user's pending recovery marker or scheduled state.
+            if not captain_turn:
+                _retire_turn_marker(session, marker_key)
+                session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
             if on_terminal is not None and not terminal_callback_called:
                 try:
-                    on_terminal(turn_succeeded)
+                    on_terminal(terminal_settlement)
                 except Exception:
                     logger.exception("TUI turn terminal callback failed")
 
