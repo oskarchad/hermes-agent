@@ -773,10 +773,50 @@ class TestWireInvariant:
         assert retry_texts == first_texts
         assert server._captain_completion_id(retry_claims, retry_texts) == completion_id
 
-        second_agent = make_agent(fallback_sid)
+        # A transient failure while authoritatively reusing the profile-wide
+        # source residue must stop before provider execution or persistence.
+        # The claim is then safely released and the same event can retry.
+        requests_before_reuse_error = len(_chat_requests(handler))
+        failed_retry_agent = make_agent(fallback_sid)
         handler.response_queue.append(_text_resp("Captain retry settled"))
-        second = second_agent.run_conversation(
-            retry_texts[0],
+        with patch.object(
+            db,
+            "reuse_staged_captain_input",
+            side_effect=RuntimeError("transient staged reuse lock"),
+        ), pytest.raises(RuntimeError, match="transient staged reuse lock"):
+            failed_retry_agent.run_conversation(
+                retry_texts[0],
+                conversation_history=[],
+                task_id="captain-retry-reuse-error",
+                task_only_context=True,
+                persist_user_display_kind="kanban_report",
+                persist_user_display_metadata=metadata,
+                persist_assistant_display_metadata=metadata,
+            )
+        assert len(_chat_requests(handler)) == requests_before_reuse_error
+        assert db.get_messages_as_conversation(fallback_sid) == []
+        assert [message["role"] for message in db.get_messages_as_conversation(sid)] == [
+            "user"
+        ]
+        server._settle_kanban_notification_claims(retry_claims, accepted=False)
+        conn = kb.connect()
+        try:
+            assert conn.execute(
+                "SELECT state FROM kanban_captain_inbox WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0] == "pending"
+        finally:
+            conn.close()
+
+        final_claims = []
+        final_texts = server._collect_kanban_notifications(
+            {"session_key": fallback_sid}, claim_records=final_claims
+        )
+        assert final_texts == first_texts
+        assert server._captain_completion_id(final_claims, final_texts) == completion_id
+
+        second = failed_retry_agent.run_conversation(
+            final_texts[0],
             conversation_history=[],
             task_id="captain-retry-second",
             task_only_context=True,
@@ -785,7 +825,7 @@ class TestWireInvariant:
             persist_assistant_display_metadata=metadata,
         )
         assert second["session_persisted"] is True
-        server._settle_kanban_notification_claims(retry_claims, accepted=True)
+        server._settle_kanban_notification_claims(final_claims, accepted=True)
 
         assert db.get_messages_as_conversation(sid) == []
         reloaded = db.get_messages_as_conversation(fallback_sid)

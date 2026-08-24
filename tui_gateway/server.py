@@ -9077,7 +9077,12 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 
 def _emit_terminal_turn_error(
-    sid: str, session: dict, error: Any, error_surface: Optional[dict] = None
+    sid: str,
+    session: dict,
+    error: Any,
+    error_surface: Optional[dict] = None,
+    *,
+    retain_inflight: bool = True,
 ) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
@@ -9107,10 +9112,17 @@ def _emit_terminal_turn_error(
         except Exception:
             error_surface = None
     with session["history_lock"]:
-        _fail_inflight_turn(session, error, error_surface=error_surface)
-        turn = session.get("inflight_turn") or {}
-        message = str(turn.get("error") or "turn failed")
-        partial = str(turn.get("assistant") or "")
+        if retain_inflight:
+            _fail_inflight_turn(session, error, error_surface=error_surface)
+            turn = session.get("inflight_turn") or {}
+            message = str(turn.get("error") or "turn failed")
+            partial = str(turn.get("assistant") or "")
+        else:
+            # Captain is a background report, not the user's next turn. Its
+            # failure frame must not overwrite the ordinary retained snapshot
+            # that session.resume still owes to the user.
+            message = str(error) or type(error).__name__
+            partial = ""
         cols = int(session.get("cols", 80))
     text = partial or f"Error: {message}"
     payload = {
@@ -9130,7 +9142,8 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    _retire_turn_marker(session)
+    if retain_inflight:
+        _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
 
@@ -12202,11 +12215,12 @@ def _run_prompt_submit(
             session["attached_images"] = []
         else:
             images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
+        if not captain_turn:
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new ordinary turn starts — replace it, never append.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -12875,20 +12889,21 @@ def _run_prompt_submit(
                     )
                 except Exception:
                     _error_surface = None
-            with session["history_lock"]:
-                if status == "error":
-                    # Returned-error result (provider 4xx, budget, etc.): retain
-                    # the failed turn for resume replay instead of clearing it.
-                    # If this terminal frame is lost to a disconnect, resume's
-                    # inflight payload is the only carrier of the failure.
-                    _fail_inflight_turn(
-                        session,
-                        result.get("error") if isinstance(result, dict) else raw,
-                        error_surface=_error_surface,
-                    )
-                    turn_error_retained = True
-                else:
-                    _clear_inflight_turn(session)
+            if not captain_turn:
+                with session["history_lock"]:
+                    if status == "error":
+                        # Returned-error result (provider 4xx, budget, etc.): retain
+                        # the failed turn for resume replay instead of clearing it.
+                        # If this terminal frame is lost to a disconnect, resume's
+                        # inflight payload is the only carrier of the failure.
+                        _fail_inflight_turn(
+                            session,
+                            result.get("error") if isinstance(result, dict) else raw,
+                            error_surface=_error_surface,
+                        )
+                        turn_error_retained = True
+                    else:
+                        _clear_inflight_turn(session)
             if status == "error":
                 payload["error"] = str(
                     (result.get("error") if isinstance(result, dict) else "") or raw
@@ -12903,8 +12918,9 @@ def _run_prompt_submit(
             if require_persisted and turn_succeeded:
                 for event_kind, event_payload in _deferred_assistant_events:
                     if event_kind == "delta":
-                        with session["history_lock"]:
-                            _append_inflight_delta(session, event_payload)
+                        if not captain_turn:
+                            with session["history_lock"]:
+                                _append_inflight_delta(session, event_payload)
                         _publish_stream_delta(event_payload)
                     elif event_kind == "callback":
                         callback, callback_args, callback_kwargs = event_payload
@@ -13116,8 +13132,13 @@ def _run_prompt_submit(
                     # Close the turn with the same terminal error frame shape as
                     # the returned-error path (uniform client handling), retaining
                     # the failed turn for resume replay.
-                    _emit_terminal_turn_error(sid, session, e)
-                    turn_error_retained = True
+                    _emit_terminal_turn_error(
+                        sid,
+                        session,
+                        e,
+                        retain_inflight=not captain_turn,
+                    )
+                    turn_error_retained = not captain_turn
                 except Exception as emit_exc:
                     print(
                         f"[gateway-turn] terminal error emit failed: "
@@ -13185,7 +13206,7 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
-                if not turn_error_retained:
+                if not captain_turn and not turn_error_retained:
                     _clear_inflight_turn(session)
             # Closing bookend of the "tui prompt accepted" record above —
             # fires on every path (success, returned error, exception,

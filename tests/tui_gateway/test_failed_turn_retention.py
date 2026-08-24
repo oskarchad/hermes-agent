@@ -21,6 +21,7 @@ Contract pinned here:
 
 from __future__ import annotations
 
+import copy
 import threading
 import types
 
@@ -247,6 +248,50 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
     assert completes[0]["status"] == "complete"
     assert "error" not in completes[0]
     assert server._inflight_snapshot(session) is None
+
+
+@pytest.mark.parametrize("outcome", ["success", "returned_error", "exception"])
+def test_captain_turn_preserves_exact_retained_ordinary_failure(
+    outcome, emits, turn_env
+):
+    def _run_captain(*_args, **_kwargs):
+        if outcome == "success":
+            return {
+                "final_response": "Captain report",
+                "session_persisted": True,
+            }
+        if outcome == "returned_error":
+            return {
+                "final_response": "",
+                "error": "Captain provider failed",
+                "failed": True,
+            }
+        raise RuntimeError("Captain dispatch failed")
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=_run_captain,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "ordinary failed prompt")
+    server._append_inflight_delta(session, "ordinary partial answer")
+    server._fail_inflight_turn(session, "ordinary provider failed")
+    retained = session["inflight_turn"]
+    expected = copy.deepcopy(retained)
+
+    assert server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "Captain task report prompt",
+        completion_id="kanban-report:retained-inflight",
+        require_persisted=True,
+        turn_purpose=server._CAPTAIN_TURN_PURPOSE,
+    ) is True
+
+    assert session["inflight_turn"] is retained
+    assert session["inflight_turn"] == expected
 
 
 # ── Exception path ─────────────────────────────────────────────────────

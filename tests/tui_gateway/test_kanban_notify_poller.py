@@ -269,9 +269,10 @@ class TestFormatKanbanEventText:
 class TestNotificationPollerLoopKanbanWiring:
     """Drive a real TUI subscription through ``_notification_poller_loop``.
 
-    Covers the wiring above ``_collect_kanban_notifications``: status.update
-    emission, agent-turn dispatch when the session is idle, durable deferral
-    while it is busy, and cursor rewind when dispatch rejects a claimed turn.
+    Covers the wiring above ``_collect_kanban_notifications``: no assistant
+    completion before settlement, one stable completion after settlement,
+    agent-turn dispatch when the session is idle, durable deferral while it is
+    busy, and cursor rewind when dispatch rejects a claimed turn.
     """
 
     def _start_poller(self, session: dict, monkeypatch):
@@ -284,10 +285,25 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        def submit_turn(_rid, _sid, _session, text, *, on_terminal=None, **_kwargs):
+        def submit_turn(
+            _rid,
+            _sid,
+            _session,
+            text,
+            *,
+            on_terminal=None,
+            completion_id=None,
+            **_kwargs,
+        ):
             submits.append(text)
+            assert not any(event == "message.complete" for event, _ in emits)
             if on_terminal is not None:
                 on_terminal(True)
+            server._emit(
+                "message.complete",
+                _sid,
+                {"id": completion_id, "status": "complete", "text": "settled"},
+            )
             return True
 
         monkeypatch.setattr(server, "_run_prompt_submit", submit_turn)
@@ -348,16 +364,30 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        def submit_turn(rid, sid, current_session, text, *, on_terminal=None, **_kwargs):
+        def submit_turn(
+            rid,
+            sid,
+            current_session,
+            text,
+            *,
+            on_terminal=None,
+            completion_id=None,
+            **_kwargs,
+        ):
             accepted = submit(rid, sid, current_session, text)
             if accepted is not False and on_terminal is not None:
                 on_terminal(True)
+                server._emit(
+                    "message.complete",
+                    sid,
+                    {"id": completion_id, "status": "complete", "text": "settled"},
+                )
             return accepted
 
         monkeypatch.setattr(server, "_run_prompt_submit", submit_turn)
         server._notification_poller_loop(_StopAfterOnePoll(), "sid-poller-test", session)
 
-    def test_idle_session_gets_status_update_and_agent_turn(self, monkeypatch):
+    def test_idle_session_gets_one_post_settlement_completion(self, monkeypatch):
         tid = _create_subscribed_task()
         _complete(tid, summary="poller e2e done")
         session = self._poller_session(running=False)
@@ -369,9 +399,11 @@ class TestNotificationPollerLoopKanbanWiring:
             stop.set()
             thread.join(timeout=5)
 
-        status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
-        assert any(tid in t for t in status_texts), status_texts
+        assert not [p for e, p in emits if e == "status.update"]
         assert any(e == "message.start" for e, _ in emits)
+        completions = [p for e, p in emits if e == "message.complete"]
+        assert len(completions) == 1
+        assert completions[0]["id"]
         assert any(tid in text for text in submits), submits
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
@@ -449,8 +481,10 @@ class TestNotificationPollerLoopKanbanWiring:
         assert len(submits) == 1
         assert tid in submits[0]
         assert _sub_rows(tid)[0]["last_event_id"] > initial_cursor
-        status_updates = [payload for event, payload in emits if event == "status.update"]
-        assert len(status_updates) == 1
+        assert not [payload for event, payload in emits if event == "status.update"]
+        completions = [payload for event, payload in emits if event == "message.complete"]
+        assert len(completions) == 1
+        assert completions[0]["id"]
 
         with restarted_session["history_lock"]:
             restarted_session["running"] = False
@@ -461,6 +495,9 @@ class TestNotificationPollerLoopKanbanWiring:
             submit=lambda _rid, _sid, _session, text: submits.append(text),
         )
         assert len(submits) == 1
+        assert [
+            payload["id"] for event, payload in emits if event == "message.complete"
+        ] == [completions[0]["id"]]
 
     def test_dispatch_failure_rewinds_cursor_for_one_retry(self, monkeypatch):
         tid = _create_subscribed_task()

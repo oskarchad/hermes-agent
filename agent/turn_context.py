@@ -764,6 +764,11 @@ def build_turn_context(
                     agent.session_id or "none",
                     exc_info=True,
                 )
+                # Profile-wide residue reuse is the authoritative idempotency
+                # gate for Captain retries. Continuing after a lock/write error
+                # can persist and send a second pair while the source residue
+                # remains active, so fail this turn before provider execution.
+                raise
 
     # Track user turns for memory flush and periodic nudge logic.
     if not task_only_context:
