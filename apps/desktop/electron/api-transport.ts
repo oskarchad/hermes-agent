@@ -36,6 +36,9 @@
 import http from 'node:http'
 import https from 'node:https'
 
+import { attachPrematureResponseGuard } from './backend-health'
+import { DEFAULT_FETCH_TIMEOUT_MS, resolveTimeoutMs } from './hardening'
+
 // JSON pool: many small concurrent calls (session lists, config, prompts).
 const HTTP_JSON_AGENT = new http.Agent({ keepAlive: true, maxSockets: 50 })
 const HTTPS_JSON_AGENT = new https.Agent({ keepAlive: true, maxSockets: 50 })
@@ -167,7 +170,145 @@ async function withRetry(makeAttempt, options: any = {}) {
   throw lastError
 }
 
+interface PublicJsonRequestOptions {
+  body?: unknown
+  headers?: Record<string, string>
+  method?: string
+  timeoutMs?: number
+}
+
+type RemoteHeadersResolver = (url: string) => Record<string, string>
+
+/**
+ * Build the credential-free JSON transport used by the Electron main process.
+ * The injected resolver keeps connection-specific header authority in main.ts
+ * while making the exact HTTP path executable without booting Electron.
+ */
+function createPublicJsonTransport(headersForRequest: RemoteHeadersResolver = () => ({})) {
+  return function fetchPublicJson(url: string, options: PublicJsonRequestOptions = {}) {
+    return withRetry(
+      (requestState: any) =>
+        new Promise((resolve, reject) => {
+          const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
+          let settled = false
+
+          let cleanupResponseGuard = () => {}
+
+          const resolveOnce = (value: unknown) => {
+            if (settled) {
+              return
+            }
+
+            settled = true
+            cleanupResponseGuard()
+            resolve(value)
+          }
+
+          const rejectOnce = (error: Error) => {
+            if (settled) {
+              return
+            }
+
+            settled = true
+            cleanupResponseGuard()
+            reject(error)
+          }
+
+          let parsed
+
+          try {
+            parsed = new URL(url)
+          } catch (error: any) {
+            rejectOnce(new Error(`Invalid URL: ${error.message}`))
+
+            return
+          }
+
+          const client = parsed.protocol === 'https:' ? https : http
+          const agent = jsonAgentFor(parsed.protocol)
+          const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            rejectOnce(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+
+            return
+          }
+
+          const req = client.request(
+            parsed,
+            {
+              agent,
+              method: options.method || 'GET',
+              headers: {
+                ...headersForRequest(url),
+                ...(options.headers || {}),
+                'Content-Type': 'application/json',
+                ...(body ? { 'Content-Length': String(body.length) } : {})
+              }
+            },
+            res => {
+              const chunks: Buffer[] = []
+              cleanupResponseGuard = attachPrematureResponseGuard(res, rejectOnce, url)
+              res.once('error', rejectOnce)
+              res.on('data', chunk => chunks.push(chunk))
+              res.once('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8')
+
+                if ((res.statusCode || 500) >= 400) {
+                  rejectOnce(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+
+                  return
+                }
+
+                if (!text) {
+                  resolveOnce(null)
+
+                  return
+                }
+
+                const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
+                const contentType = String(res.headers['content-type'] || '')
+
+                if (looksHtml || contentType.includes('text/html')) {
+                  rejectOnce(
+                    new Error(
+                      `Expected JSON from ${url} but got HTML (status ${res.statusCode}). ` +
+                        'The endpoint is likely missing on the Hermes backend.'
+                    )
+                  )
+
+                  return
+                }
+
+                try {
+                  resolveOnce(JSON.parse(text))
+                } catch {
+                  rejectOnce(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
+                }
+              })
+            }
+          )
+
+          req.once('error', rejectOnce)
+          req.setTimeout(timeoutMs, () => {
+            req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+          })
+
+          requestState.bodySent = true
+
+          if (body) {
+            req.write(body)
+          }
+
+          req.end()
+        }),
+      { method: options.method || 'GET' }
+    )
+  }
+}
+
 export {
+  createPublicJsonTransport,
   destroyKeepaliveAgents,
   downloadAgentFor,
   isIdempotentMethod,

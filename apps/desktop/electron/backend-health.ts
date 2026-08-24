@@ -13,26 +13,45 @@ type FetchJson = (url: string, token?: string | null, options?: { timeoutMs?: nu
 interface ResponseLifecycle {
   complete: boolean
   once(event: 'aborted' | 'close', listener: () => void): unknown
+  removeListener(event: 'aborted' | 'close', listener: () => void): unknown
 }
 
 export function attachPrematureResponseGuard(
   response: ResponseLifecycle,
   reject: (error: Error) => void,
   url: string
-): void {
-  let rejected = false
+): () => void {
+  let active = true
 
-  const rejectIfIncomplete = () => {
-    if (rejected || response.complete) {
+  const cleanup = () => {
+    if (!active) {
       return
     }
 
-    rejected = true
+    active = false
+    response.removeListener('aborted', rejectIfIncomplete)
+    response.removeListener('close', rejectIfIncomplete)
+  }
+
+  const rejectIfIncomplete = () => {
+    if (!active) {
+      return
+    }
+
+    if (response.complete) {
+      cleanup()
+
+      return
+    }
+
+    cleanup()
     reject(new Error(`Connection to ${url} closed before the response completed.`))
   }
 
   response.once('aborted', rejectIfIncomplete)
   response.once('close', rejectIfIncomplete)
+
+  return cleanup
 }
 
 export interface HermesReadyOptions {

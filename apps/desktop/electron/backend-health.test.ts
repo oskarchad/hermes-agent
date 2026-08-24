@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import http from 'node:http'
+import type { AddressInfo } from 'node:net'
 
 import { test } from 'vitest'
 
+import { createPublicJsonTransport } from './api-transport'
 import {
   attachPrematureResponseGuard,
   DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
@@ -19,16 +22,147 @@ import {
 
 const GATE_401 = '401: {"error":"unauthenticated","detail":"Unauthorized","reason":"no_cookie","login_url":"/login"}'
 
+function listen(server: http.Server): Promise<string> {
+  return new Promise(resolve => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve(`http://127.0.0.1:${(server.address() as AddressInfo).port}`)
+    })
+  })
+}
+
+function closeServer(server: http.Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close(error => {
+      if (error) {
+        reject(error)
+
+        return
+      }
+
+      resolve()
+    })
+    server.closeAllConnections()
+  })
+}
+
+function withDeadline<T>(promise: Promise<T>, timeoutMs = 500): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('operation remained pending')), timeoutMs)
+
+    promise.then(
+      value => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      error => {
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+}
+
+test('public JSON transport settles a complete response normally', async () => {
+  const server = http.createServer((_req, res) => {
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ ok: true }))
+  })
+
+  const baseUrl = await listen(server)
+
+  try {
+    const fetchPublicJson = createPublicJsonTransport()
+
+    assert.deepEqual(await fetchPublicJson(`${baseUrl}/api/health`), { ok: true })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('public JSON transport rejects a real partial response exactly once', async () => {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' })
+    res.write('{"ok":')
+    setImmediate(() => res.destroy())
+  })
+
+  const baseUrl = await listen(server)
+  const fetchPublicJson = createPublicJsonTransport()
+  const request = fetchPublicJson(`${baseUrl}/api/health`)
+  let settlements = 0
+
+  void request.then(
+    () => {
+      settlements += 1
+    },
+    () => {
+      settlements += 1
+    }
+  )
+
+  try {
+    await assert.rejects(withDeadline(request), /closed before the response completed/i)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(settlements, 1)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('readiness retries the production public transport after a partial response', async () => {
+  let hits = 0
+
+  const server = http.createServer((_req, res) => {
+    hits += 1
+
+    if (hits === 1) {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' })
+      res.write('{"ok":')
+      setImmediate(() => res.destroy())
+
+      return
+    }
+
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ ok: true }))
+  })
+
+  const baseUrl = await listen(server)
+  const fetchPublicJson = createPublicJsonTransport()
+
+  try {
+    await withDeadline(
+      waitForHermesReady(baseUrl, {
+        fetchPublicJson,
+        fetchJson: async () => {
+          throw new Error('legacy status fallback should not be used')
+        },
+        sleep: async () => {},
+        timeoutMs: 2_000,
+        pollMs: 0
+      })
+    )
+    assert.equal(hits, 2)
+  } finally {
+    await closeServer(server)
+  }
+})
+
 test('rejects an HTTP probe whose response closes before completion', () => {
   const response = Object.assign(new EventEmitter(), { complete: false })
-  let failure: Error | null = null
+  let failures = 0
 
-  attachPrematureResponseGuard(response, error => {
-    failure = error
+  attachPrematureResponseGuard(response, () => {
+    failures += 1
   }, 'http://127.0.0.1:9119/api/health')
+  response.emit('aborted')
+
+  assert.equal(failures, 1)
+  assert.equal(response.listenerCount('aborted'), 0)
+  assert.equal(response.listenerCount('close'), 0)
   response.emit('close')
 
-  assert.match(failure?.message || '', /closed before the response completed/i)
+  assert.equal(failures, 1)
 })
 
 test('does not reject a fully completed HTTP response when its socket closes', () => {
@@ -41,6 +175,8 @@ test('does not reject a fully completed HTTP response when its socket closes', (
   response.emit('close')
 
   assert.equal(rejected, false)
+  assert.equal(response.listenerCount('aborted'), 0)
+  assert.equal(response.listenerCount('close'), 0)
 })
 
 test('uses lightweight /api/health for current backends', async () => {
