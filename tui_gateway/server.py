@@ -11504,8 +11504,18 @@ def _notification_poller_loop(
             _kanban_claims: list[dict] = []
             _kanban_texts: list[str] = []
             _kb_exc = None
+            _captain_runtime_deferred = (
+                getattr(session.get("agent"), "api_mode", "")
+                == "codex_app_server"
+            )
             with session["history_lock"]:
-                if not session.get("running"):
+                if _captain_runtime_deferred:
+                    # The Codex app-server owns a persistent external thread;
+                    # Captain's bounded task-only synthesis cannot safely run
+                    # there. Do not lease the durable row at all. A later
+                    # supported session/runtime can claim the same pending event.
+                    pass
+                elif not session.get("running"):
                     # Hold the lock through the DB claim. A concurrent user
                     # submit waits here instead of observing a transient busy
                     # state on empty polls; when events exist, running=True is
@@ -12503,9 +12513,9 @@ def _run_prompt_submit(
 
             run_kwargs = {
                 # Captain generation is a bounded task/event report, not a turn
-                # in the user's active conversation. The agent still supplies
-                # its approved static system/persona prompt, but no ordinary
-                # session messages cross this model boundary.
+                # in the user's active conversation. The agent supplies a
+                # dedicated minimal Captain prompt, and no ordinary session
+                # prompt or messages cross this model boundary.
                 "conversation_history": [] if require_persisted else list(history),
                 "stream_callback": _stream,
                 "persist_user_message": (

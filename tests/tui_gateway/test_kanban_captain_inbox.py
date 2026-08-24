@@ -1053,6 +1053,45 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     assert _inbox_states() == {"acked": 1}
 
 
+def test_poller_defers_captain_claim_for_codex_app_server(monkeypatch):
+    """Unsupported Codex runtime leaves the durable report retryable."""
+    from tools.process_registry import process_registry
+
+    loop_key = "captain-codex-deferred"
+    session = {
+        "session_key": loop_key,
+        "history_lock": threading.Lock(),
+        "running": False,
+        "agent": SimpleNamespace(api_mode="codex_app_server"),
+    }
+    profile = _profile_for(session)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="cap-codex", assignee="worker")
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.complete_task(conn, tid, summary="retry on supported runtime")
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
+    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    submit_calls = []
+
+    def submit(*args, **kwargs):
+        submit_calls.append((args, kwargs))
+        raise AssertionError("Captain turn must be deferred")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+
+    server._notification_poller_loop(_StopAfterOnePoll(), "sid-codex", session)
+
+    assert submit_calls == []
+    assert _inbox_states() == {"pending": 1}
+    assert session["running"] is False
+
+
 def test_captain_completion_identity_namespaces_board_local_delivery_ids():
     board_a = [{"board": "alpha", "deliveries": [{"id": "7"}]}]
     board_b = [{"board": "beta", "deliveries": [{"id": "7"}]}]

@@ -1872,6 +1872,29 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # The Codex app-server runtime owns a persistent external thread whose
+    # context and finalization lifecycle cannot satisfy Captain's bounded,
+    # no-side-effect synthesis contract. Reject before the ordinary turn
+    # prologue touches counters, prompt caches, persistence, memory, plugins, or
+    # the live Codex session. The TUI poller also defers before claiming; this
+    # guard keeps direct/non-TUI callers fail-closed.
+    if task_only_context and agent.api_mode == "codex_app_server":
+        error = (
+            "Task-only Captain synthesis is unsupported with codex_app_server; "
+            "retry on a supported Hermes runtime."
+        )
+        return {
+            "final_response": "",
+            "messages": [],
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "failed": True,
+            "interrupted": False,
+            "error": error,
+            "session_persisted": False,
+        }
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -2404,7 +2427,7 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
+        if agent.ephemeral_system_prompt and not task_only_context:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
@@ -2553,8 +2576,12 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
-        if agent._use_prompt_caching and agent.provider != "moa":
+        tools_for_api = [] if task_only_context else agent.tools
+        if (
+            not task_only_context
+            and agent._use_prompt_caching
+            and agent.provider != "moa"
+        ):
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
                 api_messages,
@@ -2607,7 +2634,7 @@ def run_conversation(
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -7050,6 +7077,27 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                if task_only_context:
+                    # No Hermes tool schema is exposed for Captain synthesis.
+                    # A provider may still fabricate a call; reject it before
+                    # validation, repair, middleware, hooks, persistence, or
+                    # handler dispatch can observe it. The caller releases the
+                    # durable inbox claim and retries the event later.
+                    error = (
+                        "Task-only Captain response included an unexpected tool "
+                        "call; the report remains retryable."
+                    )
+                    return {
+                        "final_response": "",
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "failed": True,
+                        "interrupted": False,
+                        "error": error,
+                        "session_persisted": False,
+                    }
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 

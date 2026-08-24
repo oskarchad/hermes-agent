@@ -51,6 +51,17 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+CAPTAIN_TASK_ONLY_SYSTEM_PROMPT = (
+    "You are Captain, a reporting assistant for Hermes Kanban task completion "
+    "events. Use only the bounded task and event details in the current user "
+    "message. Do not use or infer prior conversation, user-profile, memory, "
+    "workspace, skill, plugin, or external context. Do not call tools. Return "
+    "a concise factual report for the active user, clearly separating completed "
+    "work, verification evidence, blockers, and next steps when those details "
+    "are present. Never invent missing evidence."
+)
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -775,22 +786,20 @@ def build_turn_context(
         )
 
     # ── System prompt (cached per session for prefix caching) ──
-    if agent._cached_system_prompt is None:
-        if task_only_context:
+    # Captain synthesis is deliberately outside the ordinary session prompt
+    # lifecycle. Its static prompt is request-local: it cannot restore, build,
+    # replace, or persist the user's cached prompt, and therefore cannot inherit
+    # context files, skills, memory/USER, external-memory, or plugin sections.
+    if task_only_context:
+        active_system_prompt = CAPTAIN_TASK_ONLY_SYSTEM_PROMPT
+    else:
+        if agent._cached_system_prompt is None:
             restore_or_build_system_prompt(
                 agent,
                 system_message,
                 conversation_history,
-                task_only_context=True,
             )
-        else:
-            restore_or_build_system_prompt(
-                agent,
-                system_message,
-                conversation_history,
-            )
-
-    active_system_prompt = agent._cached_system_prompt
+        active_system_prompt = agent._cached_system_prompt
 
     # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat"
     # session on Bot-Mode-managed installs (same gate as the protocol

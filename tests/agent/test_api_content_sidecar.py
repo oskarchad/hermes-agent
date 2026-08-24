@@ -499,9 +499,18 @@ class TestWireInvariant:
         """
         from agent.context_engine import ContextEngine
 
-        make_agent, handler, _db, _sid = wire_env
+        make_agent, handler, db, sid = wire_env
         dynamic_calls = []
         ordinary_marker = "ORDINARY_HISTORY_MUST_NOT_REACH_CAPTAIN"
+        ordinary_prompt_markers = {
+            "context_file": "CONTEXT_FILE_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "memory": "BUILTIN_MEMORY_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "user": "USER_PROFILE_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "external_memory": "EXTERNAL_MEMORY_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "skill": "SKILL_INDEX_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "plugin": "PLUGIN_PROMPT_MARKER_MUST_NOT_REACH_CAPTAIN",
+        }
+        ordinary_system_prompt = "\n\n".join(ordinary_prompt_markers.values())
 
         class _OrdinaryHistoryEngine(ContextEngine):
             @property
@@ -568,6 +577,17 @@ class TestWireInvariant:
         agent._skill_nudge_interval = 1
         agent._iters_since_skill = 1
         agent.valid_tool_names = {"skill_manage"}
+        # Model a warm production session whose byte-stable prompt already
+        # contains every ordinary prompt source. Captain synthesis must use a
+        # separate static prompt without replacing either cache tier or the
+        # canonical SessionDB prompt.
+        agent._cached_system_prompt = ordinary_system_prompt
+        agent._cached_system_prompt_static = ordinary_prompt_markers["context_file"]
+        agent.ephemeral_system_prompt = ordinary_prompt_markers["plugin"]
+        db.create_session(session_id=sid, source="cli")
+        db.update_system_prompt(sid, ordinary_system_prompt)
+        cached_prompt_before = agent._cached_system_prompt
+        cached_static_before = agent._cached_system_prompt_static
         handler.response_queue.append(_text_resp("Captain bounded report"))
 
         with patch("hermes_cli.lifecycle.invoke_hook", side_effect=invoke_dynamic_hook):
@@ -585,9 +605,69 @@ class TestWireInvariant:
         assert [message["role"] for message in sent_messages] == ["system", "user"]
         assert sent_messages[-1]["content"] == "Captain bounded task"
         assert ordinary_marker not in json.dumps(sent_messages)
+        sent_system_prompt = sent_messages[0]["content"]
+        assert "Captain" in sent_system_prompt
+        assert len(sent_system_prompt) < 2_000
+        for marker in ordinary_prompt_markers.values():
+            assert marker not in json.dumps(sent_messages)
         assert result["final_response"] == "Captain bounded report"
+        assert agent._cached_system_prompt == cached_prompt_before
+        assert agent._cached_system_prompt_static == cached_static_before
+        assert db.get_session(sid)["system_prompt"] == ordinary_system_prompt
         agent._memory_manager.on_turn_start.assert_not_called()
         agent._memory_manager.prefetch_all.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+        agent._spawn_background_review.assert_not_called()
+
+    def test_task_only_turn_sends_no_tools_and_rejects_unexpected_tool_call(
+        self, wire_env
+    ):
+        """A provider cannot turn automated Captain synthesis into tool execution."""
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent()
+        agent.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory",
+                    "description": "mutate persistent state",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        agent.valid_tool_names = {"memory"}
+        mutation_state = {"calls": 0}
+
+        def mutate_if_dispatched(*_args, **_kwargs):
+            mutation_state["calls"] += 1
+
+        agent._execute_tool_calls = MagicMock(side_effect=mutate_if_dispatched)
+        agent._memory_manager = MagicMock()
+        agent._sync_external_memory_for_turn = MagicMock()
+        agent._spawn_background_review = MagicMock()
+        handler.response_queue.append(_tc_resp("memory"))
+
+        with patch("hermes_cli.lifecycle.invoke_hook") as lifecycle_hook, patch(
+            "hermes_cli.plugins.invoke_hook"
+        ) as plugin_hook:
+            result = agent.run_conversation(
+                "Captain adversarial task",
+                conversation_history=[],
+                task_id="captain-adversarial",
+                task_only_context=True,
+            )
+
+        requests = _chat_requests(handler)
+        assert len(requests) == 1
+        assert requests[0].get("tools") in (None, [])
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "tool call" in result["error"].lower()
+        assert mutation_state == {"calls": 0}
+        agent._execute_tool_calls.assert_not_called()
+        lifecycle_hook.assert_not_called()
+        plugin_hook.assert_not_called()
+        agent._memory_manager.assert_not_called()
         agent._sync_external_memory_for_turn.assert_not_called()
         agent._spawn_background_review.assert_not_called()
 
