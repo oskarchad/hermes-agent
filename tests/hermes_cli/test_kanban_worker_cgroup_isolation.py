@@ -1221,3 +1221,255 @@ def test_pid_cas_loss_cleanup_failure_does_not_mutate_successor(
         assert cleanup_failed[0].payload["pid"] == 89301
     finally:
         conn.close()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    ("load_state", "active_state", "expected"),
+    [
+        ("loaded", "active", False),
+        ("loaded", "inactive", False),
+        ("not-found", "inactive", True),
+    ],
+)
+def test_worker_scope_is_reusable_only_after_systemd_unloads_it(
+    monkeypatch, load_state, active_state, expected,
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"LoadState={load_state}\nActiveState={active_state}\n",
+            stderr="",
+        ),
+    )
+
+    assert kb._systemd_worker_scope_unloaded("hermes-kanban-worker-test.scope") is expected
+
+
+def test_implementation_to_review_waits_for_loaded_source_scope_then_claims(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.config as config
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda *_args, **_kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    scope_state = {"unloaded": False}
+    probed_units = []
+    monkeypatch.setattr(
+        kb,
+        "_systemd_worker_scope_unloaded",
+        lambda unit: probed_units.append(unit) or scope_state["unloaded"],
+        raising=False,
+    )
+    # The wrapper PID may already be gone while a descendant still keeps the
+    # systemd scope loaded. The scope is the authoritative overlap boundary.
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="implementation handoff",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        implementation = kb.claim_task(
+            conn,
+            task_id,
+            claimer=kb._dispatcher_claim_lock(conn, task_id),
+        )
+        assert implementation is not None
+        assert implementation.claim_lock is not None
+        scope_unit = kb._kanban_worker_scope_unit(implementation.claim_lock)
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                90101,
+                isolation_mode="systemd_scope",
+                scope_unit=scope_unit,
+            ),
+        )
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready for review",
+            reviewer="gauge",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        spawn_calls = []
+
+        def spawn_review(task, _workspace):
+            spawn_calls.append((task.id, task.current_run_id))
+            return 90102
+
+        deferred = kb.dispatch_once(conn, spawn_fn=spawn_review, failure_limit=1)
+
+        parked = kb.get_task(conn, task_id)
+        assert parked is not None
+        assert parked.status == "review"
+        assert parked.current_run_id is None
+        assert parked.consecutive_failures == 0
+        assert spawn_calls == []
+        assert deferred.respawn_guarded == [(task_id, "prior_worker_teardown")]
+        assert probed_units == [scope_unit]
+        assert not any(
+            event.kind in {"spawn_failed", "gave_up"}
+            for event in kb.list_events(conn, task_id)
+        )
+
+        scope_state["unloaded"] = True
+        claimed = kb.dispatch_once(conn, spawn_fn=spawn_review, failure_limit=1)
+
+        running = kb.get_task(conn, task_id)
+        assert running is not None
+        assert running.status == "running"
+        assert running.assignee == "gauge"
+        assert running.current_run_id is not None
+        assert running.worker_pid == 90102
+        assert spawn_calls == [(task_id, running.current_run_id)]
+        assert [item[0] for item in claimed.spawned] == [task_id]
+    finally:
+        conn.close()
+
+
+def test_review_to_repair_waits_for_live_source_process_then_claims(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.config as config
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda *_args, **_kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    live_pids = {90202}
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid in live_pids)
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="review repair handoff",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="patch:implementation")
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready for review",
+            reviewer="gauge",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="gauge:review")
+        assert review is not None
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                90202,
+                isolation_mode="process_session",
+                scope_unit=None,
+            ),
+        )
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="add the missing regression",
+            expected_run_id=review.current_run_id,
+        ) == (True, "patch")
+
+        spawn_calls = []
+
+        def spawn_repair(task, _workspace):
+            spawn_calls.append((task.id, task.current_run_id))
+            return 90203
+
+        deferred = kb.dispatch_once(conn, spawn_fn=spawn_repair, failure_limit=1)
+
+        parked = kb.get_task(conn, task_id)
+        assert parked is not None
+        assert parked.status == "ready"
+        assert parked.current_run_id is None
+        assert parked.consecutive_failures == 0
+        assert spawn_calls == []
+        assert deferred.respawn_guarded == [(task_id, "prior_worker_teardown")]
+        assert not any(
+            event.kind in {"spawn_failed", "gave_up"}
+            for event in kb.list_events(conn, task_id)
+        )
+
+        live_pids.clear()
+        claimed = kb.dispatch_once(conn, spawn_fn=spawn_repair, failure_limit=1)
+
+        running = kb.get_task(conn, task_id)
+        assert running is not None
+        assert running.status == "running"
+        assert running.assignee == "patch"
+        assert running.current_run_id is not None
+        assert running.worker_pid == 90203
+        assert spawn_calls == [(task_id, running.current_run_id)]
+        assert [item[0] for item in claimed.spawned] == [task_id]
+    finally:
+        conn.close()
+
+
+def test_genuine_spawn_failure_still_trips_failure_budget(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="genuine spawn failure",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+
+        def fail_spawn(*_args, **_kwargs):
+            raise RuntimeError("genuine worker bootstrap failure")
+
+        result = kb.dispatch_once(conn, spawn_fn=fail_spawn, failure_limit=1)
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+        assert result.auto_blocked == [task_id]
+        assert result.respawn_guarded == []
+        events = kb.list_events(conn, task_id)
+        assert any(event.kind == "gave_up" for event in events)
+        assert not any(
+            event.kind == "respawn_guarded"
+            and event.payload is not None
+            and event.payload.get("reason") == "prior_worker_teardown"
+            for event in events
+        )
+    finally:
+        conn.close()

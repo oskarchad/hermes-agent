@@ -9138,11 +9138,11 @@ def _stop_kanban_worker_scope(claim_lock: str) -> bool:
     return bool(_stop_systemd_unit(unit) and _systemd_worker_scope_inactive(unit))
 
 
-def _systemd_worker_scope_inactive(unit_name: str) -> bool:
-    """Verify that a transient user scope no longer owns live processes."""
+def _systemd_worker_scope_state(unit_name: str) -> Optional[dict[str, str]]:
+    """Read a transient user scope's load/active state, if determinable."""
     binary = shutil.which("systemctl")
     if binary is None:
-        return False
+        return None
     try:
         result = subprocess.run(
             [
@@ -9158,22 +9158,47 @@ def _systemd_worker_scope_inactive(unit_name: str) -> bool:
             timeout=15,
         )
     except Exception:
-        return False
+        return None
     if result.returncode != 0:
         error = f"{result.stdout}\n{result.stderr}".lower()
-        return any(
+        if any(
             marker in error
             for marker in ("not loaded", "not found", "does not exist")
-        )
+        ):
+            return {"LoadState": "not-found", "ActiveState": "inactive"}
+        return None
     states = {}
     for line in result.stdout.splitlines():
         key, separator, value = line.partition("=")
         if separator:
             states[key] = value
+    return states
+
+
+def _systemd_worker_scope_inactive(unit_name: str) -> bool:
+    """Verify that a transient user scope no longer owns live processes."""
+    states = _systemd_worker_scope_state(unit_name)
+    if states is None:
+        return False
     return states.get("LoadState") == "not-found" or states.get("ActiveState") in {
         "inactive",
         "failed",
     }
+
+
+def _systemd_worker_scope_unloaded(unit_name: str) -> bool:
+    """Return whether systemd has released a transient worker scope name.
+
+    ``ActiveState=inactive`` is insufficient for scope-name reuse: systemd-run
+    rejects a replacement while the old transient unit remains loaded.  The
+    same-card handoff guard therefore waits for ``LoadState=not-found``.
+    Probe failures fail closed so a transient systemd delay cannot turn into an
+    overlapping worker or consume the task's crash budget.
+    """
+    states = _systemd_worker_scope_state(unit_name)
+    if states is None:
+        return False
+    return states.get("LoadState") == "not-found"
 
 
 def _worker_scope_expected(
@@ -10697,6 +10722,84 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _handoff_worker_teardown_pending(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether the source worker from a same-card handoff still exists.
+
+    ``request_review`` and ``request_changes`` deliberately make the next phase
+    dispatchable before the caller process has returned from its terminal tool
+    call.  The source run is already closed in SQLite at that point, so inspect
+    its persisted process/scope identity rather than ``tasks.current_run_id``.
+    Only those two phase-handoff outcomes are guarded; genuine failed spawns and
+    crashes continue through the normal retry-budget accounting unchanged.
+    """
+    prior = conn.execute(
+        "SELECT id, outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prior is None or prior["outcome"] not in {
+        "review_requested",
+        "changes_requested",
+    }:
+        return False
+
+    run_id = int(prior["id"])
+    spawned = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'spawned' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        payload = (
+            json.loads(spawned["payload"])
+            if spawned is not None and spawned["payload"]
+            else {}
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if _worker_scope_expected(conn, task_id, run_id=run_id):
+        scope_unit = payload.get("scope_unit")
+        if not isinstance(scope_unit, str) or not scope_unit:
+            claimed = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id, run_id),
+            ).fetchone()
+            try:
+                claimed_payload = (
+                    json.loads(claimed["payload"])
+                    if claimed is not None and claimed["payload"]
+                    else {}
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                claimed_payload = {}
+            claim_lock = (
+                claimed_payload.get("lock")
+                if isinstance(claimed_payload, dict)
+                else None
+            )
+            if not isinstance(claim_lock, str) or not claim_lock:
+                return True
+            scope_unit = _kanban_worker_scope_unit(claim_lock)
+        return not _systemd_worker_scope_unloaded(scope_unit)
+
+    worker_pid = payload.get("pid")
+    if not isinstance(worker_pid, int) or worker_pid <= 0:
+        return False
+    if worker_pid in _recent_worker_exits:
+        return False
+    return _pid_alive(worker_pid)
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -10715,6 +10818,12 @@ def check_respawn_guard(
     auth-blocker check still apply in every lane.
 
     Checks in priority order:
+
+    ``"prior_worker_teardown"``
+        The latest run ended by handing this same card to review or repair, but
+        its source process still exists or its transient systemd scope remains
+        loaded. Defer without claiming or consuming failure budget; a later
+        tick claims automatically after teardown completes.
 
     ``"rate_limit_cooldown"``
         The task's most recent run ended with the ``rate_limited`` outcome
@@ -10764,7 +10873,14 @@ def check_respawn_guard(
 
     now = int(time.time())
 
-    # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
+    # 1. Same-card phase handoff. The transition closes the source run before
+    #    its worker process/scope can finish tearing down. Claiming now would
+    #    overlap writers and, for task-owned scopes, make systemd-run reject the
+    #    still-loaded unit name as a generic spawn failure.
+    if _handoff_worker_teardown_pending(conn, task_id):
+        return "prior_worker_teardown"
+
+    # 2. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
     #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
     #    rate-limit requeue stamps a quota-flavored last_failure_error that
@@ -10800,7 +10916,7 @@ def check_respawn_guard(
         # crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 3. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
@@ -10811,7 +10927,7 @@ def check_respawn_guard(
     if lane == "review":
         return None
 
-    # 3. Completed run within guard window — proof of recent success.
+    # 4. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
     #    dragging done→ready, a dependency re-promotion, an unblock, a
     #    reclaim) is a deliberate "run it again" — honor it instead of
@@ -10836,7 +10952,7 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 5. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
