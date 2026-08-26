@@ -5501,10 +5501,35 @@ class TestCaptainReportRehome:
             ],
         )
 
+        live_projection = db.get_messages_as_conversation(destination)
+
         receipt = db.rehome_captain_report(completion_id, destination)
 
         assert receipt is not None
         assert [message["content"] for message in receipt["messages"]] == [
+            "Captain task",
+            "",
+            "ok",
+            "Canonical Captain report",
+        ]
+        live_projection.extend(receipt["messages"])
+        resumed_projection = db.get_messages_as_conversation(destination)
+        assert [message["content"] for message in resumed_projection] == [
+            "ordinary question",
+            "ordinary answer",
+            "Captain task",
+            "",
+            "ok",
+            "Canonical Captain report",
+        ]
+        assert live_projection == resumed_projection
+        assert [
+            message["content"]
+            for message in db.get_messages_as_conversation(
+                source,
+                include_inactive=True,
+            )
+        ] == [
             "Captain task",
             "",
             "ok",

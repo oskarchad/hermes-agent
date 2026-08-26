@@ -11918,15 +11918,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         completion_id: str,
         destination_session_id: str,
     ) -> Optional[Dict[str, Any]]:
-        """Return one profile-local Captain receipt, moving its turn if needed.
+        """Return one profile-local Captain receipt, rehoming its turn if needed.
 
         A :class:`SessionDB` belongs to one resolved ``HERMES_HOME`` profile, so
         searching this database is the durable profile boundary.  The receipt's
         completion id already namespaces the board-local event id.  When a
         fallback session claims an event whose model turn committed in a now-
-        absent session, move that complete synthetic turn to the destination in
-        the same transaction.  This leaves one canonical, visible transcript
-        projection instead of copying the assistant row into two sessions.
+        absent session, append that complete synthetic turn to the destination
+        with fresh insertion-order ids, then retire the source rows in the same
+        transaction.  This leaves one canonical, visible transcript projection
+        whose durable order matches the live tail append.
         """
         if not completion_id or not destination_session_id:
             return None
@@ -11996,16 +11997,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             moved = source_session_id != destination_session_id
             if moved:
+                appended_turn_ids = []
+                for source_turn_id in source_turn_ids:
+                    cursor = conn.execute(
+                        """INSERT INTO messages (
+                               session_id, role, content, tool_call_id, tool_calls,
+                               tool_name, effect_disposition, timestamp, token_count,
+                               finish_reason, reasoning, reasoning_content,
+                               reasoning_details, codex_reasoning_items,
+                               codex_message_items, platform_message_id, observed,
+                               active, compacted, api_content, display_kind,
+                               display_metadata
+                           )
+                           SELECT ?, role, content, tool_call_id, tool_calls,
+                               tool_name, effect_disposition, timestamp, token_count,
+                               finish_reason, reasoning, reasoning_content,
+                               reasoning_details, codex_reasoning_items,
+                               codex_message_items, platform_message_id, observed,
+                               1, compacted, api_content, display_kind,
+                               display_metadata
+                           FROM messages WHERE id = ? AND active = 1""",
+                        (destination_session_id, source_turn_id),
+                    )
+                    if int(cursor.rowcount) != 1:
+                        raise RuntimeError(
+                            "Captain receipt lost a canonical source row during rehome"
+                        )
+                    appended_turn_ids.append(int(cursor.lastrowid))
+
                 placeholders = ",".join("?" for _ in source_turn_ids)
                 conn.execute(
-                    "UPDATE messages SET session_id = ? "
+                    "UPDATE messages SET active = 0 "
                     f"WHERE active = 1 AND id IN ({placeholders})",
-                    (destination_session_id, *source_turn_ids),
+                    source_turn_ids,
                 )
+                source_turn_ids = appended_turn_ids
 
-            # Moving the canonical turn and soft-deleting legacy duplicates is
-            # one transaction. Recompute both counters from the surviving rows
-            # before exposing its receipt so the read model cannot lag the data.
+            # Appending the canonical turn and soft-deleting its source plus
+            # legacy duplicates is one transaction. Recompute both counters
+            # from the surviving rows before exposing its receipt so the read
+            # model cannot lag the data.
             for session_id in sorted(affected_session_ids):
                 active_rows = conn.execute(
                     "SELECT tool_calls FROM messages "
