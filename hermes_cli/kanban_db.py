@@ -1684,6 +1684,7 @@ CREATE TABLE IF NOT EXISTS kanban_captain_inbox (
     profile       TEXT NOT NULL,
     task_id       TEXT NOT NULL,
     kind          TEXT NOT NULL,
+    source_comment_id INTEGER,
     tenant        TEXT,
     state         TEXT NOT NULL DEFAULT 'pending',
     lease_token   TEXT,
@@ -1726,7 +1727,17 @@ CREATE INDEX IF NOT EXISTS idx_captain_receivers_seen ON kanban_captain_receiver
 # inbox row so the unreported backlog stays meaningful.
 CAPTAIN_REPORT_KINDS: frozenset[str] = frozenset({
     "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "captain_signal",
 })
+
+CAPTAIN_SIGNAL_HEADERS: tuple[tuple[str, str], ...] = (
+    ("METHOD DELTA", "method_delta"),
+    ("DECISION REQUIRED", "decision_required"),
+    ("CAPTAIN NOTE", "captain_note"),
+)
+CAPTAIN_SIGNAL_CLASSES: frozenset[str] = frozenset(
+    signal_class for _, signal_class in CAPTAIN_SIGNAL_HEADERS
+)
 
 # Max per-profile rows in the ``board_stats`` Captain diagnostics breakdown.
 # Beyond this the count is truncated (reported as ``profiles_truncated``) so
@@ -3013,6 +3024,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "UPDATE kanban_captain_inbox SET tenant = "
                 "(SELECT tenant FROM tasks WHERE tasks.id = kanban_captain_inbox.task_id)"
             )
+        if "source_comment_id" not in inbox_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_captain_inbox",
+                "source_comment_id",
+                "source_comment_id INTEGER",
+            )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_captain_inbox_source_comment "
+            "ON kanban_captain_inbox(source_comment_id) "
+            "WHERE source_comment_id IS NOT NULL"
+        )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -3425,6 +3448,78 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def resolve_captain_profile() -> str:
+    """Resolve the configured logical Captain for a newly rooted task tree.
+
+    ``kanban.orchestrator_profile`` is the durable ownership authority. Invalid
+    or unset values fail back to the canonical ``default`` profile rather than
+    the profile that happened to execute the create call.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli import profiles as profiles_mod
+
+        cfg = load_config() or {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        explicit = str(kanban_cfg.get("orchestrator_profile") or "").strip()
+        if explicit and profiles_mod.profile_exists(explicit):
+            return _normalize_captain_profile(explicit)
+    except Exception:
+        pass
+    return "default"
+
+
+def _resolve_captain_ownership(
+    conn: sqlite3.Connection,
+    parents: tuple[str, ...],
+    *,
+    requested_profile: Optional[str],
+    requested_origin: Optional[str],
+    tenant: Optional[str],
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Resolve one immutable Captain owner for a root or descendant task.
+
+    Registered parents are authoritative. A child inherits their profile,
+    preferred origin, and tenant even when the creating worker supplies its own
+    profile/session. Conflicting registered parents fail closed instead of
+    silently assigning a fan-in task to one arbitrary Captain.
+    """
+    parent_rows: list[sqlite3.Row] = []
+    if parents:
+        placeholders = ",".join("?" * len(parents))
+        parent_rows = conn.execute(
+            "SELECT task_id, profile, origin_session_key, tenant "
+            "FROM kanban_captain_registry "
+            f"WHERE task_id IN ({placeholders}) ORDER BY task_id",
+            parents,
+        ).fetchall()
+    if parent_rows:
+        profiles = {str(row["profile"]) for row in parent_rows}
+        origins = {
+            str(row["origin_session_key"])
+            for row in parent_rows
+            if row["origin_session_key"]
+        }
+        tenants = {str(row["tenant"]) for row in parent_rows if row["tenant"]}
+        if len(profiles) != 1:
+            raise ValueError("parent tasks have conflicting Captain profiles")
+        if len(origins) > 1:
+            raise ValueError("parent tasks have conflicting Captain origins")
+        if len(tenants) > 1:
+            raise ValueError("parent tasks have conflicting Captain tenants")
+        inherited_tenant = next(iter(tenants), None)
+        if tenant and inherited_tenant and str(tenant) != inherited_tenant:
+            raise ValueError("child tenant conflicts with parent Captain tenant")
+        return (
+            next(iter(profiles)),
+            next(iter(origins), None),
+            str(tenant) if tenant else inherited_tenant,
+        )
+
+    profile = requested_profile or resolve_captain_profile()
+    return _normalize_captain_profile(profile), requested_origin, tenant
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3625,6 +3720,13 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    captain_profile, captain_origin_session_key, tenant = _resolve_captain_ownership(
+        conn,
+        parents,
+        requested_profile=captain_profile,
+        requested_origin=captain_origin_session_key,
+        tenant=tenant,
+    )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3685,14 +3787,13 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
-            if captain_profile:
-                register_captain_owner(
-                    conn,
-                    row["id"],
-                    profile=captain_profile,
-                    origin_session_key=captain_origin_session_key,
-                    tenant=tenant,
-                )
+            register_captain_owner(
+                conn,
+                row["id"],
+                profile=captain_profile,
+                origin_session_key=captain_origin_session_key,
+                tenant=tenant,
+            )
             return row["id"]
 
     enabled_toolsets_list = normalize_enabled_toolsets(
@@ -3850,17 +3951,16 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
-                if captain_profile:
-                    # Registration shares the create transaction but follows
-                    # the ``created`` event, so creation is all-or-nothing and
-                    # that historical event never materializes in the inbox.
-                    register_captain_owner(
-                        conn,
-                        task_id,
-                        profile=captain_profile,
-                        origin_session_key=captain_origin_session_key,
-                        tenant=tenant,
-                    )
+                # Registration shares the create transaction but follows the
+                # ``created`` event, so creation is all-or-nothing and that
+                # historical event never materializes in the inbox.
+                register_captain_owner(
+                    conn,
+                    task_id,
+                    profile=captain_profile,
+                    origin_session_key=captain_origin_session_key,
+                    tenant=tenant,
+                )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -4410,7 +4510,12 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    _materialize_captain_signal: bool = True,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -4424,13 +4529,107 @@ def add_comment(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        normalized_author = author.strip()
+        normalized_body = body.strip()
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            (task_id, normalized_author, normalized_body, now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        signal_class = (
+            _classify_captain_signal(normalized_body)
+            if _materialize_captain_signal
+            else None
+        )
+        if signal_class is not None:
+            materialize_captain_signal(
+                conn,
+                task_id=task_id,
+                comment_id=comment_id,
+                author=normalized_author,
+                signal_class=signal_class,
+            )
+        return comment_id
+
+
+def _classify_captain_signal(body: str) -> Optional[str]:
+    """Classify an explicit Captain header on the first non-empty line."""
+    first_line = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    upper = first_line.upper()
+    for header, signal_class in CAPTAIN_SIGNAL_HEADERS:
+        suffix = upper[len(header):].lstrip()
+        if upper == header or (
+            upper.startswith(header)
+            and suffix[:1] in {":", "-", "—"}
+        ):
+            return signal_class
+    return None
+
+
+def materialize_captain_signal(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    comment_id: int,
+    author: str,
+    signal_class: str,
+) -> Optional[int]:
+    """Materialize one durable Captain report for an immutable comment source.
+
+    The event payload carries reference metadata only; the comment body remains
+    authoritative in ``task_comments`` and is read/redacted at delivery time.
+    Reprocessing the same board-local comment id returns the original event.
+    """
+    if signal_class not in CAPTAIN_SIGNAL_CLASSES:
+        raise ValueError(f"unknown Captain signal class {signal_class!r}")
+    with write_txn(conn, allow_nested=True):
+        comment = conn.execute(
+            "SELECT 1 FROM task_comments WHERE id = ? AND task_id = ?",
+            (int(comment_id), task_id),
+        ).fetchone()
+        if comment is None:
+            raise ValueError(f"unknown comment {comment_id} for task {task_id}")
+        if conn.execute(
+            "SELECT 1 FROM kanban_captain_registry WHERE task_id = ?",
+            (task_id,),
+        ).fetchone() is None:
+            return None
+        existing = conn.execute(
+            "SELECT event_id FROM kanban_captain_inbox WHERE source_comment_id = ?",
+            (int(comment_id),),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["event_id"])
+        return _append_event(
+            conn,
+            task_id,
+            "captain_signal",
+            {
+                "author": author.strip(),
+                "comment_id": int(comment_id),
+                "signal_class": signal_class,
+            },
+            source_comment_id=int(comment_id),
+        )
+
+
+def get_comment(conn: sqlite3.Connection, comment_id: int) -> Optional[Comment]:
+    """Return one immutable comment source by its board-local id."""
+    row = conn.execute(
+        "SELECT id, task_id, author, body, created_at FROM task_comments WHERE id = ?",
+        (int(comment_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return Comment(
+        id=row["id"],
+        task_id=row["task_id"],
+        author=row["author"],
+        body=row["body"],
+        created_at=row["created_at"],
+    )
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -4734,6 +4933,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
+    source_comment_id: Optional[int] = None,
 ) -> int:
     """Record an event row.  Called from within an already-open txn.
 
@@ -4763,9 +4963,19 @@ def _append_event(
         if reg is not None:
             conn.execute(
                 "INSERT OR IGNORE INTO kanban_captain_inbox "
-                "(event_id, profile, task_id, kind, tenant, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (event_id, reg["profile"], task_id, kind, reg["tenant"], now, now),
+                "(event_id, profile, task_id, kind, source_comment_id, tenant, "
+                "state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    event_id,
+                    reg["profile"],
+                    task_id,
+                    kind,
+                    source_comment_id,
+                    reg["tenant"],
+                    now,
+                    now,
+                ),
             )
     return event_id
 
@@ -14184,6 +14394,69 @@ def ack_captain_reports(
             params,
         )
     return int(cur.rowcount or 0)
+
+
+def ack_captain_reports_with_reply(
+    conn: sqlite3.Connection,
+    *,
+    token: str,
+    owner: str,
+    reply_author: str,
+    reply_body: str,
+    reply_task_ids: Iterable[str],
+) -> int:
+    """Atomically append a Captain reply and ack its fenced signal lease.
+
+    A lost response after commit is safe: replaying the old token sees no leased
+    rows and appends no second comment. Any late comment or ack failure rolls
+    the whole operation back, keeping the inbox row retryable.
+    """
+    if not owner:
+        raise ValueError("Captain reply settlement requires a lease owner")
+    if not reply_author or not reply_author.strip():
+        raise ValueError("Captain reply author is required")
+    if not reply_body or not reply_body.strip():
+        raise ValueError("Captain reply body is required")
+    allowed_tasks = {str(task_id) for task_id in reply_task_ids if task_id}
+    now = int(time.time())
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT task_id, kind FROM kanban_captain_inbox "
+            "WHERE lease_token = ? AND lease_owner = ? AND state = 'leased' "
+            "AND lease_expires >= ? ORDER BY event_id",
+            (token, owner, now),
+        ).fetchall()
+        if not rows:
+            return 0
+        leased_signal_tasks = {
+            str(row["task_id"])
+            for row in rows
+            if row["kind"] == "captain_signal"
+        }
+        if not leased_signal_tasks.issubset(allowed_tasks):
+            raise RuntimeError("Captain reply signal task identity does not match lease")
+        signal_tasks = {
+            str(row["task_id"])
+            for row in rows
+            if row["kind"] == "captain_signal" and row["task_id"] in allowed_tasks
+        }
+        for task_id in sorted(signal_tasks):
+            add_comment(
+                conn,
+                task_id,
+                author=reply_author.strip(),
+                body=reply_body.strip(),
+                _materialize_captain_signal=False,
+            )
+        cur = conn.execute(
+            "UPDATE kanban_captain_inbox SET state = 'acked', updated_at = ? "
+            "WHERE lease_token = ? AND lease_owner = ? AND state = 'leased' "
+            "AND lease_expires >= ?",
+            (now, token, owner, now),
+        )
+        if int(cur.rowcount or 0) != len(rows):
+            raise RuntimeError("Captain reply settlement lost its fenced lease")
+        return int(cur.rowcount or 0)
 
 
 def release_captain_reports(

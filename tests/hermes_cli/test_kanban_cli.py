@@ -57,11 +57,18 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
-def test_slash_create_registers_session_profile_not_author(kanban_home, monkeypatch):
-    """Gateway `/kanban create` must register the Captain owner to the
-    session-bound profile (normalized), separate from task authorship. The
-    `--created-by` author label ('user' by default) must never own Captain
-    rows."""
+def test_slash_create_registers_configured_orchestrator_not_session_or_author(
+    kanban_home, monkeypatch
+):
+    """The configured orchestrator owns the tree regardless of who creates it."""
+    from hermes_cli import config, profiles
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"orchestrator_profile": "Captain"}},
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
     monkeypatch.setenv("HERMES_SESSION_PROFILE", "Otto")
 
     out = kc.run_slash("create 'session-owned card' --assignee peer")
@@ -74,17 +81,24 @@ def test_slash_create_registers_session_profile_not_author(kanban_home, monkeypa
         authors = conn.execute("SELECT created_by FROM tasks").fetchall()
 
     assert len(rows) == 1
-    assert rows[0]["profile"] == "otto"  # session profile, normalized — not 'user'
+    assert rows[0]["profile"] == "captain"
     # Task authorship is unchanged (default author label), proving the two
     # concerns are decoupled.
     assert authors[0]["created_by"] == "user"
 
 
-def test_cli_create_registers_active_profile_when_no_session_profile(
+def test_cli_create_registers_configured_orchestrator_when_no_session_profile(
     kanban_home, monkeypatch
 ):
-    """A plain CLI create with no session env still owns Captain rows under the
-    real active/launch profile, never the `--created-by` author string."""
+    """A plain CLI create is owned by configuration, not its launch profile."""
+    from hermes_cli import config, profiles
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"orchestrator_profile": "Otto"}},
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
     monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "Reviewer")
 
@@ -103,20 +117,22 @@ def test_cli_create_registers_active_profile_when_no_session_profile(
             "SELECT profile FROM kanban_captain_registry"
         ).fetchall()
     assert len(rows) == 1
-    assert rows[0]["profile"] == "reviewer"  # HERMES_PROFILE, normalized
+    assert rows[0]["profile"] == "otto"
 
 
-def test_slash_create_prefers_context_bound_profile_over_process_env(
+def test_slash_create_prefers_configured_orchestrator_over_context_and_process(
     kanban_home, monkeypatch
 ):
-    """Gateway session ContextVars are authoritative in multiplexed processes.
-
-    ``/kanban create`` runs in ``asyncio.to_thread``, which copies ContextVars;
-    reading only ``os.environ`` would instead stamp the process launch profile
-    and leak the report into the wrong Captain inbox.
-    """
+    """Session and process identities cannot override logical tree ownership."""
+    from hermes_cli import config, profiles
     from gateway.session_context import clear_session_vars, set_session_vars
 
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"orchestrator_profile": "Captain"}},
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
     monkeypatch.setenv("HERMES_PROFILE", "Default")
     monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
     tokens = set_session_vars(profile="Otto")
@@ -131,7 +147,7 @@ def test_slash_create_prefers_context_bound_profile_over_process_env(
             "SELECT profile FROM kanban_captain_registry"
         ).fetchall()
     assert len(rows) == 1
-    assert rows[0]["profile"] == "otto"
+    assert rows[0]["profile"] == "captain"
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):

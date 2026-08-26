@@ -1426,7 +1426,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.complete': {
-        const receiptId = typeof ev.payload?.id === 'string' ? ev.payload.id : ''
+        const terminalFailed = ev.payload?.status === 'error' || ev.payload?.status === 'interrupted'
+        // Stable Captain ids are durable success receipts. A retryable failure
+        // may carry the same backend id, but must not consume it before the
+        // successful retry becomes visible.
+        const receiptId = !terminalFailed && typeof ev.payload?.id === 'string' ? ev.payload.id : ''
         const replayedReceipt = Boolean(receiptId && messageReceiptIds.has(receiptId))
 
         if (receiptId && !replayedReceipt) {

@@ -1195,42 +1195,11 @@ def kanban_command(args: argparse.Namespace) -> int:
 def _captain_owner_profile() -> str:
     """Resolve the Captain-owner profile for a CLI / ``/kanban`` create.
 
-    This is the owning Hermes **profile**, distinct from task authorship
-    (``--created-by`` / :func:`_profile_author`, which may be an arbitrary human
-    label like ``user``). Precedence: the exact session-bound
-    ``HERMES_SESSION_PROFILE`` first (set by the gateway/session for
-    ``/kanban create``), then the launch ``HERMES_PROFILE``, then the active
-    profile — canonicalized with ``normalize_profile_name`` so ``Otto`` and
-    ``otto`` are one owner. Never routes to an author label.
+    Logical tree ownership follows ``kanban.orchestrator_profile`` (with the
+    canonical ``default`` fallback), never the session/launch profile or the
+    arbitrary ``--created-by`` author label.
     """
-    from hermes_cli.profiles import normalize_profile_name
-
-    # Gateway multiplexing binds the profile in a ContextVar and then runs the
-    # slash handler through ``asyncio.to_thread`` (which copies that context).
-    # Once session context has been engaged, process-global env belongs to the
-    # launch/default profile and must not be borrowed for another session.
-    try:
-        from gateway.session_context import get_session_env, session_context_engaged
-
-        raw = get_session_env("HERMES_SESSION_PROFILE", "").strip()
-        if not raw and not session_context_engaged():
-            raw = (os.environ.get("HERMES_PROFILE") or "").strip()
-    except Exception:
-        raw = (
-            os.environ.get("HERMES_SESSION_PROFILE")
-            or os.environ.get("HERMES_PROFILE")
-            or ""
-        ).strip()
-    if not raw:
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            raw = get_active_profile_name() or "default"
-        except Exception:
-            raw = "default"
-    try:
-        return normalize_profile_name(raw)
-    except Exception:
-        return "default"
+    return kb.resolve_captain_profile()
 
 
 def _profile_author() -> str:

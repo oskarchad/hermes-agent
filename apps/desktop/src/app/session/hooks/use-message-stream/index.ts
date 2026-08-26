@@ -591,6 +591,10 @@ export function useMessageStream({
         // Structured failure from the terminal frame wins over the legacy text
         // heuristic ("Error: <provider detail>" texts don't match the regexes).
         const completionError = failure?.error ?? completionErrorText(finalText)
+        // A stable Captain receipt identifies a successfully persisted report.
+        // Failed terminal frames are retry status, not the durable receipt;
+        // retaining the id on their bubble would suppress the later success.
+        const acceptedCompletionId = completionError ? '' : completionId
         // A partial failure's `text` is streamed output the user should keep,
         // not the error string — settle it like a normal reply AND mark the
         // bubble failed, instead of stripping the text.
@@ -614,7 +618,7 @@ export function useMessageStream({
         const completeMessage = (message: ChatMessage): ChatMessage => {
           const settled = {
             ...message,
-            ...(completionId ? { id: completionId } : {}),
+            ...(acceptedCompletionId ? { id: acceptedCompletionId } : {}),
             completedAt: occurredAt,
             parts: completeOpenTimelineParts(message.parts, occurredAt),
             pending: false,
@@ -635,7 +639,7 @@ export function useMessageStream({
         }
 
         const newAssistantFromCompletion = (): ChatMessage => ({
-          id: completionId || `assistant-${Date.now()}`,
+          id: acceptedCompletionId || `assistant-${Date.now()}`,
           role: 'assistant',
           parts:
             completionError && !keepFailedPartialText
@@ -653,7 +657,7 @@ export function useMessageStream({
         let nextMessages = prev
 
         const replayedCompletion = Boolean(
-          completionId && prev.some(message => message.id === completionId && !message.pending)
+          acceptedCompletionId && prev.some(message => message.id === acceptedCompletionId && !message.pending)
         )
 
         if (replayedCompletion) {
@@ -661,7 +665,7 @@ export function useMessageStream({
           // its stable completion id arrives. Keep the already-visible receipt
           // and discard only that transient replay bubble.
           nextMessages = streamId
-            ? prev.filter(message => message.id !== streamId || message.id === completionId)
+            ? prev.filter(message => message.id !== streamId || message.id === acceptedCompletionId)
             : prev
         } else if (streamId && prev.some(m => m.id === streamId)) {
           nextMessages = prev.map(m => (m.id === streamId ? completeMessage(m) : m))

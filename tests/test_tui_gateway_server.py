@@ -7280,6 +7280,7 @@ def test_run_prompt_submit_requires_explicit_persistence_before_success_emit(
             session,
             "synthetic",
             on_terminal=record_terminal,
+            completion_id="kanban-report:board:persist-required",
             require_persisted=True,
         ) is True
         assert settled.wait(3.0)
@@ -7290,6 +7291,10 @@ def test_run_prompt_submit_requires_explicit_persistence_before_success_emit(
     assert results == [False]
     assert not any(
         event == "message.complete" and (payload or {}).get("status") == "complete"
+        for event, payload in emitted
+    )
+    assert not any(
+        event == "message.complete" and (payload or {}).get("id")
         for event, payload in emitted
     )
     assert not any(event == "message.delta" for event, _payload in emitted)

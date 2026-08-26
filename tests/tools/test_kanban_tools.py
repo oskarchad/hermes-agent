@@ -955,7 +955,7 @@ def test_create_registers_captain_owner_without_notify_sub_when_unattached(
             (tid,),
         ).fetchone()
         assert reg is not None
-        assert reg["profile"] == "test-worker"
+        assert reg["profile"] == "default"
         assert reg["origin_session_key"] is None
         # The 'created' event predates registration → it never materializes.
         assert conn.execute(
@@ -972,6 +972,23 @@ def test_create_reports_atomic_captain_registration(monkeypatch, worker_env):
     payload = json.loads(out)
     assert payload["ok"] is True
     assert payload["captain_registered"] is True
+
+
+def test_captain_origin_requires_active_profile_to_match_logical_captain(
+    monkeypatch
+):
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_KEY", "desktop-origin")
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "wrench")
+    assert kt._resolve_captain_origin_session_key("otto") is None
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "otto")
+    assert kt._resolve_captain_origin_session_key("otto") == "desktop-origin"
 
 
 def test_create_registration_failure_rolls_back_instead_of_silent_success(

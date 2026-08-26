@@ -134,9 +134,11 @@ def test_origin_gone_sibling_claims_exactly_once():
 def test_different_profile_cannot_claim():
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="cap3", assignee="worker")
-        kb.register_captain_owner(
-            conn, tid, profile="a-totally-other-profile", origin_session_key=None
+        tid = kb.create_task(
+            conn,
+            title="cap3",
+            assignee="worker",
+            captain_profile="a-totally-other-profile",
         )
         kb.complete_task(conn, tid, summary="foreign")
     finally:
@@ -554,9 +556,11 @@ def test_no_duplicate_across_exact_origin_and_captain_routes():
 def test_unattached_orchestrator_registers_without_notify_sub():
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="cap7", assignee="worker")
-        kb.register_captain_owner(
-            conn, tid, profile="orchestrator", origin_session_key=None
+        tid = kb.create_task(
+            conn,
+            title="cap7",
+            assignee="worker",
+            captain_profile="orchestrator",
         )
         assert kb.list_notify_subs(conn, task_id=tid) == []
         kb.complete_task(conn, tid, summary="cron done")
@@ -841,8 +845,9 @@ def test_board_stats_reports_unreported_captain_backlog():
 def test_captain_profile_is_canonically_normalized_mixed_case():
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="cap-norm", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile="Otto", origin_session_key=None)
+        tid = kb.create_task(
+            conn, title="cap-norm", assignee="worker", captain_profile="Otto"
+        )
         kb.complete_task(conn, tid, summary="norm test")
 
         reg = conn.execute(
@@ -865,8 +870,9 @@ def test_mixed_case_profile_session_claims_its_own_rows():
     """A session whose profile differs only in case still claims its reports."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="cap-norm2", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile="otto", origin_session_key=None)
+        tid = kb.create_task(
+            conn, title="cap-norm2", assignee="worker", captain_profile="otto"
+        )
         kb.complete_task(conn, tid, summary="cross-case claim")
     finally:
         conn.close()
@@ -881,7 +887,7 @@ def test_mixed_case_profile_session_claims_its_own_rows():
     session["profile_home"] = otto_home
     _register_live("sid-otto", session)
 
-    assert _profile_for(session) == "Otto"  # raw bound name is mixed case
+    assert _profile_for(session) == "otto"
     claims = []
     texts = _collect_kanban_notifications(session, claim_records=claims)
     assert len(texts) == 1
@@ -894,8 +900,9 @@ def test_board_stats_captain_per_profile_breakdown():
     conn = kb.connect()
     try:
         for i, prof in enumerate(["alpha", "beta", "beta"]):
-            tid = kb.create_task(conn, title=f"s{i}", assignee="worker")
-            kb.register_captain_owner(conn, tid, profile=prof, origin_session_key=None)
+            tid = kb.create_task(
+                conn, title=f"s{i}", assignee="worker", captain_profile=prof
+            )
             kb.complete_task(conn, tid, summary="x")
         stats = kb.board_stats(conn)
     finally:
@@ -921,9 +928,11 @@ def test_board_stats_captain_per_profile_truncates_at_20():
     conn = kb.connect()
     try:
         for i in range(23):
-            tid = kb.create_task(conn, title=f"t{i}", assignee="worker")
-            kb.register_captain_owner(
-                conn, tid, profile=f"prof{i:02d}", origin_session_key=None
+            tid = kb.create_task(
+                conn,
+                title=f"t{i}",
+                assignee="worker",
+                captain_profile=f"prof{i:02d}",
             )
             kb.complete_task(conn, tid, summary="x")
         stats = kb.board_stats(conn)

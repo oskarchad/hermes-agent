@@ -1438,7 +1438,7 @@ def _handle_create(args: dict, **kw) -> str:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
             captain_profile = _resolve_creator_profile()
-            captain_origin = _resolve_captain_origin_session_key()
+            captain_origin = _resolve_captain_origin_session_key(captain_profile)
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1496,39 +1496,28 @@ def _handle_create(args: dict, **kw) -> str:
 
 
 def _resolve_creator_profile() -> str:
-    """Resolve the normalized creator profile for the Captain ledger.
+    """Resolve the configured logical Captain for a newly rooted task tree.
 
-    Same source of truth as the auto-subscribe ``notifier_profile`` stamp:
-    the session's bound profile env, else the active profile, else default.
+    Task authorship and exact-origin notification routing remain session scoped;
+    durable Captain ownership follows ``kanban.orchestrator_profile``.
     """
-    try:
-        from gateway.session_context import get_session_env, session_context_engaged
-        profile = get_session_env("HERMES_SESSION_PROFILE", "")
-        if not profile and not session_context_engaged():
-            profile = os.environ.get("HERMES_PROFILE") or ""
-    except Exception:
-        profile = (
-            os.environ.get("HERMES_SESSION_PROFILE")
-            or os.environ.get("HERMES_PROFILE")
-            or ""
-        )
-    if not profile:
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            profile = get_active_profile_name() or "default"
-        except Exception:
-            profile = "default"
-    # Canonicalize so mixed-case / title-cased inputs resolve to one owner,
-    # matching kanban_db's ownership filters (see _normalize_captain_profile).
-    try:
-        from hermes_cli.profiles import normalize_profile_name
-        return normalize_profile_name(profile)
-    except Exception:
-        return (profile or "default").strip().lower() or "default"
+    from hermes_cli import kanban_db as _kb
+
+    return _kb.resolve_captain_profile()
 
 
-def _resolve_captain_origin_session_key() -> Optional[str]:
-    """Return the exact TUI/Desktop origin, never a gateway chat identity."""
+def _resolve_captain_origin_session_key(captain_profile: str) -> Optional[str]:
+    """Return a TUI/Desktop origin only when that session is the Captain."""
+    from hermes_cli.profiles import get_active_profile_name, normalize_profile_name
+
+    try:
+        active_profile = normalize_profile_name(get_active_profile_name())
+        logical_captain = normalize_profile_name(captain_profile)
+    except Exception:
+        return None
+    if active_profile != logical_captain:
+        return None
+
     origin_session_key: Optional[str] = None
     platform = ""
     try:
@@ -1551,19 +1540,20 @@ def _maybe_register_captain(conn: Any, task_id: str) -> bool:
     """Legacy reconciliation helper for callers outside atomic ``create_task``.
 
     Runs unconditionally (no config gate — this is a separate mechanism from
-    the exact-origin notify subscription). The creator profile always owns the
-    task; the exact TUI/Desktop origin session key is recorded only when the
-    creator IS such a session, so a live origin session owns delivery while
+    the exact-origin notify subscription). The configured logical Captain owns
+    the task; the exact TUI/Desktop origin session key is recorded only when the
+    creator is such a session, so a live origin session owns delivery while
     present. Gateway/CLI/cron/unattached creators register with no origin
     session and invent NO platform/chat destination. New create paths register
     transactionally; this helper remains bounded and reports success explicitly.
     """
     try:
         from hermes_cli import kanban_db as _kb
+        captain_profile = _resolve_creator_profile()
         _kb.register_captain_owner(
             conn, task_id,
-            profile=_resolve_creator_profile(),
-            origin_session_key=_resolve_captain_origin_session_key(),
+            profile=captain_profile,
+            origin_session_key=_resolve_captain_origin_session_key(captain_profile),
         )
         return True
     except Exception as _exc:

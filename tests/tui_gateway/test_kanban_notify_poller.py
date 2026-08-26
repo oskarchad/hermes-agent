@@ -408,6 +408,135 @@ class TestNotificationPollerLoopKanbanWiring:
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
+    def test_captain_signal_terminal_settlement_posts_reply_exactly_once(
+        self, monkeypatch, tmp_path
+    ):
+        import tui_gateway.server as server
+        from tools import kanban_tools as kt
+
+        class ActiveWorker:
+            def __init__(self):
+                self.steers: list[str] = []
+
+            def steer(self, text: str) -> bool:
+                self.steers.append(text)
+                return True
+
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(
+                conn,
+                title="Captain decision target",
+                assignee="worker",
+                captain_profile="otto",
+                captain_origin_session_key=SESSION_KEY,
+            )
+        finally:
+            conn.close()
+
+        # Seed the existing live-comment bridge before the worker emits its
+        # structured request, exactly as a running worker does on its first poll.
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_PROFILE", "wrench")
+        kt._comment_poll_last_attempt = 0.0
+        kt._comment_watermark.clear()
+        worker = ActiveWorker()
+        assert kt.inject_new_comments_from_env(worker) is False
+
+        conn = kb.connect()
+        try:
+            kb.add_comment(
+                conn,
+                tid,
+                author="wrench",
+                body="DECISION REQUIRED — choose the bounded route",
+            )
+            inbox_count = conn.execute(
+                "SELECT COUNT(*) FROM kanban_captain_inbox WHERE task_id = ?",
+                (tid,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert inbox_count == 1
+
+        turn_state = {"ran": False}
+        receipt = {
+            "report": {
+                "role": "assistant",
+                "content": "ACK — choose route A.",
+            },
+            "messages": [],
+            "moved": False,
+        }
+        monkeypatch.setattr(
+            server,
+            "_persisted_captain_report",
+            lambda _session, _completion_id: receipt if turn_state["ran"] else None,
+        )
+        session = self._poller_session(running=False)
+        captain_home = tmp_path / "profiles" / "Otto"
+        captain_home.mkdir(parents=True)
+        session["profile_home"] = str(captain_home)
+        emits: list = []
+        submits: list[str] = []
+
+        def submit_signal(_rid, _sid, _session, text):
+            submits.append(text)
+            turn_state["ran"] = True
+
+        self._run_poller_once(
+            session,
+            monkeypatch,
+            emits=emits,
+            submit=submit_signal,
+        )
+
+        conn = kb.connect()
+        try:
+            inbox_states = [
+                row["state"]
+                for row in conn.execute(
+                    "SELECT state FROM kanban_captain_inbox WHERE task_id = ?",
+                    (tid,),
+                ).fetchall()
+            ]
+            replies = [
+                (comment.author, comment.body)
+                for comment in kb.list_comments(conn, tid)
+                if comment.body == "ACK — choose route A."
+            ]
+            future_worker_context = kb.build_worker_context(conn, tid)
+        finally:
+            conn.close()
+
+        assert len(submits) == 1
+        assert tid in submits[0]
+        assert "DECISION REQUIRED" in submits[0]
+        assert inbox_states == ["acked"]
+        assert replies == [("otto", "ACK — choose route A.")]
+
+        kt._comment_poll_last_attempt = 0.0
+        assert kt.inject_new_comments_from_env(worker) is True
+        assert len(worker.steers) == 1
+        assert "otto: ACK — choose route A." in worker.steers[0]
+        assert "comment from worker `otto`" in future_worker_context
+        assert "ACK — choose route A." in future_worker_context
+
+        # Polling both sides again replays neither the Captain turn nor the
+        # worker injection, so the response remains exactly-once end to end.
+        with session["history_lock"]:
+            session["running"] = False
+        self._run_poller_once(
+            session,
+            monkeypatch,
+            emits=emits,
+            submit=lambda _rid, _sid, _session, text: submits.append(text),
+        )
+        assert len(submits) == 1
+        kt._comment_poll_last_attempt = 0.0
+        assert kt.inject_new_comments_from_env(worker) is False
+        assert len(worker.steers) == 1
+
     def test_busy_session_waits_then_dispatches_when_idle(self, monkeypatch):
         import threading
 

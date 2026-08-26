@@ -10562,6 +10562,46 @@ _CAPTAIN_RECEIVER_TTL_SECONDS = 15
 _CAPTAIN_POLL_ROW_CAP = 16
 _CAPTAIN_TURN_ROW_CAP = 1
 _CAPTAIN_POLL_BYTE_CAP = 8 * 1024
+_CAPTAIN_SIGNAL_BODY_BYTE_CAP = 2 * 1024
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Bound text by UTF-8 bytes without splitting a code point."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    encoded = encoded[:max_bytes]
+    while encoded:
+        try:
+            return encoded.decode("utf-8") + "\n[comment truncated]"
+        except UnicodeDecodeError:
+            encoded = encoded[:-1]
+    return "[comment truncated]"
+
+
+def _format_captain_signal_text(task, ev, board_slug: str, comment) -> str:
+    """Render a bounded signal from its authoritative durable comment."""
+    from agent.redact import redact_sensitive_text
+
+    payload = getattr(ev, "payload", None) or {}
+    task_id = getattr(ev, "task_id", "")
+    title = (getattr(task, "title", None) or task_id)[:120]
+    board_tag = f"[{board_slug}] " if board_slug else ""
+    signal_class = str(payload.get("signal_class") or "signal").replace("_", " ")
+    comment_id = payload.get("comment_id")
+    if comment is None:
+        body = "[authoritative source comment unavailable]"
+        author = str(payload.get("author") or "unknown")[:120]
+    else:
+        author = str(comment.author or payload.get("author") or "unknown")[:120]
+        body = _truncate_utf8(
+            redact_sensitive_text(str(comment.body or ""), force=True),
+            _CAPTAIN_SIGNAL_BODY_BYTE_CAP,
+        )
+    return render_kanban_alert(
+        f"⚑ {board_tag}Captain {signal_class} on Kanban {task_id} — {title}\n"
+        f"comment #{comment_id} by {author}:\n{body}"
+    )
 
 
 def _session_captain_profile(session: dict) -> str:
@@ -10572,12 +10612,14 @@ def _session_captain_profile(session: dict) -> str:
     process-global env guess, so a Desktop session pinned to another profile
     reads that profile's ledger.
     """
+    from hermes_cli.profiles import normalize_profile_name
+
     try:
         if isinstance(session, dict) and session.get("profile_home"):
-            return Path(session["profile_home"]).name
+            return normalize_profile_name(Path(session["profile_home"]).name)
     except Exception:
         pass
-    return _current_profile_name()
+    return normalize_profile_name(_current_profile_name())
 
 
 def _session_key_is_live(session_key: str) -> bool:
@@ -10735,6 +10777,9 @@ def _collect_captain_reports(
                 "owner": owner,
                 "expected_count": len(events),
                 "task_ids": {ev.task_id},
+                "signal_task_ids": (
+                    {ev.task_id} if ev.kind == "captain_signal" else set()
+                ),
                 "deliveries": deliveries,
             })
             continue  # already delivered via the exact-origin route this batch
@@ -10745,13 +10790,24 @@ def _collect_captain_reports(
         # Captain payloads are a stricter privacy boundary than the existing
         # exact-origin notification: never copy the raw spawn/tool error, and
         # force-redact credential-shaped text even when global redaction is off.
-        text = _format_kanban_event_text(
-            {"task_id": ev.task_id},
-            task,
-            ev,
-            slug,
-            include_error_detail=False,
-        )
+        if ev.kind == "captain_signal":
+            payload = ev.payload or {}
+            try:
+                comment_id = int(payload.get("comment_id"))
+            except (TypeError, ValueError):
+                comment_id = 0
+            comment = _kb.get_comment(conn, comment_id) if comment_id else None
+            if comment is not None and comment.task_id != ev.task_id:
+                comment = None
+            text = _format_captain_signal_text(task, ev, slug, comment)
+        else:
+            text = _format_kanban_event_text(
+                {"task_id": ev.task_id},
+                task,
+                ev,
+                slug,
+                include_error_detail=False,
+            )
         if text:
             from agent.redact import redact_sensitive_text
 
@@ -10787,6 +10843,9 @@ def _collect_captain_reports(
             "owner": owner,
             "expected_count": len(events),
             "task_ids": {ev.task_id},
+            "signal_task_ids": (
+                {ev.task_id} if ev.kind == "captain_signal" else set()
+            ),
             "deliveries": deliveries,
         })
     return leased_count
@@ -11079,7 +11138,7 @@ def _collect_kanban_notifications(
             # Preserve delivery if the read-only probe cannot inspect a
             # locked, corrupt, or otherwise unusual database.
             open_writable = True
-        if not open_writable:
+        if not open_writable and claim_records is not None:
             try:
                 open_writable = _kb.count_captain_pending(
                     board=slug, profile=captain_profile
@@ -11138,10 +11197,27 @@ def _collect_kanban_notifications(
                         "SELECT 1 FROM kanban_captain_inbox WHERE event_id = ?",
                         (ev.id,),
                     ).fetchone() is not None
-                    if captain_backed:
-                        # Registered events have ONE shared durable claim: the
-                        # Captain lease. The exact cursor may advance, but it
-                        # never renders a second external delivery.
+                    captain_owner = conn.execute(
+                        "SELECT profile, origin_session_key "
+                        "FROM kanban_captain_registry WHERE task_id = ?",
+                        (ev.task_id,),
+                    ).fetchone()
+                    captain_owned_here = bool(
+                        captain_owner
+                        and captain_owner["profile"] == captain_profile
+                        and (
+                            not captain_owner["origin_session_key"]
+                            or captain_owner["origin_session_key"] == session_key
+                        )
+                    )
+                    if (
+                        captain_backed
+                        and captain_owned_here
+                        and claim_records is not None
+                    ):
+                        # When this session owns both routes, the Captain lease
+                        # is the single delivery receipt. Other creator sessions
+                        # retain their independent exact-origin notification.
                         continue
                     # Record every event id the exact-origin route claimed so
                     # the Captain route can settle-but-not-duplicate the same
@@ -11233,7 +11309,11 @@ def _renew_kanban_notification_claims(
 
 
 def _settle_kanban_notification_claims(
-    claim_records: list[dict], *, accepted: bool
+    claim_records: list[dict],
+    *,
+    accepted: bool,
+    reply_author: str | None = None,
+    reply_body: str | None = None,
 ) -> None:
     """Authoritatively ack accepted claims or rewind every rejected claim.
 
@@ -11255,11 +11335,26 @@ def _settle_kanban_notification_claims(
                 if not owner:
                     raise RuntimeError("Captain settlement claim has no fenced owner")
                 if accepted:
-                    settled = _kb.ack_captain_reports(
-                        conn,
-                        token=record["token"],
-                        owner=owner,
-                    )
+                    signal_task_ids = set(record.get("signal_task_ids") or ())
+                    if signal_task_ids:
+                        if not reply_author or not reply_body or not reply_body.strip():
+                            raise RuntimeError(
+                                "Captain signal settlement requires a persisted reply"
+                            )
+                        settled = _kb.ack_captain_reports_with_reply(
+                            conn,
+                            token=record["token"],
+                            owner=owner,
+                            reply_author=reply_author,
+                            reply_body=reply_body,
+                            reply_task_ids=signal_task_ids,
+                        )
+                    else:
+                        settled = _kb.ack_captain_reports(
+                            conn,
+                            token=record["token"],
+                            owner=owner,
+                        )
                     if settled != expected:
                         raise RuntimeError(
                             f"Captain ack expected {expected} row(s), got {settled}"
@@ -11343,6 +11438,47 @@ def _settle_kanban_notification_claims(
         raise RuntimeError(f"Kanban notification settlement failed: {detail}") from errors[0]
 
 
+def _settle_captain_turn_claims(
+    session: dict,
+    claim_records: list[dict],
+    *,
+    completion_id: str,
+    captain_profile: str,
+    succeeded: bool,
+) -> None:
+    """Settle a Captain turn, posting its durable reply for signal claims."""
+    signal_tasks = {
+        task_id
+        for record in claim_records
+        if record.get("route") == "captain"
+        for task_id in (record.get("signal_task_ids") or ())
+    }
+    if not succeeded or not signal_tasks:
+        _settle_kanban_notification_claims(
+            claim_records,
+            accepted=bool(succeeded),
+        )
+        return
+
+    try:
+        receipt = _persisted_captain_report(session, completion_id)
+        if receipt is None:
+            raise RuntimeError("Captain signal reply is not durable")
+        reply_body = _captain_reply_text(receipt)
+        if not reply_body:
+            raise RuntimeError("Captain signal reply is empty")
+    except Exception:
+        _settle_kanban_notification_claims(claim_records, accepted=False)
+        raise
+
+    _settle_kanban_notification_claims(
+        claim_records,
+        accepted=True,
+        reply_author=captain_profile,
+        reply_body=reply_body,
+    )
+
+
 _CAPTAIN_COMPLETION_METADATA_KEY = "captain_completion_id"
 _CAPTAIN_TURN_PURPOSE = "captain_report"
 
@@ -11402,6 +11538,21 @@ def _persisted_captain_report(session: dict, completion_id: str):
     return None
 
 
+def _captain_reply_text(receipt: object) -> str:
+    """Return one bounded, force-redacted durable Captain reply."""
+    from agent.redact import redact_sensitive_text
+
+    if not isinstance(receipt, dict):
+        return ""
+    return _truncate_utf8(
+        redact_sensitive_text(
+            str((receipt.get("report") or {}).get("content") or ""),
+            force=True,
+        ),
+        _CAPTAIN_SIGNAL_BODY_BYTE_CAP,
+    ).strip()
+
+
 def _reconcile_persisted_captain_report(
     sid: str,
     session: dict,
@@ -11417,7 +11568,12 @@ def _reconcile_persisted_captain_report(
     if receipt.get("moved"):
         pending.add(completion_id)
 
-    _settle_kanban_notification_claims(claim_records, accepted=True)
+    _settle_kanban_notification_claims(
+        claim_records,
+        accepted=True,
+        reply_author=_session_captain_profile(session),
+        reply_body=_captain_reply_text(receipt),
+    )
 
     with session["history_lock"]:
         if not any(
@@ -11652,8 +11808,12 @@ def _notification_poller_loop(
                                     _settled.set()
                                     return
                                 try:
-                                    _settle_kanban_notification_claims(
-                                        _kanban_claims, accepted=bool(succeeded)
+                                    _settle_captain_turn_claims(
+                                        session,
+                                        _kanban_claims,
+                                        completion_id=completion_id,
+                                        captain_profile=_session_captain_profile(session),
+                                        succeeded=bool(succeeded),
                                     )
                                 finally:
                                     # Mark after the authoritative attempt, not
@@ -12852,7 +13012,10 @@ def _run_prompt_submit(
                 terminal_settlement = None
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
-            if completion_id:
+            # The stable Captain id is a success receipt. Failed/interrupted
+            # attempts release or retain the inbox lease for retry and must not
+            # teach clients that the durable report was already delivered.
+            if completion_id and status == "complete":
                 payload["id"] = completion_id
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
