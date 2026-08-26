@@ -1536,31 +1536,6 @@ def _resolve_captain_origin_session_key(captain_profile: str) -> Optional[str]:
     return origin_session_key
 
 
-def _maybe_register_captain(conn: Any, task_id: str) -> bool:
-    """Legacy reconciliation helper for callers outside atomic ``create_task``.
-
-    Runs unconditionally (no config gate — this is a separate mechanism from
-    the exact-origin notify subscription). The configured logical Captain owns
-    the task; the exact TUI/Desktop origin session key is recorded only when the
-    creator is such a session, so a live origin session owns delivery while
-    present. Gateway/CLI/cron/unattached creators register with no origin
-    session and invent NO platform/chat destination. New create paths register
-    transactionally; this helper remains bounded and reports success explicitly.
-    """
-    try:
-        from hermes_cli import kanban_db as _kb
-        captain_profile = _resolve_creator_profile()
-        _kb.register_captain_owner(
-            conn, task_id,
-            profile=captain_profile,
-            origin_session_key=_resolve_captain_origin_session_key(captain_profile),
-        )
-        return True
-    except Exception as _exc:
-        logger.warning("_maybe_register_captain failed: %r", _exc)
-        return False
-
-
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 

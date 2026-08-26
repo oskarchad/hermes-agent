@@ -10622,25 +10622,6 @@ def _session_captain_profile(session: dict) -> str:
     return normalize_profile_name(_current_profile_name())
 
 
-def _session_key_is_live(session_key: str) -> bool:
-    """True when some non-finalized in-process session carries ``session_key``.
-
-    ``_sessions`` is the source of TUI/Desktop liveness. Used to decide Captain
-    eligibility: a non-origin session may only claim a task's report while its
-    registered origin session is absent/finalized.
-    """
-    if not session_key:
-        return False
-    key = str(session_key)
-    with _sessions_lock:
-        for sess in _sessions.values():
-            if not isinstance(sess, dict) or sess.get("_finalized"):
-                continue
-            if str(sess.get("session_key") or "") == key:
-                return True
-    return False
-
-
 def _captain_row_eligible(
     conn,
     *,
