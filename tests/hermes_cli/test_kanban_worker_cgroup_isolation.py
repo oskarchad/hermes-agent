@@ -1473,4 +1473,3 @@ def test_genuine_spawn_failure_still_trips_failure_budget(monkeypatch, tmp_path)
         )
     finally:
         conn.close()
-

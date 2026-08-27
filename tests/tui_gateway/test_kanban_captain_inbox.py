@@ -1735,4 +1735,3 @@ def test_gc_compacts_old_acked_rows_and_reopen_gets_new_event():
     second = _collect_kanban_notifications(session, claim_records=claims)
     assert len(second) == 1
     assert "second" in second[0]
-

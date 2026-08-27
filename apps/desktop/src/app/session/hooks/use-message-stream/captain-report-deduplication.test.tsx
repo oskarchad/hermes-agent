@@ -118,4 +118,3 @@ describe('Captain report completion receipts', () => {
     ).toHaveLength(1)
   })
 })
-

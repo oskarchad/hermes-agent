@@ -501,4 +501,3 @@ def test_gateway_settlement_posts_persisted_otto_reply_on_signal_task_once(
     assert [(comment.author, comment.body) for comment in comments].count(
         ("otto", "ACK — use route A.")
     ) == 1
-
