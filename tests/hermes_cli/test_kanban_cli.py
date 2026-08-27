@@ -57,6 +57,99 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_slash_create_registers_configured_orchestrator_not_session_or_author(
+    kanban_home, monkeypatch
+):
+    """The configured orchestrator owns the tree regardless of who creates it."""
+    from hermes_cli import config, profiles
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"orchestrator_profile": "Captain"}},
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "Otto")
+
+    out = kc.run_slash("create 'session-owned card' --assignee peer")
+    assert "Created" in out
+
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT profile FROM kanban_captain_registry"
+        ).fetchall()
+        authors = conn.execute("SELECT created_by FROM tasks").fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["profile"] == "captain"
+    # Task authorship is unchanged (default author label), proving the two
+    # concerns are decoupled.
+    assert authors[0]["created_by"] == "user"
+
+
+def test_cli_create_registers_configured_orchestrator_when_no_session_profile(
+    kanban_home, monkeypatch
+):
+    """A plain CLI create is owned by configuration, not its launch profile."""
+    from hermes_cli import config, profiles
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"orchestrator_profile": "Otto"}},
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "Reviewer")
+
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args(
+        ["kanban", "create", "cli card", "--assignee", "peer", "--created-by", "user"]
+    )
+    assert kc.kanban_command(args) == 0
+
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT profile FROM kanban_captain_registry"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["profile"] == "otto"
+
+
+def test_slash_create_prefers_configured_orchestrator_over_context_and_process(
+    kanban_home, monkeypatch
+):
+    """Session and process identities cannot override logical tree ownership."""
+    from hermes_cli import config, profiles
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"orchestrator_profile": "Captain"}},
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setenv("HERMES_PROFILE", "Default")
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    tokens = set_session_vars(profile="Otto")
+    try:
+        out = kc.run_slash("create 'context-owned card' --assignee peer")
+    finally:
+        clear_session_vars(tokens)
+
+    assert "Created" in out
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT profile FROM kanban_captain_registry"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["profile"] == "captain"
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

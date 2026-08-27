@@ -1437,6 +1437,8 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            captain_profile = _resolve_creator_profile()
+            captain_origin = _resolve_captain_origin_session_key(captain_profile)
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1466,8 +1468,14 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                captain_profile=captain_profile,
+                captain_origin_session_key=captain_origin,
             )
             new_task = kb.get_task(conn, new_tid)
+            captain_registered = conn.execute(
+                "SELECT 1 FROM kanban_captain_registry WHERE task_id = ?",
+                (new_tid,),
+            ).fetchone() is not None
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1476,6 +1484,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                captain_registered=captain_registered,
             )
         finally:
             conn.close()
@@ -1484,6 +1493,47 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _resolve_creator_profile() -> str:
+    """Resolve the configured logical Captain for a newly rooted task tree.
+
+    Task authorship and exact-origin notification routing remain session scoped;
+    durable Captain ownership follows ``kanban.orchestrator_profile``.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    return _kb.resolve_captain_profile()
+
+
+def _resolve_captain_origin_session_key(captain_profile: str) -> Optional[str]:
+    """Return a TUI/Desktop origin only when that session is the Captain."""
+    from hermes_cli.profiles import get_active_profile_name, normalize_profile_name
+
+    try:
+        active_profile = normalize_profile_name(get_active_profile_name())
+        logical_captain = normalize_profile_name(captain_profile)
+    except Exception:
+        return None
+    if active_profile != logical_captain:
+        return None
+
+    origin_session_key: Optional[str] = None
+    platform = ""
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        session_key = (
+            get_session_env("HERMES_SESSION_KEY", "")
+            or os.environ.get("HERMES_SESSION_KEY", "")
+        )
+    except Exception:
+        chat_id = ""
+        session_key = os.environ.get("HERMES_SESSION_KEY", "")
+    if session_key and not (platform and chat_id):
+        origin_session_key = session_key
+    return origin_session_key
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:

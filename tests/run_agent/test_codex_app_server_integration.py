@@ -73,6 +73,79 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_task_only_turn_is_rejected_without_touching_persistent_codex_thread(self):
+        """Captain synthesis cannot reuse the user's stateful Codex thread."""
+
+        class _OrdinaryCodexSession:
+            def __init__(self):
+                self.thread_id = "ordinary-thread-with-private-history"
+                self.history = ["PRIVATE_CODEX_THREAD_CONTEXT"]
+                self.calls = 0
+
+            def run_turn(self, user_input: str, **_kwargs):
+                self.calls += 1
+                self.history.append(user_input)
+                return TurnResult(
+                    final_text="unsafe synthetic result",
+                    projected_messages=[
+                        {"role": "assistant", "content": "unsafe synthetic result"}
+                    ],
+                    thread_id=self.thread_id,
+                )
+
+        agent = _make_codex_agent(session_id="codex-task-only")
+        ordinary_session = _OrdinaryCodexSession()
+        agent._codex_session = ordinary_session
+        agent._cached_system_prompt = "ORDINARY_CODEX_PROMPT"
+        agent._cached_system_prompt_static = "ORDINARY_CODEX_STATIC_PREFIX"
+        agent._memory_manager = MagicMock()
+        agent._sync_external_memory_for_turn = MagicMock()
+        agent._spawn_background_review = MagicMock()
+        session_state_before = (
+            ordinary_session.thread_id,
+            list(ordinary_session.history),
+            ordinary_session.calls,
+        )
+        counters_before = (
+            agent.session_api_calls,
+            agent._user_turn_count,
+            agent._iters_since_skill,
+        )
+
+        with patch("hermes_cli.lifecycle.invoke_hook") as lifecycle_hook, patch(
+            "hermes_cli.plugins.invoke_hook"
+        ) as plugin_hook:
+            result = agent.run_conversation(
+                "Captain must not enter Codex thread",
+                conversation_history=[],
+                task_id="captain-codex-task",
+                task_only_context=True,
+            )
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["failed"] is True
+        assert "codex_app_server" in result["error"]
+        assert "retry" in result["error"].lower()
+        assert agent._codex_session is ordinary_session
+        assert (
+            ordinary_session.thread_id,
+            ordinary_session.history,
+            ordinary_session.calls,
+        ) == session_state_before
+        assert (
+            agent.session_api_calls,
+            agent._user_turn_count,
+            agent._iters_since_skill,
+        ) == counters_before
+        assert agent._cached_system_prompt == "ORDINARY_CODEX_PROMPT"
+        assert agent._cached_system_prompt_static == "ORDINARY_CODEX_STATIC_PREFIX"
+        agent._memory_manager.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+        agent._spawn_background_review.assert_not_called()
+        lifecycle_hook.assert_not_called()
+        plugin_hook.assert_not_called()
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

@@ -133,8 +133,10 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    task_only_context=False,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    persist_assistant_display_metadata=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -296,6 +298,7 @@ def finalize_turn(
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    _session_persisted = False
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -401,7 +404,7 @@ def finalize_turn(
         # persisted, run micro-compaction to absorb the oldest uncompacted
         # exchange into the rolling summary.  This amortizes compression
         # across turns rather than batching it into one big pause.
-        if not interrupted and not failed:
+        if not task_only_context and not interrupted and not failed:
             try:
                 _compressor = getattr(agent, "context_compressor", None)
                 # Strict `is True` + isinstance gates: plugin context engines
@@ -447,7 +450,30 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
-        agent._persist_session(messages, conversation_history)
+        if (
+            persist_assistant_display_metadata
+            and final_response
+            and not interrupted
+            and not failed
+        ):
+            for _message in reversed(messages):
+                if not isinstance(_message, dict) or _message.get("role") != "assistant":
+                    continue
+                _existing_metadata = _message.get("display_metadata")
+                if not isinstance(_existing_metadata, dict):
+                    _existing_metadata = {}
+                _message["display_metadata"] = {
+                    **_existing_metadata,
+                    **persist_assistant_display_metadata,
+                }
+                if _message.get("_db_persisted"):
+                    _message["_db_display_metadata_dirty"] = True
+                    agent._db_flush_scan_prefix = None
+                break
+
+        _session_persisted = (
+            agent._persist_session(messages, conversation_history) is True
+        )
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -594,7 +620,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not task_only_context:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -617,7 +643,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if final_response and not interrupted and not task_only_context:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -647,18 +673,19 @@ def finalize_turn(
         # provider response (early failure / interrupt), which is exactly the
         # contract: real usage when available, ``None`` otherwise.
         _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
+        if not task_only_context:
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
 
@@ -745,6 +772,9 @@ def finalize_turn(
             result["failure_reason"] = (
                 "session_persistence_failed:" + (_cause or "unknown")
             )
+    # Durable consumers need an explicit commit receipt. Ordinary callers still
+    # receive the generated response on a final cleanup failure (#8049).
+    result["session_persisted"] = _session_persisted
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).
@@ -770,19 +800,23 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
-            and agent._iters_since_skill >= agent._skill_nudge_interval
-            and "skill_manage" in agent.valid_tool_names):
+    if (
+        not task_only_context
+        and agent._skill_nudge_interval > 0
+        and agent._iters_since_skill >= agent._skill_nudge_interval
+        and "skill_manage" in agent.valid_tool_names
+    ):
         _should_review_skills = True
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    if not task_only_context:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
@@ -792,6 +826,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not task_only_context
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
@@ -816,18 +851,19 @@ def finalize_turn(
     # Plugins can use this for cleanup, flushing buffers, etc.
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
+        if not task_only_context:
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=_turn_exit_reason,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 

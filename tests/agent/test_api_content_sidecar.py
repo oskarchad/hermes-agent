@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
@@ -446,14 +447,14 @@ def wire_env():
     db = SessionDB(db_path=Path(test_home) / "state.db")
     sid = "sess-wire"
 
-    def make_agent():
+    def make_agent(session_id=sid):
         agent = AIAgent(
             api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
             provider="openai-compat", model="test-model",
             max_iterations=10, enabled_toolsets=[],
             quiet_mode=True, skip_context_files=True, skip_memory=True,
             save_trajectories=False, platform="cli",
-            session_db=db, session_id=sid,
+            session_db=db, session_id=session_id,
         )
         agent.valid_tool_names = {"read_file"}
         return agent
@@ -487,6 +488,362 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_task_only_turn_bypasses_dynamic_context_and_finalization_hooks(
+        self, wire_env
+    ):
+        """A Captain-style turn reaches the provider and persistence seams cleanly.
+
+        This is intentionally production-shaped: a real ``AIAgent`` sends one
+        request to the in-process provider while an overriding context engine,
+        lifecycle plugins, and external-memory/review doubles all attempt to
+        observe or rewrite the synthetic turn.
+        """
+        from agent.context_engine import ContextEngine
+
+        make_agent, handler, db, sid = wire_env
+        dynamic_calls = []
+        ordinary_marker = "ORDINARY_HISTORY_MUST_NOT_REACH_CAPTAIN"
+        ordinary_prompt_markers = {
+            "context_file": "CONTEXT_FILE_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "memory": "BUILTIN_MEMORY_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "user": "USER_PROFILE_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "external_memory": "EXTERNAL_MEMORY_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "skill": "SKILL_INDEX_MARKER_MUST_NOT_REACH_CAPTAIN",
+            "plugin": "PLUGIN_PROMPT_MARKER_MUST_NOT_REACH_CAPTAIN",
+        }
+        ordinary_system_prompt = "\n\n".join(ordinary_prompt_markers.values())
+
+        class _OrdinaryHistoryEngine(ContextEngine):
+            @property
+            def name(self):
+                return "ordinary-history"
+
+            def update_from_response(self, usage):
+                dynamic_calls.append("update_from_response")
+
+            def should_compress(self, prompt_tokens=None):
+                dynamic_calls.append("should_compress")
+                return False
+
+            def note_request_rough_estimate(self, request_tokens):
+                dynamic_calls.append("note_request_rough_estimate")
+
+            def compress(
+                self,
+                messages,
+                current_tokens=None,
+                focus_topic=None,
+                force=False,
+                memory_context="",
+            ):
+                return messages
+
+            def select_context(self, request_messages, **kwargs):
+                dynamic_calls.append("select_context")
+                return [
+                    request_messages[0],
+                    {"role": "user", "content": ordinary_marker},
+                    {"role": "assistant", "content": "ordinary reply"},
+                    request_messages[-1],
+                ]
+
+            def on_turn_complete(self, messages, usage=None, **kwargs):
+                dynamic_calls.append("on_turn_complete")
+
+            _micro_compact_enabled = True
+
+            def _micro_compact(self, messages):
+                dynamic_calls.append("micro_compact")
+                return messages
+
+        def invoke_dynamic_hook(name, **kwargs):
+            dynamic_calls.append(name)
+            if name == "transform_llm_output":
+                return [f"TRANSFORMED WITH {ordinary_marker}"]
+            if name == "pre_llm_call":
+                return [{"context": ordinary_marker}]
+            return []
+
+        agent = make_agent()
+        agent.compression_enabled = True
+        agent.context_compressor = _OrdinaryHistoryEngine()
+        agent.prefill_messages = [
+            {"role": "assistant", "content": ordinary_marker},
+        ]
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = ""
+        agent._memory_manager.prefetch_all.return_value = ordinary_marker
+        agent._sync_external_memory_for_turn = MagicMock()
+        agent._spawn_background_review = MagicMock()
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 1
+        agent.valid_tool_names = {"skill_manage"}
+        # Model a warm production session whose byte-stable prompt already
+        # contains every ordinary prompt source. Captain synthesis must use a
+        # separate static prompt without replacing either cache tier or the
+        # canonical SessionDB prompt.
+        agent._cached_system_prompt = ordinary_system_prompt
+        agent._cached_system_prompt_static = ordinary_prompt_markers["context_file"]
+        agent.ephemeral_system_prompt = ordinary_prompt_markers["plugin"]
+        db.create_session(session_id=sid, source="cli")
+        db.update_system_prompt(sid, ordinary_system_prompt)
+        cached_prompt_before = agent._cached_system_prompt
+        cached_static_before = agent._cached_system_prompt_static
+        handler.response_queue.append(_text_resp("Captain bounded report"))
+
+        with patch("hermes_cli.lifecycle.invoke_hook", side_effect=invoke_dynamic_hook):
+            result = agent.run_conversation(
+                "Captain bounded task",
+                conversation_history=[],
+                task_id="captain-task",
+                task_only_context=True,
+            )
+
+        requests = _chat_requests(handler)
+        assert len(requests) == 1
+        assert dynamic_calls == []
+        sent_messages = requests[0]["messages"]
+        assert [message["role"] for message in sent_messages] == ["system", "user"]
+        assert sent_messages[-1]["content"] == "Captain bounded task"
+        assert ordinary_marker not in json.dumps(sent_messages)
+        sent_system_prompt = sent_messages[0]["content"]
+        assert "Captain" in sent_system_prompt
+        assert len(sent_system_prompt) < 2_000
+        for marker in ordinary_prompt_markers.values():
+            assert marker not in json.dumps(sent_messages)
+        assert result["final_response"] == "Captain bounded report"
+        assert agent._cached_system_prompt == cached_prompt_before
+        assert agent._cached_system_prompt_static == cached_static_before
+        assert db.get_session(sid)["system_prompt"] == ordinary_system_prompt
+        agent._memory_manager.on_turn_start.assert_not_called()
+        agent._memory_manager.prefetch_all.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+        agent._spawn_background_review.assert_not_called()
+
+    def test_task_only_turn_sends_no_tools_and_rejects_unexpected_tool_call(
+        self, wire_env
+    ):
+        """A provider cannot turn automated Captain synthesis into tool execution."""
+        make_agent, handler, _db, _sid = wire_env
+        agent = make_agent()
+        agent.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory",
+                    "description": "mutate persistent state",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        agent.valid_tool_names = {"memory"}
+        mutation_state = {"calls": 0}
+
+        def mutate_if_dispatched(*_args, **_kwargs):
+            mutation_state["calls"] += 1
+
+        agent._execute_tool_calls = MagicMock(side_effect=mutate_if_dispatched)
+        agent._memory_manager = MagicMock()
+        agent._sync_external_memory_for_turn = MagicMock()
+        agent._spawn_background_review = MagicMock()
+        handler.response_queue.append(_tc_resp("memory"))
+
+        with patch("hermes_cli.lifecycle.invoke_hook") as lifecycle_hook, patch(
+            "hermes_cli.plugins.invoke_hook"
+        ) as plugin_hook:
+            result = agent.run_conversation(
+                "Captain adversarial task",
+                conversation_history=[],
+                task_id="captain-adversarial",
+                task_only_context=True,
+            )
+
+        requests = _chat_requests(handler)
+        assert len(requests) == 1
+        assert requests[0].get("tools") in (None, [])
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "tool call" in result["error"].lower()
+        assert mutation_state == {"calls": 0}
+        agent._execute_tool_calls.assert_not_called()
+        lifecycle_hook.assert_not_called()
+        plugin_hook.assert_not_called()
+        agent._memory_manager.assert_not_called()
+        agent._sync_external_memory_for_turn.assert_not_called()
+        agent._spawn_background_review.assert_not_called()
+
+    def test_task_only_rollback_failure_marks_claim_unsafe_to_release(self, wire_env):
+        """A transient cleanup failure must keep the durable claim fenced."""
+        make_agent, handler, db, _sid = wire_env
+        agent = make_agent()
+        completion_id = "kanban-report:rollback-failed"
+        metadata = {"captain_completion_id": completion_id}
+        handler.response_queue.append(_tc_resp("fabricated_tool"))
+
+        with patch.object(
+            db,
+            "rollback_staged_captain_input",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            result = agent.run_conversation(
+                "Captain rollback failure",
+                conversation_history=[],
+                task_id="captain-rollback-failure",
+                task_only_context=True,
+                persist_user_display_kind="kanban_report",
+                persist_user_display_metadata=metadata,
+                persist_assistant_display_metadata=metadata,
+            )
+
+        assert result["failed"] is True
+        assert result["captain_retry_safe"] is False
+        assert [
+            (message["role"], message["content"])
+            for message in db.get_messages_as_conversation(agent.session_id)
+        ] == [("user", "Captain rollback failure")]
+
+    def test_task_only_retry_leaves_one_durable_captain_pair(self, wire_env):
+        """A dirty failed turn retries in another session as one canonical pair."""
+        from hermes_cli import kanban_db as kb
+        import tui_gateway.server as server
+
+        make_agent, handler, db, sid = wire_env
+        fallback_sid = "sess-wire-fallback"
+        session = {"session_key": sid}
+        profile = server._session_captain_profile(session)
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="captain retry residue", assignee="worker"
+            )
+            kb.register_captain_owner(
+                conn, task_id, profile=profile, origin_session_key=None
+            )
+            kb.complete_task(conn, task_id, summary="stable durable retry")
+        finally:
+            conn.close()
+
+        first_claims = []
+        first_texts = server._collect_kanban_notifications(
+            session, claim_records=first_claims
+        )
+        assert len(first_texts) == 1
+        completion_id = server._captain_completion_id(first_claims, first_texts)
+        metadata = {"captain_completion_id": completion_id}
+
+        first_agent = make_agent()
+        handler.response_queue.append(_tc_resp("memory"))
+        with patch.object(
+            db,
+            "rollback_staged_captain_input",
+            side_effect=RuntimeError("transient rollback lock"),
+        ):
+            first = first_agent.run_conversation(
+                first_texts[0],
+                conversation_history=[],
+                task_id="captain-retry-first",
+                task_only_context=True,
+                persist_user_display_kind="kanban_report",
+                persist_user_display_metadata=metadata,
+                persist_assistant_display_metadata=metadata,
+            )
+        assert first["failed"] is True
+        assert first["captain_retry_safe"] is False
+        assert [message["role"] for message in db.get_messages_as_conversation(sid)] == [
+            "user"
+        ]
+
+        # The unsafe terminal outcome keeps the claim leased. Model the bounded
+        # lease expiry/restart before a different same-profile session retries.
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE kanban_captain_inbox SET lease_expires = ? "
+                    "WHERE state = 'leased'",
+                    (int(time.time()) - 1,),
+                )
+        finally:
+            conn.close()
+
+        retry_claims = []
+        retry_texts = server._collect_kanban_notifications(
+            {"session_key": fallback_sid}, claim_records=retry_claims
+        )
+        assert retry_texts == first_texts
+        assert server._captain_completion_id(retry_claims, retry_texts) == completion_id
+
+        # A transient failure while authoritatively reusing the profile-wide
+        # source residue must stop before provider execution or persistence.
+        # The claim is then safely released and the same event can retry.
+        requests_before_reuse_error = len(_chat_requests(handler))
+        failed_retry_agent = make_agent(fallback_sid)
+        handler.response_queue.append(_text_resp("Captain retry settled"))
+        with patch.object(
+            db,
+            "reuse_staged_captain_input",
+            side_effect=RuntimeError("transient staged reuse lock"),
+        ), pytest.raises(RuntimeError, match="transient staged reuse lock"):
+            failed_retry_agent.run_conversation(
+                retry_texts[0],
+                conversation_history=[],
+                task_id="captain-retry-reuse-error",
+                task_only_context=True,
+                persist_user_display_kind="kanban_report",
+                persist_user_display_metadata=metadata,
+                persist_assistant_display_metadata=metadata,
+            )
+        assert len(_chat_requests(handler)) == requests_before_reuse_error
+        assert db.get_messages_as_conversation(fallback_sid) == []
+        assert [message["role"] for message in db.get_messages_as_conversation(sid)] == [
+            "user"
+        ]
+        server._settle_kanban_notification_claims(retry_claims, accepted=False)
+        conn = kb.connect()
+        try:
+            assert conn.execute(
+                "SELECT state FROM kanban_captain_inbox WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0] == "pending"
+        finally:
+            conn.close()
+
+        final_claims = []
+        final_texts = server._collect_kanban_notifications(
+            {"session_key": fallback_sid}, claim_records=final_claims
+        )
+        assert final_texts == first_texts
+        assert server._captain_completion_id(final_claims, final_texts) == completion_id
+
+        second = failed_retry_agent.run_conversation(
+            final_texts[0],
+            conversation_history=[],
+            task_id="captain-retry-second",
+            task_only_context=True,
+            persist_user_display_kind="kanban_report",
+            persist_user_display_metadata=metadata,
+            persist_assistant_display_metadata=metadata,
+        )
+        assert second["session_persisted"] is True
+        server._settle_kanban_notification_claims(final_claims, accepted=True)
+
+        assert db.get_messages_as_conversation(sid) == []
+        reloaded = db.get_messages_as_conversation(fallback_sid)
+        assert [message["role"] for message in reloaded] == ["user", "assistant"]
+        assert [message["content"] for message in reloaded] == [
+            first_texts[0],
+            "Captain retry settled",
+        ]
+        assert all(
+            (message.get("display_metadata") or {}).get("captain_completion_id")
+            == completion_id
+            for message in reloaded
+        )
+        assert all(
+            left["role"] != right["role"]
+            for left, right in zip(reloaded, reloaded[1:])
+        )
+
     def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,
         the sidecar equals the sent bytes exactly, the field never reaches the

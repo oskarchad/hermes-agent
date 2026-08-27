@@ -1192,6 +1192,16 @@ def kanban_command(args: argparse.Namespace) -> int:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _captain_owner_profile() -> str:
+    """Resolve the Captain-owner profile for a CLI / ``/kanban`` create.
+
+    Logical tree ownership follows ``kanban.orchestrator_profile`` (with the
+    canonical ``default`` fallback), never the session/launch profile or the
+    arbitrary ``--created-by`` author label.
+    """
+    return kb.resolve_captain_profile()
+
+
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
     for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
@@ -1614,6 +1624,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            captain_profile=_captain_owner_profile(),
+            captain_origin_session_key=None,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2980,6 +2992,22 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    cap = stats.get("captain_unreported") or {}
+    cap_count = int(cap.get("count") or 0)
+    if cap_count:
+        cap_age = cap.get("oldest_age_seconds")
+        suffix = f" (oldest {int(cap_age)}s)" if cap_age is not None else ""
+        print(f"\nUnreported Captain reports: {cap_count}{suffix}")
+        for row in cap.get("by_profile") or []:
+            row_age = row.get("oldest_age_seconds")
+            row_suffix = f", oldest {int(row_age)}s" if row_age is not None else ""
+            print(
+                f"  {str(row.get('profile') or '-'):20s}  "
+                f"{int(row.get('count') or 0)}{row_suffix}"
+            )
+        truncated = int(cap.get("profiles_truncated") or 0)
+        if truncated:
+            print(f"  … {truncated} more profile(s) not shown")
     return 0
 
 

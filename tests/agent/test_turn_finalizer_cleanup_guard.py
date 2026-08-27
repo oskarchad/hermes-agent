@@ -26,8 +26,9 @@ class _StubCompressor:
 class _StubAgent:
     """Minimal agent surface that ``finalize_turn`` reads from."""
 
-    def __init__(self, *, raise_in):
+    def __init__(self, *, raise_in, persist_result=True):
         self._raise_in = set(raise_in)
+        self._persist_result = persist_result
         self.max_iterations = 3
         self.iteration_budget = _StubBudget()
         self.context_compressor = _StubCompressor()
@@ -73,6 +74,7 @@ class _StubAgent:
     def _persist_session(self, *a, **k):
         if "persist_session" in self._raise_in:
             raise RuntimeError("sqlite database is locked")
+        return self._persist_result
 
     # --- harmless no-ops ------------------------------------------------
     def _emit_status(self, *a, **k):
@@ -106,24 +108,28 @@ def _run(
     final_response=None,
     api_call_count=3,
     turn_exit_reason="unknown",
+    persist_assistant_display_metadata=None,
+    failed=False,
+    messages=None,
 ):
-    messages = [
-        {"role": "user", "content": "do a thing"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
-            ],
-        },
-        {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
-    ]
+    if messages is None:
+        messages = [
+            {"role": "user", "content": "do a thing"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "file contents"},
+        ]
     return finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
         interrupted=False,
-        failed=False,
+        failed=failed,
         messages=messages,
         conversation_history=None,
         effective_task_id="task-1",
@@ -132,6 +138,7 @@ def _run(
         original_user_message="do a thing",
         _should_review_memory=False,
         _turn_exit_reason=turn_exit_reason,
+        persist_assistant_display_metadata=persist_assistant_display_metadata,
     )
 
 
@@ -154,6 +161,7 @@ def test_single_cleanup_step_raises_does_not_skip_others(step):
         )
     ]
     assert len(result["cleanup_errors"]) == 1
+    assert result["session_persisted"] is (step != "persist_session")
 
 
 def test_clean_turn_has_no_cleanup_errors_key():
@@ -161,6 +169,75 @@ def test_clean_turn_has_no_cleanup_errors_key():
     result = _run(agent)
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
+    assert result["session_persisted"] is True
     assert "cleanup_errors" not in result
+
+
+@pytest.mark.parametrize("persist_result", [False, None])
+def test_persistence_receipt_requires_explicit_durable_commit(persist_result):
+    result = _run(_StubAgent(raise_in=(), persist_result=persist_result))
+
+    assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
+    assert result["session_persisted"] is False
+
+
+def test_final_assistant_event_identity_is_stamped_before_persistence():
+    agent = _StubAgent(raise_in=())
+    metadata = {"captain_completion_id": "kanban-report:default:42"}
+
+    result = _run(
+        agent,
+        final_response="Captain report",
+        persist_assistant_display_metadata=metadata,
+    )
+
+    final_assistant = next(
+        message
+        for message in reversed(result["messages"])
+        if message.get("role") == "assistant"
+    )
+    assert final_assistant["content"] == "Captain report"
+    assert final_assistant["display_metadata"] == metadata
+
+
+def test_failed_assistant_is_not_stamped_as_a_durable_captain_receipt():
+    agent = _StubAgent(raise_in=())
+
+    result = _run(
+        agent,
+        final_response="Provider error",
+        failed=True,
+        persist_assistant_display_metadata={
+            "captain_completion_id": "kanban-report:default:failed",
+        },
+    )
+
+    assert all(
+        "captain_completion_id" not in (message.get("display_metadata") or {})
+        for message in result["messages"]
+        if message.get("role") == "assistant"
+    )
+
+
+def test_persisted_final_assistant_is_marked_for_canonical_metadata_update():
+    messages = [
+        {"role": "user", "content": "do a thing", "_db_persisted": True},
+        {
+            "role": "assistant",
+            "content": "Captain report",
+            "_db_persisted": True,
+        },
+    ]
+
+    result = _run(
+        _StubAgent(raise_in=()),
+        final_response="Captain report",
+        messages=messages,
+        persist_assistant_display_metadata={
+            "captain_completion_id": "kanban-report:default:verified",
+        },
+    )
+
+    assert result["messages"][-1]["_db_display_metadata_dirty"] is True
 
 

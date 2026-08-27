@@ -862,7 +862,13 @@ def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
         return False
 
 
-def _restore_or_build_system_prompt(agent, system_message, conversation_history):
+def _restore_or_build_system_prompt(
+    agent,
+    system_message,
+    conversation_history,
+    *,
+    task_only_context=False,
+):
     """Restore the cached system prompt from the session DB or build it fresh.
 
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built
@@ -1044,16 +1050,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if not task_only_context:
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -1061,12 +1068,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # _credits_state already exists). For the plain CLI / any path that didn't seed
     # at build, it primes credits state from /api/oauth/account (or a fixture) on the
     # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
+    if not task_only_context:
+        try:
+            from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+            seed_credits_at_session_start(agent)
+        except Exception:
+            logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
@@ -1831,6 +1839,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    persist_assistant_display_metadata: Optional[Dict[str, Any]] = None,
+    task_only_context: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1856,10 +1866,35 @@ def run_conversation(
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
+        persist_assistant_display_metadata: Optional stable presentation
+            metadata to attach to the final assistant row before persistence.
 
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # The Codex app-server runtime owns a persistent external thread whose
+    # context and finalization lifecycle cannot satisfy Captain's bounded,
+    # no-side-effect synthesis contract. Reject before the ordinary turn
+    # prologue touches counters, prompt caches, persistence, memory, plugins, or
+    # the live Codex session. The TUI poller also defers before claiming; this
+    # guard keeps direct/non-TUI callers fail-closed.
+    if task_only_context and agent.api_mode == "codex_app_server":
+        error = (
+            "Task-only Captain synthesis is unsupported with codex_app_server; "
+            "retry on a supported Hermes runtime."
+        )
+        return {
+            "final_response": "",
+            "messages": [],
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "failed": True,
+            "interrupted": False,
+            "error": error,
+            "session_persisted": False,
+        }
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -1907,6 +1942,7 @@ def run_conversation(
         persist_user_timestamp,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
+        task_only_context=task_only_context,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -2012,6 +2048,7 @@ def run_conversation(
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
+            persist_assistant_display_metadata=persist_assistant_display_metadata,
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
@@ -2095,9 +2132,13 @@ def run_conversation(
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
         # Track tool-calling iterations for skill nudge.
-        # Counter resets whenever skill_manage is actually used.
-        if (agent._skill_nudge_interval > 0
-                and "skill_manage" in agent.valid_tool_names):
+        # Counter resets whenever skill_manage is actually used. Synthetic
+        # task-only turns must not advance ordinary-session review cadence.
+        if (
+            not task_only_context
+            and agent._skill_nudge_interval > 0
+            and "skill_manage" in agent.valid_tool_names
+        ):
             agent._iters_since_skill += 1
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
@@ -2386,7 +2427,7 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
+        if agent.ephemeral_system_prompt and not task_only_context:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
@@ -2444,7 +2485,7 @@ def run_conversation(
 
         # Inject ephemeral prefill messages right after the system prompt
         # but before conversation history. Same API-call-time-only pattern.
-        if agent.prefill_messages:
+        if agent.prefill_messages and not task_only_context:
             sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
             for idx, pfm in enumerate(agent.prefill_messages):
                 # Structural clone: the sanitizers below run over
@@ -2465,13 +2506,14 @@ def run_conversation(
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        api_messages = _apply_context_engine_selection(
-            agent,
-            api_messages,
-            messages,
-            _sel_incoming,
-            logger=request_logger,
-        )
+        if not task_only_context:
+            api_messages = _apply_context_engine_selection(
+                agent,
+                api_messages,
+                messages,
+                _sel_incoming,
+                logger=request_logger,
+            )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -2534,8 +2576,12 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
-        if agent._use_prompt_caching and agent.provider != "moa":
+        tools_for_api = [] if task_only_context else agent.tools
+        if (
+            not task_only_context
+            and agent._use_prompt_caching
+            and agent.provider != "moa"
+        ):
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
                 api_messages,
@@ -2588,7 +2634,7 @@ def run_conversation(
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -2598,7 +2644,7 @@ def run_conversation(
         _note_rough = getattr(
             agent.context_compressor, "note_request_rough_estimate", None
         )
-        if callable(_note_rough):
+        if not task_only_context and callable(_note_rough):
             _note_rough(request_pressure_tokens)
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -2674,7 +2720,8 @@ def run_conversation(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
         if (
-            agent.compression_enabled
+            not task_only_context
+            and agent.compression_enabled
             and not _review_fork_first_request_pending(agent)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
@@ -4180,7 +4227,8 @@ def run_conversation(
                             False,
                         )
                     )
-                    agent.context_compressor.update_from_response(usage_dict)
+                    if not task_only_context:
+                        agent.context_compressor.update_from_response(usage_dict)
                     _compression_threshold = int(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0
@@ -4221,7 +4269,7 @@ def run_conversation(
                     # of interest is the cost/size of the latest assembled
                     # request, so we keep the most recent call's usage.
                     agent._last_turn_usage = dict(usage_dict)
-                elif getattr(
+                elif not task_only_context and getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",
                     False,
@@ -7029,6 +7077,50 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                if task_only_context:
+                    # No Hermes tool schema is exposed for Captain synthesis.
+                    # A provider may still fabricate a call; reject it before
+                    # validation, repair, middleware, hooks, persistence, or
+                    # handler dispatch can observe it. Roll back the crash-staged
+                    # synthetic input before the caller releases the durable
+                    # inbox claim. A profile-wide canonical assistant receipt is
+                    # an atomic guard inside SessionDB and is never removed.
+                    error = (
+                        "Task-only Captain response included an unexpected tool "
+                        "call; the report remains retryable."
+                    )
+                    _captain_completion_id = (
+                        persist_user_display_metadata.get("captain_completion_id")
+                        if isinstance(persist_user_display_metadata, dict)
+                        else None
+                    )
+                    _session_db = getattr(agent, "_session_db", None)
+                    _captain_retry_safe = True
+                    if _captain_completion_id and _session_db is not None:
+                        try:
+                            _session_db.rollback_staged_captain_input(
+                                _captain_completion_id,
+                                agent.session_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Captain staged-input rollback failed for session=%s",
+                                agent.session_id or "none",
+                                exc_info=True,
+                            )
+                            _captain_retry_safe = False
+                    return {
+                        "final_response": "",
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "failed": True,
+                        "interrupted": False,
+                        "error": error,
+                        "session_persisted": False,
+                        "captain_retry_safe": _captain_retry_safe,
+                    }
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -7536,7 +7628,8 @@ def run_conversation(
                     )
 
                 if (
-                    agent.compression_enabled
+                    not task_only_context
+                    and agent.compression_enabled
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
                 ):
@@ -8587,10 +8680,12 @@ def run_conversation(
         turn_id=turn_id,
         user_message=user_message,
         original_user_message=original_user_message,
+        task_only_context=task_only_context,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        persist_assistant_display_metadata=persist_assistant_display_metadata,
     )
 
 

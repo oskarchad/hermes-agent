@@ -7083,6 +7083,710 @@ class _RecordingAgent:
         return {"final_response": "", "messages": []}
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ({"final_response": "ok", "messages": []}, True),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "error": "provider failed",
+                "failed": True,
+            },
+            False,
+        ),
+        (RuntimeError("turn exploded"), False),
+    ],
+)
+def test_run_prompt_submit_reports_real_terminal_outcome(
+    monkeypatch, tmp_path, outcome, expected
+):
+    """Admission is not completion: callback fires from the real terminal path."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    results = []
+
+    def record_terminal(ok):
+        results.append(ok)
+        settled.set()
+
+    class _OutcomeAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    session = _session(
+        session_key="terminal-outcome",
+        agent=_OutcomeAgent([]),
+        running=True,
+    )
+    server._sessions["terminal-outcome"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid", "terminal-outcome", session, "synthetic",
+            on_terminal=record_terminal,
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("terminal-outcome", None)
+
+    assert results == [expected]
+
+
+def test_run_prompt_submit_settles_success_before_terminal_emit_can_fail(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    results = []
+    order = []
+    original_emit = server._emit
+
+    def record_terminal(ok):
+        results.append(ok)
+        order.append(f"settled:{ok}")
+        settled.set()
+
+    def fail_terminal_emit(event, sid, payload=None):
+        if event == "message.complete":
+            # Model a transport that accepted the visible frame and then died
+            # before the worker could observe the write result.
+            order.append("visible")
+            raise RuntimeError("transport write failed")
+        return original_emit(event, sid, payload)
+
+    monkeypatch.setattr(server, "_emit", fail_terminal_emit)
+    session = _session(
+        session_key="terminal-emit-error",
+        agent=_RecordingAgent([]),
+        running=True,
+    )
+    server._sessions["terminal-emit-error"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "terminal-emit-error",
+            session,
+            "synthetic",
+            on_terminal=record_terminal,
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("terminal-emit-error", None)
+
+    assert results == [True]
+    assert order == ["settled:True", "visible"]
+
+
+def test_run_prompt_submit_requires_explicit_persistence_before_success_emit(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    results = []
+    emitted = []
+
+    class _PersistFailureAgent(_RecordingAgent):
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.interim_assistant_callback = None
+            self.reasoning_callback = lambda text: emitted.append(
+                ("reasoning.delta", {"text": text})
+            )
+            self.thinking_callback = lambda text: emitted.append(
+                ("thinking.delta", {"text": text})
+            )
+            self._session_db = type(
+                "_DB", (), {"flush_token_counts": lambda _self: None}
+            )()
+            self._session_persist_lock = None
+            self._persist_disabled = False
+            self._inflight_turn_id = "turn"
+            self._inflight_turn_session_id = "persist-required"
+            self.session_id = "persist-required"
+
+        def _drop_trailing_empty_response_scaffolding(self, _messages):
+            return None
+
+        def _save_session_log(self, _messages):
+            return None
+
+        def _flush_messages_to_session_db(self, _messages, _history):
+            return False
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **kwargs
+        ):
+            assert stream_callback is not None
+            stream_callback("captain report")
+            self.reasoning_callback("captain reasoning")
+            self.thinking_callback("captain thinking")
+            assert self.interim_assistant_callback is not None
+            self.interim_assistant_callback("captain interim")
+            messages = [
+                {"role": "user", "content": "synthetic"},
+                {"role": "assistant", "content": "captain report"},
+            ]
+            from run_agent import AIAgent
+
+            persisted = AIAgent._persist_session(self, messages, [])
+            return {
+                "final_response": "captain report",
+                "messages": messages,
+                "session_persisted": persisted,
+            }
+
+    claims = []
+
+    def record_terminal(ok):
+        server._settle_kanban_notification_claims(claims, accepted=ok)
+        results.append(ok)
+        settled.set()
+
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, payload)),
+    )
+    session = _session(
+        session_key="persist-required",
+        agent=_PersistFailureAgent([]),
+        running=True,
+    )
+    server._sessions["persist-required"] = session
+    try:
+        profile = server._session_captain_profile(session)
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(conn, title="persist-required", assignee="worker")
+            kb.register_captain_owner(
+                conn, tid, profile=profile, origin_session_key=None
+            )
+            kb.complete_task(conn, tid, summary="must survive persistence failure")
+        finally:
+            conn.close()
+        assert len(
+            server._collect_kanban_notifications(session, claim_records=claims)
+        ) == 1
+        assert server._run_prompt_submit(
+            "rid",
+            "persist-required",
+            session,
+            "synthetic",
+            on_terminal=record_terminal,
+            completion_id="kanban-report:board:persist-required",
+            require_persisted=True,
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("persist-required", None)
+
+    assert results == [False]
+    assert not any(
+        event == "message.complete" and (payload or {}).get("status") == "complete"
+        for event, payload in emitted
+    )
+    assert not any(
+        event == "message.complete" and (payload or {}).get("id")
+        for event, payload in emitted
+    )
+    assert not any(event == "message.delta" for event, _payload in emitted)
+    assert not any(event == "message.interim" for event, _payload in emitted)
+    assert not any(
+        event in {"reasoning.delta", "thinking.delta"}
+        for event, _payload in emitted
+    )
+    assert not any(
+        "captain report" in str((payload or {}).get("text") or "")
+        or "captain interim" in str((payload or {}).get("text") or "")
+        for _event, payload in emitted
+    )
+    assert all(
+        message.get("content") != "captain report"
+        for message in session["history"]
+    )
+    assert (session.get("inflight_turn") or {}).get("assistant") in {None, ""}
+    retry_claims = []
+    assert len(
+        server._collect_kanban_notifications(session, claim_records=retry_claims)
+    ) == 1
+
+
+def test_persisted_turn_releases_interim_delta_and_tts_only_after_settlement(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    order = []
+
+    class _TTSQueue:
+        def __init__(self):
+            self.items = []
+
+        def put(self, item):
+            order.append(("tts", item))
+            self.items.append(item)
+
+    tts_queue = _TTSQueue()
+
+    class _PersistedAgent(_RecordingAgent):
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.run_kwargs = None
+            self.interim_assistant_callback = None
+            self.reasoning_callback = lambda text: order.append(
+                ("reasoning.delta", {"text": text})
+            )
+            self.thinking_callback = lambda text: order.append(
+                ("thinking.delta", {"text": text})
+            )
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_assistant_display_metadata=None,
+            **kwargs,
+        ):
+            self.run_kwargs = {
+                "conversation_history": conversation_history,
+                "stream_callback": stream_callback,
+                "persist_assistant_display_metadata": (
+                    persist_assistant_display_metadata
+                ),
+                **kwargs,
+            }
+            assert stream_callback is not None
+            stream_callback("captain final")
+            self.reasoning_callback("captain reasoning")
+            self.thinking_callback("captain thinking")
+            assert self.interim_assistant_callback is not None
+            self.interim_assistant_callback("captain interim")
+            return {
+                "final_response": "captain final",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "captain final"},
+                ],
+                "session_persisted": True,
+            }
+
+    def record_terminal(ok):
+        order.append(("settled", ok))
+        settled.set()
+
+    monkeypatch.setattr(server, "_tts_stream_begin", lambda: tts_queue)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: order.append((event, payload)),
+    )
+    agent = _PersistedAgent([])
+    session = _session(
+        session_key="persist-buffer-success",
+        agent=agent,
+        running=True,
+    )
+    server._sessions["persist-buffer-success"] = session
+    completion_id = "kanban-report:default:success"
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "persist-buffer-success",
+            session,
+            "synthetic",
+            on_terminal=record_terminal,
+            require_persisted=True,
+            completion_id=completion_id,
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("persist-buffer-success", None)
+
+    settled_index = order.index(("settled", True))
+    assistant_events = [
+        (index, event, payload)
+        for index, (event, payload) in enumerate(order)
+        if event
+        in {
+            "message.delta",
+            "reasoning.delta",
+            "thinking.delta",
+            "message.interim",
+            "message.complete",
+        }
+        and (
+            "captain" in str((payload or {}).get("text") or "")
+            or event == "message.complete"
+        )
+    ]
+    assert [(event, (payload or {}).get("text")) for _, event, payload in assistant_events] == [
+        ("message.delta", "captain final"),
+        ("reasoning.delta", "captain reasoning"),
+        ("thinking.delta", "captain thinking"),
+        ("message.interim", "captain interim"),
+        ("message.complete", "captain final"),
+    ]
+    assert all(index > settled_index for index, _event, _payload in assistant_events)
+    assert tts_queue.items == ["captain final", None]
+    assert next(index for index, item in enumerate(order) if item == ("tts", "captain final")) > settled_index
+    assert agent.run_kwargs is not None
+    assert agent.run_kwargs["persist_assistant_display_metadata"] == {
+        "captain_completion_id": completion_id,
+    }
+
+
+def test_persisted_captain_turn_excludes_unrelated_session_history(
+    monkeypatch, tmp_path
+):
+    """Captain model input is the bounded event prompt, never the active chat."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    settled = threading.Event()
+    captured = {}
+
+    class _ContextCapturingAgent(_RecordingAgent):
+        valid_tool_names = set()
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            persist_assistant_display_metadata=None,
+            images=None,
+            task_only_context=False,
+            **kwargs,
+        ):
+            captured["provider_messages"] = [
+                {"role": "system", "content": "approved static persona"},
+                *(conversation_history or []),
+                {"role": "user", "content": prompt},
+            ]
+            captured["images"] = images
+            captured["task_only_context"] = task_only_context
+            assert stream_callback is not None
+            stream_callback("bounded Captain response")
+            return {
+                "final_response": "bounded Captain response",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "bounded Captain response"},
+                ],
+                "session_persisted": True,
+            }
+
+    event_prompt = "Kanban task t_safe completed: bounded handoff"
+    secret_marker = "UNRELATED_SECRET_MARKER_MUST_NOT_REACH_PROVIDER"
+    agent = _ContextCapturingAgent([])
+    session = _session(
+        session_key="captain-task-only-context",
+        agent=agent,
+        running=True,
+    )
+    session["history"] = [
+        {"role": "user", "content": f"ordinary conversation {secret_marker}"},
+        {"role": "assistant", "content": "ordinary reply"},
+    ]
+    session["attached_images"] = ["UNRELATED_SESSION_IMAGE"]
+    session["client_surface"] = "hud"
+    server._sessions["captain-task-only-context"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "captain-task-only-context",
+            session,
+            event_prompt,
+            on_terminal=lambda _ok: settled.set(),
+            require_persisted=True,
+            completion_id="kanban-report:task-only",
+        ) is True
+        assert settled.wait(3.0)
+        session["_run_thread"].join(timeout=3.0)
+    finally:
+        server._sessions.pop("captain-task-only-context", None)
+
+    provider_messages = captured["provider_messages"]
+    assert provider_messages == [
+        {"role": "system", "content": "approved static persona"},
+        {"role": "user", "content": event_prompt},
+    ]
+    assert secret_marker not in json.dumps(provider_messages)
+    assert captured["images"] in (None, [])
+    assert captured["task_only_context"] is True
+    assert session["attached_images"] == ["UNRELATED_SESSION_IMAGE"]
+    assert [message.get("content") for message in session["history"]] == [
+        f"ordinary conversation {secret_marker}",
+        "ordinary reply",
+        event_prompt,
+        "bounded Captain response",
+    ]
+
+
+def test_captain_turn_does_not_drive_goal_or_loop_controllers(
+    monkeypatch, tmp_path
+):
+    """A durable Captain success cannot spend or continue unrelated controllers."""
+    import hermes_cli.goals as goals
+    import hermes_cli.loops as loops
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    controller_state = {
+        "goal_turns_used": 7,
+        "goal_judges": 0,
+        "goal_continuations": 0,
+        "loop_awaiting": True,
+        "loop_completions": 0,
+    }
+
+    class _ActiveGoalManager:
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, *_args, **_kwargs):
+            controller_state["goal_turns_used"] += 1
+            controller_state["goal_judges"] += 1
+            controller_state["goal_continuations"] += 1
+            return {
+                "should_continue": True,
+                "continuation_prompt": "ordinary tools-enabled goal continuation",
+            }
+
+    class _AwaitingLoopManager:
+        def __init__(self, **_kwargs):
+            self.state = types.SimpleNamespace(
+                awaiting_response=controller_state["loop_awaiting"]
+            )
+
+        def complete_tick(self, _response):
+            controller_state["loop_awaiting"] = False
+            controller_state["loop_completions"] += 1
+            return {"message": "loop completed"}
+
+    class _CaptainAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            self._turns.append(prompt)
+            return {
+                "final_response": "Captain report",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "Captain report"},
+                ],
+                "session_persisted": True,
+            }
+
+    monkeypatch.setattr(goals, "GoalManager", _ActiveGoalManager)
+    monkeypatch.setattr(loops, "LoopManager", _AwaitingLoopManager)
+    monkeypatch.setattr(
+        server,
+        "_plan_goal_compression_recovery",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Captain reached compression-goal recovery")
+        ),
+    )
+    turns = []
+    session = _session(
+        session_key="captain-controller-isolation",
+        agent=_CaptainAgent(turns),
+        running=True,
+    )
+    server._sessions["captain-controller-isolation"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "captain-controller-isolation",
+            session,
+            "Captain event",
+            require_persisted=True,
+            completion_id="kanban-report:controller-isolation",
+            turn_purpose="captain_report",
+        ) is True
+    finally:
+        server._sessions.pop("captain-controller-isolation", None)
+
+    assert turns == ["Captain event"]
+    assert controller_state == {
+        "goal_turns_used": 7,
+        "goal_judges": 0,
+        "goal_continuations": 0,
+        "loop_awaiting": True,
+        "loop_completions": 0,
+    }
+
+
+def test_captain_turn_preserves_next_user_and_recovery_controls(
+    monkeypatch, tmp_path
+):
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    marker_calls = []
+    restore_calls = []
+    monkeypatch.setattr(
+        server,
+        "record_turn_start",
+        lambda *_args, **_kwargs: marker_calls.append("record"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_retire_turn_marker",
+        lambda *_args, **_kwargs: marker_calls.append("retire"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_restore_agent_model_runtime",
+        lambda *_args, **_kwargs: restore_calls.append("restore"),
+    )
+
+    run_kwargs = {}
+
+    class _CaptainAgent(_RecordingAgent):
+        def run_conversation(
+            self,
+            prompt,
+            persist_user_display_metadata=None,
+            **kwargs,
+        ):
+            run_kwargs.update(kwargs)
+            run_kwargs["persist_user_display_metadata"] = (
+                persist_user_display_metadata
+            )
+            return {
+                "final_response": "Captain report",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "Captain report"},
+                ],
+                "session_persisted": True,
+            }
+
+    once_restore = {"model": "ordinary-model", "provider": "ordinary-provider"}
+    agent = _CaptainAgent([])
+    session = _session(
+        session_key="captain-control-preservation",
+        agent=agent,
+        running=True,
+        one_turn_model_restore=once_restore,
+        _auto_continue_attempt=2,
+        _auto_continue_prompt="original interrupted user prompt",
+        _auto_continue_scheduled=True,
+    )
+    server._sessions["captain-control-preservation"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "captain-control-preservation",
+            session,
+            "Captain event",
+            require_persisted=True,
+            completion_id="kanban-report:control-preservation",
+            turn_purpose="captain_report",
+        ) is True
+    finally:
+        server._sessions.pop("captain-control-preservation", None)
+
+    assert session["one_turn_model_restore"] is once_restore
+    assert session["_auto_continue_attempt"] == 2
+    assert session["_auto_continue_prompt"] == "original interrupted user prompt"
+    assert session["_auto_continue_scheduled"] is True
+    assert run_kwargs["persist_user_display_metadata"] == {
+        "captain_completion_id": "kanban-report:control-preservation"
+    }
+    assert marker_calls == []
+    assert restore_calls == []
+
+
+@pytest.mark.parametrize(
+    ("control_key", "control_value"),
+    [
+        (
+            "one_turn_model_restore",
+            {"model": "ordinary-model", "provider": "ordinary-provider"},
+        ),
+        (
+            "moa_one_shot_restore",
+            {"model": "ordinary-model", "provider": "ordinary-provider"},
+        ),
+    ],
+)
+def test_captain_defers_bot_capability_rebuild_and_preserves_one_shot_runtime(
+    monkeypatch, tmp_path, control_key, control_value
+):
+    """Captain cannot consume a pending Bot Chat rebuild or one-shot model."""
+    from tools import bot_mode_probe
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    observed_models = []
+
+    class _BotAgent(_RecordingAgent):
+        def __init__(self, model):
+            super().__init__([])
+            self.model = model
+            self.provider = "test-provider"
+            self.api_key = "test-key"
+            self.base_url = "https://example.invalid/v1"
+            self.api_mode = "chat_completions"
+            self._session_title_hint = "Bot Chat"
+
+        def switch_model(self, *, new_model, new_provider, **_kwargs):
+            self.model = new_model
+            self.provider = new_provider
+
+        def run_conversation(self, prompt, **_kwargs):
+            observed_models.append((self.model, prompt))
+            return {
+                "final_response": "Captain report",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "Captain report"},
+                ],
+                "session_persisted": True,
+            }
+
+    def _build_agent(*_args, **kwargs):
+        override = kwargs.get("model_override")
+        model = override.get("model") if isinstance(override, dict) else "config-model"
+        return _BotAgent(model)
+
+    active_agent = _BotAgent("pending-one-shot-model")
+    session = _session(
+        session_key="captain-bot-rebuild",
+        agent=active_agent,
+        running=True,
+        bot_caps_seen="old-fingerprint",
+        **{control_key: control_value},
+    )
+    monkeypatch.setattr(bot_mode_probe, "capability_fingerprint", lambda _home: "new-fingerprint")
+    monkeypatch.setattr(server, "_make_agent", _build_agent)
+    server._sessions["captain-bot-rebuild"] = session
+    try:
+        assert server._run_prompt_submit(
+            "rid",
+            "captain-bot-rebuild",
+            session,
+            "Captain event",
+            require_persisted=True,
+            completion_id="kanban-report:bot-rebuild",
+            turn_purpose="captain_report",
+        ) is True
+    finally:
+        server._sessions.pop("captain-bot-rebuild", None)
+
+    assert observed_models == [("pending-one-shot-model", "Captain event")]
+    assert session[control_key] is control_value
+    assert session["agent"].model == "pending-one-shot-model"
+    assert session["bot_caps_seen"] == "old-fingerprint"
+
+
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(
     monkeypatch, tmp_path
 ):

@@ -5350,3 +5350,194 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+class TestCaptainReportRehome:
+    def test_staged_input_reuse_moves_profile_residue_to_fallback_session(self, db):
+        source = "captain-staged-source"
+        destination = "captain-staged-fallback"
+        stale = "captain-staged-obsolete"
+        completion_id = "kanban-report:staged-fallback"
+        metadata = {"captain_completion_id": completion_id}
+        for session_id in (source, destination, stale):
+            db.create_session(session_id=session_id, source="tui", model="test")
+        db.append_message(
+            source,
+            "user",
+            content="Captain task",
+            display_metadata=metadata,
+        )
+        db.append_message(
+            stale,
+            "user",
+            content="obsolete retry payload",
+            display_metadata=metadata,
+        )
+
+        assert db.reuse_staged_captain_input(
+            completion_id, destination, "Captain task"
+        ) is True
+
+        assert db.get_messages_as_conversation(source) == []
+        assert db.get_messages_as_conversation(stale) == []
+        assert [
+            (message["role"], message["content"])
+            for message in db.get_messages_as_conversation(destination)
+        ] == [("user", "Captain task")]
+        assert db.get_session(source)["message_count"] == 0
+        assert db.get_session(stale)["message_count"] == 0
+        assert db.get_session(destination)["message_count"] == 1
+
+    def test_staged_input_reuse_collapses_retry_residue(self, db):
+        session_id = "captain-staged-reuse"
+        completion_id = "kanban-report:staged-reuse"
+        metadata = {"captain_completion_id": completion_id}
+        db.create_session(session_id=session_id, source="tui", model="test")
+        db.append_messages_batch(
+            session_id,
+            [
+                {"role": "user", "content": "Captain task", "display_metadata": metadata},
+                {"role": "user", "content": "Captain task", "display_metadata": metadata},
+            ],
+        )
+
+        assert db.reuse_staged_captain_input(
+            completion_id, session_id, "Captain task"
+        ) is True
+
+        assert [
+            message["content"] for message in db.get_messages_as_conversation(session_id)
+        ] == ["Captain task"]
+        assert db.get_session(session_id)["message_count"] == 1
+
+    def test_staged_input_rollback_never_deletes_committed_pair(self, db):
+        session_id = "captain-staged-committed"
+        completion_id = "kanban-report:staged-committed"
+        metadata = {"captain_completion_id": completion_id}
+        db.create_session(session_id=session_id, source="tui", model="test")
+        db.append_messages_batch(
+            session_id,
+            [
+                {"role": "user", "content": "Captain task", "display_metadata": metadata},
+                {
+                    "role": "assistant",
+                    "content": "Captain report",
+                    "display_metadata": metadata,
+                },
+            ],
+        )
+
+        assert db.rollback_staged_captain_input(completion_id, session_id) == 0
+        assert [
+            (message["role"], message["content"])
+            for message in db.get_messages_as_conversation(session_id)
+        ] == [
+            ("user", "Captain task"),
+            ("assistant", "Captain report"),
+        ]
+        assert db.get_session(session_id)["message_count"] == 2
+
+    def test_rehome_recomputes_counts_for_tool_turn_and_legacy_duplicate(self, db):
+        source = "captain-source"
+        destination = "captain-destination"
+        duplicate = "captain-legacy-duplicate"
+        completion_id = "kanban-report:count-reconciliation"
+        for session_id in (source, destination, duplicate):
+            db.create_session(session_id=session_id, source="tui", model="test")
+
+        db.append_messages_batch(
+            source,
+            [
+                {"role": "user", "content": "Captain task"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        },
+                        {
+                            "id": "call-2",
+                            "function": {"name": "search_files", "arguments": "{}"},
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+                {
+                    "role": "assistant",
+                    "content": "Canonical Captain report",
+                    "display_metadata": {"captain_completion_id": completion_id},
+                },
+            ],
+        )
+        db.append_messages_batch(
+            destination,
+            [
+                {"role": "user", "content": "ordinary question"},
+                {"role": "assistant", "content": "ordinary answer"},
+            ],
+        )
+        db.append_messages_batch(
+            duplicate,
+            [
+                {"role": "user", "content": "legacy copied task"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "legacy-call",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "legacy-call", "content": "legacy ok"},
+                {
+                    "role": "assistant",
+                    "content": "Legacy duplicate report",
+                    "display_metadata": {"captain_completion_id": completion_id},
+                },
+            ],
+        )
+
+        live_projection = db.get_messages_as_conversation(destination)
+
+        receipt = db.rehome_captain_report(completion_id, destination)
+
+        assert receipt is not None
+        assert [message["content"] for message in receipt["messages"]] == [
+            "Captain task",
+            "",
+            "ok",
+            "Canonical Captain report",
+        ]
+        live_projection.extend(receipt["messages"])
+        resumed_projection = db.get_messages_as_conversation(destination)
+        assert [message["content"] for message in resumed_projection] == [
+            "ordinary question",
+            "ordinary answer",
+            "Captain task",
+            "",
+            "ok",
+            "Canonical Captain report",
+        ]
+        assert live_projection == resumed_projection
+        assert [
+            message["content"]
+            for message in db.get_messages_as_conversation(
+                source,
+                include_inactive=True,
+            )
+        ] == [
+            "Captain task",
+            "",
+            "ok",
+            "Canonical Captain report",
+        ]
+        assert db.get_session(source)["message_count"] == 0
+        assert db.get_session(source)["tool_call_count"] == 0
+        assert db.get_session(destination)["message_count"] == 6
+        assert db.get_session(destination)["tool_call_count"] == 2
+        assert db.get_session(duplicate)["message_count"] == 0
+        assert db.get_session(duplicate)["tool_call_count"] == 0
