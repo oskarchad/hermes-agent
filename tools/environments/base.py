@@ -634,7 +634,7 @@ def _export_dump_excluding_session_vars(
         # would make the FIRST command's value override a later outer
         # harness value arriving via the process env, exactly like the
         # session-var leak this dump already guards against.
-        "AI_AGENT HERMES_AGENT "
+        "AI_AGENT HERMES_AGENT HERMES_DELEGATED_CHILD_CONTEXT "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "

@@ -10715,6 +10715,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        display_metadata_updates: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -10724,6 +10725,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         finish_reason, reasoning*, codex_*, timestamp, api_content,
         display_kind, display_metadata, ...). Reusing that helper keeps ONE
         row-serialization path for every multi-row writer.
+
+        ``display_metadata_updates`` merges presentation metadata into the
+        latest active row matching ``role`` + ``content`` under that same
+        guarded transaction. A missing target aborts the whole write.
 
         A turn-boundary flush writes the whole turn (user + assistant + tool
         rows, typically 3-8 messages) as one BEGIN IMMEDIATE / commit pair
@@ -10741,12 +10746,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the batch commits in chunks of at most that many rows — same
         recovery semantics as the old per-row loops (a mid-copy failure
         leaves a partial seed), just with bounded lock holds. A turn flush
-        never needs it. Returns the inserted row count.
+        never needs it. Returns the committed insert + metadata-update count.
         """
-        if not messages:
+        metadata_updates = list(display_metadata_updates or ())
+        if not messages and not metadata_updates:
             return 0
 
         if chunk_rows is not None and len(messages) > chunk_rows:
+            if metadata_updates:
+                raise ValueError(
+                    "display_metadata_updates cannot be combined with chunked writes"
+                )
             inserted_total = 0
             for start in range(0, len(messages), chunk_rows):
                 inserted_total += self.append_messages_batch(
@@ -10769,6 +10779,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
             )
+            updated = 0
+            for update in metadata_updates:
+                row = conn.execute(
+                    "SELECT id, display_metadata FROM messages "
+                    "WHERE session_id = ? AND role = ? AND content = ? "
+                    "AND active = 1 ORDER BY id DESC LIMIT 1",
+                    (
+                        session_id,
+                        update.get("role"),
+                        self._encode_content(update.get("content")),
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "canonical display metadata update target is missing"
+                    )
+                metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+                patch = update.get("display_metadata")
+                if not isinstance(patch, dict):
+                    raise TypeError("display metadata update must be a mapping")
+                metadata.update(patch)
+                cursor = conn.execute(
+                    "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                    (self._encode_display_metadata(metadata), row["id"]),
+                )
+                updated += cursor.rowcount
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
                 conn.execute(
@@ -10781,7 +10817,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
-            return inserted
+            return inserted + updated
 
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
@@ -11797,6 +11833,343 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 current = child_id
 
             return best if best is not None else session_id
+
+    def reuse_staged_captain_input(
+        self,
+        completion_id: str,
+        session_id: str,
+        content: Any,
+    ) -> bool:
+        """Reuse one unpaired Captain input row after a crashed attempt.
+
+        The completion identity is profile-local because each ``SessionDB`` is
+        rooted under one resolved ``HERMES_HOME``. If a canonical assistant
+        receipt already exists, no input row is changed. Otherwise duplicate
+        active inputs from older failed attempts are collapsed atomically and
+        the survivor can be represented by a fresh in-memory persisted dict.
+        A residue owned by an earlier same-profile session is copied to the
+        current session at the end of its transcript and retired at the source
+        in the same transaction; moving its old row id would reorder a fallback
+        session's ordinary conversation.
+        """
+        if not completion_id or not session_id:
+            return False
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            destination = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if destination is None:
+                raise RuntimeError("Captain staged-input destination session is missing")
+
+            committed = conn.execute(
+                "SELECT 1 FROM messages "
+                "WHERE role = 'assistant' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ? "
+                "LIMIT 1",
+                (completion_id,),
+            ).fetchone()
+            if committed is not None:
+                return False
+
+            rows = conn.execute(
+                "SELECT id, session_id, content FROM messages "
+                "WHERE role = 'user' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ? "
+                "ORDER BY CASE WHEN content = ? THEN 0 ELSE 1 END, "
+                "CASE WHEN session_id = ? THEN 0 ELSE 1 END, id",
+                (completion_id, stored_content, session_id),
+            ).fetchall()
+            matching_rows = [row for row in rows if row["content"] == stored_content]
+            if not matching_rows:
+                return False
+
+            keep_id = int(matching_rows[0]["id"])
+            source_session_id = str(matching_rows[0]["session_id"])
+            affected_session_ids = {str(row["session_id"]) for row in rows}
+            affected_session_ids.add(session_id)
+            if source_session_id != session_id:
+                cursor = conn.execute(
+                    """INSERT INTO messages (
+                           session_id, role, content, tool_call_id, tool_calls,
+                           tool_name, effect_disposition, timestamp, token_count,
+                           finish_reason, reasoning, reasoning_content,
+                           reasoning_details, codex_reasoning_items,
+                           codex_message_items, platform_message_id, observed,
+                           active, compacted, api_content, display_kind,
+                           display_metadata
+                       )
+                       SELECT ?, role, content, tool_call_id, tool_calls,
+                           tool_name, effect_disposition, timestamp, token_count,
+                           finish_reason, reasoning, reasoning_content,
+                           reasoning_details, codex_reasoning_items,
+                           codex_message_items, platform_message_id, observed,
+                           1, compacted, api_content, display_kind,
+                           display_metadata
+                       FROM messages WHERE id = ? AND active = 1""",
+                    (session_id, keep_id),
+                )
+                if int(cursor.rowcount) != 1:
+                    raise RuntimeError("Captain staged input disappeared during rehome")
+                keep_id = int(cursor.lastrowid)
+
+            conn.execute(
+                "UPDATE messages SET active = 0 "
+                "WHERE role = 'user' AND active = 1 AND id != ? "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ?",
+                (keep_id, completion_id),
+            )
+            for affected_session_id in sorted(affected_session_ids):
+                conn.execute(
+                    "UPDATE sessions SET message_count = ("
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1"
+                    ") WHERE id = ?",
+                    (affected_session_id, affected_session_id),
+                )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def rollback_staged_captain_input(
+        self,
+        completion_id: str,
+        session_id: str,
+    ) -> int:
+        """Soft-delete profile-wide unpaired inputs, never a committed report."""
+        if not completion_id or not session_id:
+            return 0
+
+        def _do(conn):
+            committed = conn.execute(
+                "SELECT 1 FROM messages "
+                "WHERE role = 'assistant' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ? "
+                "LIMIT 1",
+                (completion_id,),
+            ).fetchone()
+            if committed is not None:
+                return 0
+
+            rows = conn.execute(
+                "SELECT DISTINCT session_id FROM messages "
+                "WHERE role = 'user' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ?",
+                (completion_id,),
+            ).fetchall()
+            cursor = conn.execute(
+                "UPDATE messages SET active = 0 "
+                "WHERE role = 'user' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ?",
+                (completion_id,),
+            )
+            removed = int(cursor.rowcount)
+            if removed:
+                for row in rows:
+                    affected_session_id = str(row["session_id"])
+                    conn.execute(
+                        "UPDATE sessions SET message_count = ("
+                        "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1"
+                        ") WHERE id = ?",
+                        (affected_session_id, affected_session_id),
+                    )
+            return removed
+
+        return int(self._execute_write(_do) or 0)
+
+    def rehome_captain_report(
+        self,
+        completion_id: str,
+        destination_session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one profile-local Captain receipt, rehoming its turn if needed.
+
+        A :class:`SessionDB` belongs to one resolved ``HERMES_HOME`` profile, so
+        searching this database is the durable profile boundary.  The receipt's
+        completion id already namespaces the board-local event id.  When a
+        fallback session claims an event whose model turn committed in a now-
+        absent session, append that complete synthetic turn to the destination
+        with fresh insertion-order ids, then retire the source rows in the same
+        transaction.  This leaves one canonical, visible transcript projection
+        whose durable order matches the live tail append.
+        """
+        if not completion_id or not destination_session_id:
+            return None
+
+        def _do(conn):
+            destination = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (destination_session_id,),
+            ).fetchone()
+            if destination is None:
+                raise RuntimeError("Captain receipt destination session is missing")
+
+            receipt_rows = conn.execute(
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                "FROM messages "
+                "WHERE role = 'assistant' AND active = 1 "
+                "AND json_valid(display_metadata) = 1 "
+                "AND json_extract(display_metadata, '$.captain_completion_id') = ? "
+                "ORDER BY CASE WHEN session_id = ? THEN 0 ELSE 1 END, id",
+                (completion_id, destination_session_id),
+            ).fetchall()
+            if not receipt_rows:
+                return None
+
+            canonical = receipt_rows[0]
+            canonical_id = int(canonical["id"])
+            source_session_id = str(canonical["session_id"])
+
+            def _turn_start(session_id: str, assistant_id: int) -> int:
+                row = conn.execute(
+                    "SELECT id FROM messages "
+                    "WHERE session_id = ? AND active = 1 AND role = 'user' AND id <= ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id, assistant_id),
+                ).fetchone()
+                return int(row["id"]) if row is not None else assistant_id
+
+            turn_start = _turn_start(source_session_id, canonical_id)
+            source_turn_rows = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ? "
+                "ORDER BY id",
+                (source_session_id, turn_start, canonical_id),
+            ).fetchall()
+            source_turn_ids = [int(row["id"]) for row in source_turn_rows]
+            if not source_turn_ids or canonical_id not in source_turn_ids:
+                raise RuntimeError("Captain receipt lost its canonical source rows")
+
+            affected_session_ids = {
+                source_session_id,
+                destination_session_id,
+            }
+
+            # Old affected builds could already have copied one completion into
+            # multiple sessions. Soft-delete every non-canonical synthetic turn
+            # so normal resume/export projections expose only the chosen receipt.
+            for duplicate in receipt_rows[1:]:
+                duplicate_session_id = str(duplicate["session_id"])
+                affected_session_ids.add(duplicate_session_id)
+                duplicate_id = int(duplicate["id"])
+                duplicate_start = _turn_start(duplicate_session_id, duplicate_id)
+                conn.execute(
+                    "UPDATE messages SET active = 0 "
+                    "WHERE session_id = ? AND active = 1 AND id BETWEEN ? AND ?",
+                    (duplicate_session_id, duplicate_start, duplicate_id),
+                )
+
+            moved = source_session_id != destination_session_id
+            if moved:
+                appended_turn_ids = []
+                for source_turn_id in source_turn_ids:
+                    cursor = conn.execute(
+                        """INSERT INTO messages (
+                               session_id, role, content, tool_call_id, tool_calls,
+                               tool_name, effect_disposition, timestamp, token_count,
+                               finish_reason, reasoning, reasoning_content,
+                               reasoning_details, codex_reasoning_items,
+                               codex_message_items, platform_message_id, observed,
+                               active, compacted, api_content, display_kind,
+                               display_metadata
+                           )
+                           SELECT ?, role, content, tool_call_id, tool_calls,
+                               tool_name, effect_disposition, timestamp, token_count,
+                               finish_reason, reasoning, reasoning_content,
+                               reasoning_details, codex_reasoning_items,
+                               codex_message_items, platform_message_id, observed,
+                               1, compacted, api_content, display_kind,
+                               display_metadata
+                           FROM messages WHERE id = ? AND active = 1""",
+                        (destination_session_id, source_turn_id),
+                    )
+                    if int(cursor.rowcount) != 1:
+                        raise RuntimeError(
+                            "Captain receipt lost a canonical source row during rehome"
+                        )
+                    appended_turn_ids.append(int(cursor.lastrowid))
+
+                placeholders = ",".join("?" for _ in source_turn_ids)
+                conn.execute(
+                    "UPDATE messages SET active = 0 "
+                    f"WHERE active = 1 AND id IN ({placeholders})",
+                    source_turn_ids,
+                )
+                source_turn_ids = appended_turn_ids
+
+            # Appending the canonical turn and soft-deleting its source plus
+            # legacy duplicates is one transaction. Recompute both counters
+            # from the surviving rows before exposing its receipt so the read
+            # model cannot lag the data.
+            for session_id in sorted(affected_session_ids):
+                active_rows = conn.execute(
+                    "SELECT tool_calls FROM messages "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                ).fetchall()
+                tool_call_count = 0
+                for row in active_rows:
+                    raw_tool_calls = row["tool_calls"]
+                    if not raw_tool_calls:
+                        continue
+                    try:
+                        decoded_tool_calls = json.loads(raw_tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        tool_call_count += 1
+                    else:
+                        tool_call_count += (
+                            len(decoded_tool_calls)
+                            if isinstance(decoded_tool_calls, list)
+                            else 1
+                        )
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                    "WHERE id = ?",
+                    (len(active_rows), tool_call_count, session_id),
+                )
+
+            placeholders = ",".join("?" for _ in source_turn_ids)
+            turn_rows = conn.execute(
+                f"SELECT {self._CONVERSATION_ROW_COLUMNS} FROM messages "
+                f"WHERE active = 1 AND id IN ({placeholders}) "
+                "ORDER BY id",
+                source_turn_ids,
+            ).fetchall()
+            messages = self._rows_to_conversation(
+                turn_rows,
+                session_id=destination_session_id,
+                include_ancestors=False,
+                repair_alternation=False,
+            )
+            report = next(
+                (
+                    message
+                    for message in reversed(messages)
+                    if message.get("role") == "assistant"
+                    and isinstance(message.get("display_metadata"), dict)
+                    and message["display_metadata"].get("captain_completion_id")
+                    == completion_id
+                ),
+                None,
+            )
+            if report is None:
+                raise RuntimeError("Captain receipt lost its canonical assistant row")
+            return {
+                "report": report,
+                "messages": messages,
+                "source_session_id": source_session_id,
+                "destination_session_id": destination_session_id,
+                "moved": moved,
+            }
+
+        return self._execute_write(_do)
 
     def get_messages_as_conversation(
         self,

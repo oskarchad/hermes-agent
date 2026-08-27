@@ -21,6 +21,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from hermes_cli.kanban_alerts import (
+    project_kanban_event_lineage,
+    render_kanban_alert,
+)
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -489,6 +493,7 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    latest_run = _kb.latest_run(conn, sub["task_id"])
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -499,6 +504,7 @@ class GatewayKanbanWatchersMixin:
                                         "cursor": cursor,
                                         "events": events,
                                         "task": task,
+                                        "latest_run": latest_run,
                                         "board": slug,
                                     })
                                 except Exception as sub_exc:
@@ -517,6 +523,7 @@ class GatewayKanbanWatchersMixin:
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
+                    latest_run = d.get("latest_run")
                     board_slug = d.get("board")
                     platform_str = (sub["platform"] or "").lower()
                     try:
@@ -573,6 +580,7 @@ class GatewayKanbanWatchersMixin:
                     wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        lineage = None
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -608,17 +616,29 @@ class GatewayKanbanWatchersMixin:
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
+                            lineage = project_kanban_event_lineage(
+                                task, ev, latest_run,
+                            )
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
+                            blocked = "; task is blocked" if lineage.block_is_current else ""
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"after repeated spawn failures{blocked}{err}"
                             )
                         elif kind == "crashed":
+                            lineage = project_kanban_event_lineage(
+                                task, ev, latest_run,
+                            )
+                            recovery = ""
+                            if lineage.retry_is_current:
+                                recovery = "; dispatcher will retry"
+                            elif lineage.block_is_current:
+                                recovery = "; task is blocked"
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"(pid gone){recovery}"
                             )
                         elif kind == "timed_out":
                             limit = 0
@@ -696,6 +716,7 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+                        msg = render_kanban_alert(msg, lineage=lineage)
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)

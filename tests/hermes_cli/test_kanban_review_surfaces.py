@@ -282,7 +282,7 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
         assert secret not in comments[0].body
 
 
-def test_goal_mode_review_handoff_cannot_bypass_judge(
+def test_goal_mode_review_handoff_is_intermediate_before_reviewer_approval(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -294,72 +294,202 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     kb.init_db()
 
     with kb.connect() as conn:
-        tool_task = kb.create_task(
+        task_id = kb.create_task(
             conn,
-            title="Goal-mode tool task",
+            title="Implement a reviewed goal-mode change",
             assignee="builder",
+            body="Acceptance: implementation is verified and independently approved.",
+            skills=["test-driven-development"],
             goal_mode=True,
         )
-        claimed = kb.claim_task(conn, tool_task, claimer="builder:1")
+        claimed = kb.claim_task(conn, task_id, claimer="builder:1")
         assert claimed is not None
-    monkeypatch.setenv("HERMES_KANBAN_TASK", tool_task)
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
 
     from tools import kanban_tools as tools
 
+    judge_evidence: list[str] = []
+
+    def judge_goal(*args, **kwargs):
+        evidence = kwargs.get("last_response", "")
+        judge_evidence.append(evidence)
+        if "Premature completion" in evidence:
+            return "continue", "independent approval is missing", False, None, False
+        if "Reviewer approved" in evidence:
+            return "done", "independent approval recorded", False, None, False
+        pytest.fail(f"unexpected goal judge call for lifecycle handoff: {evidence!r}")
+
     monkeypatch.setattr(tools, "_goal_judge_available", lambda: True)
-    monkeypatch.setattr(
-        tools,
-        "judge_goal",
-        lambda *args, **kwargs: (
-            "continue",
-            "acceptance evidence is missing",
-            False,
-            None,
-            False,
-        ),
+    monkeypatch.setattr(tools, "judge_goal", judge_goal)
+
+    premature = json.loads(
+        tools._handle_complete({"summary": "Premature completion without review."})
     )
-    rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
-    assert "error" in rejected
-    assert "rejected by judge" in rejected["error"]
-    with kb.connect() as conn:
-        tool_after = kb.get_task(conn, tool_task)
-        assert tool_after is not None
-        assert tool_after.status == "running"
+    assert "Goal completion rejected by judge" in premature["error"]
 
-    # The shell/CLI path applies the same gate and must not bypass the tool.
-    with kb.connect() as conn:
-        cli_task = kb.create_task(
-            conn,
-            title="Goal-mode CLI task",
-            assignee="builder",
-            goal_mode=True,
-        )
-        cli_claimed = kb.claim_task(conn, cli_task, claimer="builder:2")
-        assert cli_claimed is not None
-    monkeypatch.setenv("HERMES_KANBAN_TASK", cli_task)
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(cli_claimed.current_run_id))
+    requested = json.loads(
+        tools._handle_request_review({
+            "summary": "Implementation and focused tests are complete.",
+            "metadata": {"commit": "abc123", "tests_run": 4},
+            "reviewer": "reviewer",
+        })
+    )
+    assert requested["ok"] is True
+    assert requested["status"] == "review"
+    assert judge_evidence == ["Premature completion without review."]
 
-    import agent.auxiliary_client as auxiliary_client
+    with kb.connect() as conn:
+        awaiting_review = kb.get_task(conn, task_id)
+        assert awaiting_review is not None
+        assert awaiting_review.status == "review"
+        assert awaiting_review.assignee == "reviewer"
+        assert awaiting_review.current_run_id is None
+        assert awaiting_review.skills is None
+        implementation_run = kb.latest_run(conn, task_id)
+        assert implementation_run is not None
+        assert implementation_run.id == claimed.current_run_id
+        assert implementation_run.outcome == "review_requested"
+        assert implementation_run.profile == "builder"
+        review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+        assert review is not None
+
     from hermes_cli import goals
 
     monkeypatch.setattr(
-        auxiliary_client,
-        "get_text_auxiliary_client",
-        lambda purpose: (object(), "judge-model"),
-    )
-    monkeypatch.setattr(
         goals,
         "judge_goal",
-        lambda *args, **kwargs: ("continue", "tests are missing", False, None, False),
+        lambda *args, **kwargs: pytest.fail(
+            "the implementation goal loop must stop at the review handoff"
+        ),
     )
-    output = kc.run_slash(f"request-review {cli_task} --summary 'Looks ready.'")
-    assert "rejected by judge" in output
-    with kb.connect() as conn:
-        cli_after = kb.get_task(conn, cli_task)
-        assert cli_after is not None
-        assert cli_after.status == "running"
+    loop_result = goals.run_kanban_goal_loop(
+        task_id=task_id,
+        goal_text="implementation plus independent approval",
+        run_turn=lambda prompt: pytest.fail("must not run another implementation turn"),
+        task_status_fn=lambda: "review",
+        block_fn=lambda reason: pytest.fail("must not block"),
+        first_response="Review requested.",
+    )
+    assert loop_result["outcome"] == "review_requested_by_worker"
 
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    approved = json.loads(
+        tools._handle_complete({
+            "summary": "Reviewer approved the verified implementation.",
+        })
+    )
+    assert approved["ok"] is True
+    with kb.connect() as conn:
+        completed = kb.get_task(conn, task_id)
+        assert completed is not None
+        assert completed.status == "done"
+        review_run = kb.latest_run(conn, task_id)
+        assert review_run is not None
+        assert review_run.id == review.current_run_id
+        assert review_run.outcome == "completed"
+        assert review_run.profile == "reviewer"
+
+
+def test_goal_mode_review_changes_restore_implementation_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    implementation_skills = ["test-driven-development"]
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Repair a reviewed goal-mode change",
+            assignee="builder",
+            skills=implementation_skills,
+            goal_mode=True,
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+        assert implementation is not None
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv(
+        "HERMES_KANBAN_RUN_ID",
+        str(implementation.current_run_id),
+    )
+
+    monkeypatch.setattr(
+        kc,
+        "_goal_mode_handoff_rejection",
+        lambda *args, **kwargs: pytest.fail(
+            "request-review is an intermediate transition and must not be judged"
+        ),
+    )
+    output = kc.run_slash(
+        f"request-review {task_id} --reviewer reviewer "
+        "--summary 'Implementation verified.'"
+    )
+    assert "Requested review" in output
+
+    with kb.connect() as conn:
+        awaiting_review = kb.get_task(conn, task_id)
+        assert awaiting_review is not None
+        assert awaiting_review.status == "review"
+        assert awaiting_review.assignee == "reviewer"
+        assert awaiting_review.skills is None
+        review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+        assert review is not None
+
+    from tools import kanban_tools as tools
+
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    changed = json.loads(
+        tools._handle_request_changes({"reason": "Add the missing regression."})
+    )
+    assert changed["ok"] is True
+    assert changed["implementer"] == "builder"
+
+    with kb.connect() as conn:
+        repair_task = kb.get_task(conn, task_id)
+        assert repair_task is not None
+        assert repair_task.status == "ready"
+        assert repair_task.assignee == "builder"
+        assert repair_task.current_run_id is None
+        assert repair_task.skills == implementation_skills
+        review_run = kb.latest_run(conn, task_id)
+        assert review_run is not None
+        assert review_run.id == review.current_run_id
+        assert review_run.outcome == "changes_requested"
+        repair = kb.claim_task(conn, task_id, claimer="builder:2")
+        assert repair is not None
+
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(repair.current_run_id))
+    monkeypatch.setattr(
+        tools,
+        "_goal_mode_handoff_rejection",
+        lambda *args, **kwargs: pytest.fail(
+            "re-review is still an intermediate transition and must not be judged"
+        ),
+    )
+    rereview = json.loads(
+        tools._handle_request_review({
+            "summary": "Regression added and verified.",
+            "reviewer": "reviewer",
+        })
+    )
+    assert rereview["ok"] is True
+    with kb.connect() as conn:
+        awaiting_rereview = kb.get_task(conn, task_id)
+        assert awaiting_rereview is not None
+        assert awaiting_rereview.status == "review"
+        assert awaiting_rereview.assignee == "reviewer"
+        assert awaiting_rereview.skills is None
 
 def test_goal_loop_stops_after_reviewer_requests_changes(
     monkeypatch: pytest.MonkeyPatch,

@@ -67,6 +67,49 @@ describe('createGatewayEventHandler', () => {
     patchUiState({ showReasoning: true })
   })
 
+  it('deduplicates a replayed Captain assistant completion by stable id', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({
+        payload: { id: 'kanban-report:board:42', text: 'Captain report' },
+        type: 'message.complete'
+      } as any)
+    }
+
+    expect(appended.filter(msg => msg.role === 'assistant' && msg.text === 'Captain report')).toHaveLength(1)
+    expect(getUiState().busy).toBe(false)
+  })
+
+  it('does not let a failed attempt consume the stable receipt used by a successful retry', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({
+      payload: {
+        error: 'temporary persistence failure',
+        id: 'kanban-report:board:retry',
+        status: 'error',
+        text: 'temporary persistence failure'
+      },
+      type: 'message.complete'
+    } as any)
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({
+      payload: {
+        id: 'kanban-report:board:retry',
+        status: 'complete',
+        text: 'Captain retry succeeded'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended.filter(msg => msg.role === 'assistant' && msg.text === 'Captain retry succeeded')).toHaveLength(1)
+  })
+
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {
     const appended: Msg[] = []
 

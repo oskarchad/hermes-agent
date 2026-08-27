@@ -75,6 +75,12 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "completed_at": t.completed_at,
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
+        "enabled_toolsets": (
+            list(t.enabled_toolsets) if t.enabled_toolsets is not None else None
+        ),
+        "effective_toolsets": (
+            list(t.effective_toolsets) if t.effective_toolsets is not None else None
+        ),
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
@@ -361,6 +367,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). The kanban lifecycle is already "
                                "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument(
+        "--toolset", action="append", default=[], dest="enabled_toolsets",
+        help="Bound this task's worker tools to a named toolset "
+             "(repeatable). Required lifecycle toolsets are added automatically.",
+    )
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -494,6 +505,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
     )
+
+    # --- set-toolsets (per-task bounded worker surface) ---
+    p_set_toolsets = sub.add_parser(
+        "set-toolsets",
+        help="Set or clear a task's bounded worker toolset allowlist",
+    )
+    p_set_toolsets.add_argument("task_id")
+    p_set_toolsets.add_argument("toolsets", nargs="*")
+    p_set_toolsets.add_argument(
+        "--clear", action="store_true",
+        help="Clear the override and inherit the assignee profile toolsets",
+    )
+    p_set_toolsets.add_argument("--json", action="store_true")
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -1114,6 +1138,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "set-toolsets": _cmd_set_toolsets,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1166,6 +1191,16 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+def _captain_owner_profile() -> str:
+    """Resolve the Captain-owner profile for a CLI / ``/kanban`` create.
+
+    Logical tree ownership follows ``kanban.orchestrator_profile`` (with the
+    canonical ``default`` fallback), never the session/launch profile or the
+    arbitrary ``--created-by`` author label.
+    """
+    return kb.resolve_captain_profile()
+
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
@@ -1580,12 +1615,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
+            enabled_toolsets=(
+                getattr(args, "enabled_toolsets", None) or None
+            ),
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            captain_profile=_captain_owner_profile(),
+            captain_origin_session_key=None,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1890,6 +1930,36 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_toolsets(args: argparse.Namespace) -> int:
+    if args.clear and args.toolsets:
+        print("kanban: --clear cannot be combined with toolset names", file=sys.stderr)
+        return 2
+    requested = None if args.clear else list(args.toolsets)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_enabled_toolsets(conn, args.task_id, requested)
+            task = kb.get_task(conn, args.task_id) if ok else None
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok or task is None:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    elif requested is None:
+        print(
+            f"Cleared toolset override on {args.task_id} "
+            "(worker inherits its profile toolsets)"
+        )
+    else:
+        print(
+            f"Set toolset override on {args.task_id}: "
+            + ",".join(task.effective_toolsets or ())
+        )
     return 0
 
 
@@ -2212,7 +2282,7 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
+    """Return a rejection reason when goal-mode completion is premature."""
     if task is None or not task.goal_mode:
         return None
     try:
@@ -2275,9 +2345,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
-            # to every terminal handoff so request-review cannot bypass the
-            # acceptance contract that protects complete.
+            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Completion
+            # is terminal, so it must satisfy the card's acceptance contract.
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
@@ -2432,17 +2501,6 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
-        rejection = _goal_mode_handoff_rejection(
-            kb.get_task(conn, tid),
-            summary or "",
-        )
-        if rejection is not None:
-            print(
-                f"kanban: goal review handoff of {tid} rejected by judge: "
-                f"{rejection}. Provide acceptance evidence matching the task.",
-                file=sys.stderr,
-            )
-            return 1
         ok, reason = kb.request_review(
             conn,
             tid,
@@ -2934,6 +2992,22 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    cap = stats.get("captain_unreported") or {}
+    cap_count = int(cap.get("count") or 0)
+    if cap_count:
+        cap_age = cap.get("oldest_age_seconds")
+        suffix = f" (oldest {int(cap_age)}s)" if cap_age is not None else ""
+        print(f"\nUnreported Captain reports: {cap_count}{suffix}")
+        for row in cap.get("by_profile") or []:
+            row_age = row.get("oldest_age_seconds")
+            row_suffix = f", oldest {int(row_age)}s" if row_age is not None else ""
+            print(
+                f"  {str(row.get('profile') or '-'):20s}  "
+                f"{int(row.get('count') or 0)}{row_suffix}"
+            )
+        truncated = int(cap.get("profiles_truncated") or 0)
+        if truncated:
+            print(f"  … {truncated} more profile(s) not shown")
     return 0
 
 

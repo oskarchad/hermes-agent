@@ -38,7 +38,12 @@ from tools.registry import (
     registry,
     tool_error,
 )
-from toolsets import resolve_toolset, validate_toolset
+from toolsets import (
+    KANBAN_TASK_TOOLSETS_BOUNDED_ENV,
+    MANDATORY_KANBAN_TASK_TOOLSETS,
+    resolve_toolset,
+    validate_toolset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +375,7 @@ def get_tool_definitions(
                 registry._generation,
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
+                os.environ.get(KANBAN_TASK_TOOLSETS_BOUNDED_ENV) == "1",
                 bool(skip_tool_search_assembly),
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
@@ -423,21 +429,33 @@ def _compute_tool_definitions(
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
     tools_to_include: set = set()
+    dispatcher_worker = bool(
+        os.environ.get("HERMES_KANBAN_TASK")
+        and not _is_delegated_child_context()
+        and _is_dispatcher_owned_worker()
+    )
+    dispatcher_bounded_worker = bool(
+        dispatcher_worker
+        and os.environ.get(KANBAN_TASK_TOOLSETS_BOUNDED_ENV) == "1"
+    )
+    irreducible_worker_toolsets = {"kanban"} if dispatcher_worker else set()
+    if dispatcher_bounded_worker:
+        irreducible_worker_toolsets.update(MANDATORY_KANBAN_TASK_TOOLSETS)
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if (
-            os.environ.get("HERMES_KANBAN_TASK")
-            and not _is_delegated_child_context()
-            and _is_dispatcher_owned_worker()
-            and "kanban" not in effective_enabled_toolsets
-        ):
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive the lifecycle handoff tools. Assignee
-            # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
-            effective_enabled_toolsets.append("kanban")
+        if dispatcher_worker:
+            # Every worker retains board lifecycle. Explicitly bounded tasks
+            # additionally retain the ordered Context7 + Kanban minimum shown
+            # in task readback. Legacy NULL tasks keep profile inheritance.
+            ordered_minimum = (
+                MANDATORY_KANBAN_TASK_TOOLSETS
+                if dispatcher_bounded_worker
+                else ("kanban",)
+            )
+            for mandatory_toolset in ordered_minimum:
+                if mandatory_toolset not in effective_enabled_toolsets:
+                    effective_enabled_toolsets.append(mandatory_toolset)
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -463,6 +481,8 @@ def _compute_tool_definitions(
     # stripped out. See issue #17309.
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
+            if toolset_name in irreducible_worker_toolsets:
+                continue
             if validate_toolset(toolset_name):
                 from toolsets import bundle_non_core_tools, get_toolset
                 if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):

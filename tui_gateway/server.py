@@ -5974,21 +5974,35 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
 
     # Capability surface changed — rebuild the agent in place. Same
     # session_id/key, so the DB-backed history and (epoch-refreshed) system
-    # prompt carry over; only tool definitions and prompt bytes change.
+    # prompt carry over; only tool definitions and prompt bytes change. Preserve
+    # the exact live runtime as well: /model --once and /moa install a transient
+    # model without pinning ``session['model_override']``, and rebuilding from
+    # config would silently spend that control before the intended user turn.
     try:
+        live_runtime = _snapshot_agent_model_runtime(agent)
         tokens = _set_session_context(sid, cwd=_session_cwd(session))
         try:
             new_agent = _make_agent(
                 sid,
                 session["session_key"],
                 session_id=session["session_key"],
+                model_override=live_runtime,
                 platform_override=_session_source(session),
             )
         finally:
             _clear_session_context(tokens)
         new_agent._session_title_hint = "Bot Chat"
         session["agent"] = new_agent
-        session["config_model_seen"] = _config_model_target()
+        config_target = _config_model_target()
+        if (
+            config_target[0]
+            and live_runtime.get("model") == config_target[0]
+            and (
+                not config_target[1]
+                or live_runtime.get("provider") == config_target[1]
+            )
+        ):
+            session["config_model_seen"] = config_target
         _emit(
             "notice",
             sid,
@@ -9647,7 +9661,12 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 
 def _emit_terminal_turn_error(
-    sid: str, session: dict, error: Any, error_surface: Optional[dict] = None
+    sid: str,
+    session: dict,
+    error: Any,
+    error_surface: Optional[dict] = None,
+    *,
+    retain_inflight: bool = True,
 ) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
@@ -9677,10 +9696,17 @@ def _emit_terminal_turn_error(
         except Exception:
             error_surface = None
     with session["history_lock"]:
-        _fail_inflight_turn(session, error, error_surface=error_surface)
-        turn = session.get("inflight_turn") or {}
-        message = str(turn.get("error") or "turn failed")
-        partial = str(turn.get("assistant") or "")
+        if retain_inflight:
+            _fail_inflight_turn(session, error, error_surface=error_surface)
+            turn = session.get("inflight_turn") or {}
+            message = str(turn.get("error") or "turn failed")
+            partial = str(turn.get("assistant") or "")
+        else:
+            # Captain is a background report, not the user's next turn. Its
+            # failure frame must not overwrite the ordinary retained snapshot
+            # that session.resume still owes to the user.
+            message = str(error) or type(error).__name__
+            partial = ""
         cols = int(session.get("cols", 80))
     text = partial or f"Error: {message}"
     payload = {
@@ -9700,7 +9726,8 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    _retire_turn_marker(session)
+    if retain_inflight:
+        _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
 
@@ -11108,6 +11135,328 @@ _KANBAN_NOTIFY_KINDS = (
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
+# How long a Captain inbox lease is held before it is reclaimable. A crash
+# between lease and ack strands the row only until this elapses; the next
+# poll after a restart reclaims it (see hermes_cli/kanban_db.py).
+_CAPTAIN_LEASE_SECONDS = 120
+_CAPTAIN_LEASE_RENEW_SECONDS = max(1.0, _CAPTAIN_LEASE_SECONDS / 3)
+_CAPTAIN_RECEIVER_TTL_SECONDS = 15
+# Hard context/SQLite guards. One poll leases at most this many event rows and
+# the joined synthetic prompt never exceeds this UTF-8 byte budget.
+_CAPTAIN_POLL_ROW_CAP = 16
+_CAPTAIN_TURN_ROW_CAP = 1
+_CAPTAIN_POLL_BYTE_CAP = 8 * 1024
+_CAPTAIN_SIGNAL_BODY_BYTE_CAP = 2 * 1024
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """Bound text by UTF-8 bytes without splitting a code point."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    encoded = encoded[:max_bytes]
+    while encoded:
+        try:
+            return encoded.decode("utf-8") + "\n[comment truncated]"
+        except UnicodeDecodeError:
+            encoded = encoded[:-1]
+    return "[comment truncated]"
+
+
+def _format_captain_signal_text(task, ev, board_slug: str, comment) -> str:
+    """Render a bounded signal from its authoritative durable comment."""
+    from agent.redact import redact_sensitive_text
+    from hermes_cli.kanban_alerts import render_kanban_alert
+
+    payload = getattr(ev, "payload", None) or {}
+    task_id = getattr(ev, "task_id", "")
+    title = (getattr(task, "title", None) or task_id)[:120]
+    board_tag = f"[{board_slug}] " if board_slug else ""
+    signal_class = str(payload.get("signal_class") or "signal").replace("_", " ")
+    comment_id = payload.get("comment_id")
+    if comment is None:
+        body = "[authoritative source comment unavailable]"
+        author = str(payload.get("author") or "unknown")[:120]
+    else:
+        author = str(comment.author or payload.get("author") or "unknown")[:120]
+        body = _truncate_utf8(
+            redact_sensitive_text(str(comment.body or ""), force=True),
+            _CAPTAIN_SIGNAL_BODY_BYTE_CAP,
+        )
+    return render_kanban_alert(
+        f"⚑ {board_tag}Captain {signal_class} on Kanban {task_id} — {title}\n"
+        f"comment #{comment_id} by {author}:\n{body}"
+    )
+
+
+def _session_captain_profile(session: dict) -> str:
+    """Resolve the profile that owns this session's Captain reports.
+
+    Bound to the session's own profile — ``profile_home`` for a multiplexed
+    Desktop session, otherwise the process launch profile — never a
+    process-global env guess, so a Desktop session pinned to another profile
+    reads that profile's ledger.
+    """
+    from hermes_cli.profiles import normalize_profile_name
+
+    try:
+        if isinstance(session, dict) and session.get("profile_home"):
+            return normalize_profile_name(Path(session["profile_home"]).name)
+    except Exception:
+        pass
+    return normalize_profile_name(_current_profile_name())
+
+
+def _captain_row_eligible(
+    conn,
+    *,
+    profile: str,
+    this_key: str,
+    origin_key,
+    row_tenant,
+    now: int,
+) -> bool:
+    """Whether this session may claim a Captain row with the given origin.
+
+    - No origin (gateway/CLI/cron/unattached) → same-profile only when untenant.
+    - We ARE the origin → always ours while live.
+    - A different origin → only if that origin is not live and the row is
+      untenant. Tenant-tagged fallback fails closed until session transport
+      carries authoritative tenant identity.
+    """
+    origin = str(origin_key).strip() if origin_key else ""
+    if not origin:
+        return not row_tenant
+    if origin == str(this_key or ""):
+        return True
+    if row_tenant:
+        return False
+    from hermes_cli import kanban_db as _kb
+
+    return not _kb.captain_receiver_is_live(
+        conn,
+        profile=profile,
+        session_key=origin,
+        now=now,
+        max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
+    )
+
+
+def _collect_captain_reports(
+    conn,
+    slug: str,
+    session: dict,
+    captain_profile: str,
+    claimed_event_ids: set,
+    claim_records: Optional[list[dict]],
+    texts: list,
+    row_limit: int = _CAPTAIN_POLL_ROW_CAP,
+) -> int:
+    """Claim eligible Captain inbox rows for this session's profile.
+
+    Runs alongside the exact-origin ``kanban_notify_subs`` route on the same
+    board connection. Rows whose ``task_event.id`` was already turned into text
+    by the exact-origin route are settled but not re-rendered (dedup); the rest
+    are formatted. Leases are recorded in ``claim_records`` so the caller acks
+    them on a successful terminal turn or releases them on rejection/failure.
+
+    A Captain row is acked ONLY after the synthetic turn reaches a successful
+    terminal outcome and its transcript is durable, immediately before the
+    stable-id assistant completion is emitted. Leasing is meaningless without
+    a settlement callback.
+    When ``claim_records`` is ``None`` (a probe-style call with no way to
+    ack/release), this helper is a no-op and leaves every row ``pending`` —
+    it never leases or acks merely because it was invoked.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    if claim_records is None:
+        return 0
+
+    # A synthetic turn carries one Captain event, giving every retry the same
+    # event-derived completion identity even when another board's settlement
+    # fails independently.
+    row_limit = max(
+        0,
+        min(int(row_limit), _CAPTAIN_POLL_ROW_CAP, _CAPTAIN_TURN_ROW_CAP),
+    )
+    if row_limit == 0:
+        return 0
+
+    this_key = str(session.get("session_key") or "")
+    now = int(time.time())
+    try:
+        candidates = _kb.read_captain_candidates(
+            conn,
+            profile=captain_profile,
+            now=now,
+            limit=row_limit,
+            receiver_session_key=this_key,
+            receiver_max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
+        )
+    except Exception:
+        return 0
+    eligible = [
+        int(c["event_id"])
+        for c in candidates
+        if _captain_row_eligible(
+            conn,
+            profile=captain_profile,
+            this_key=this_key,
+            origin_key=c.get("origin_session_key"),
+            row_tenant=c.get("tenant"),
+            now=now,
+        )
+    ]
+    if not eligible:
+        return 0
+    task_cache: dict = {}
+    used_bytes = sum(len(t.encode("utf-8")) + 1 for t in texts)
+    leased_count = 0
+    for event_id in eligible[:row_limit]:
+        if used_bytes >= _CAPTAIN_POLL_BYTE_CAP:
+            break
+        # One event per lease token makes byte paging lossless: rows that do
+        # not fit this prompt remain pending/unleased for the next poll instead
+        # of sharing an ack token with the visible prefix.
+        owner = this_key or captain_profile
+        token, events = _kb.lease_captain_reports(
+            conn,
+            profile=captain_profile,
+            owner=owner,
+            event_ids=[event_id],
+            now=now,
+            lease_seconds=_CAPTAIN_LEASE_SECONDS,
+            receiver_session_key=this_key,
+            receiver_max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
+        )
+        if not events:
+            continue
+        leased_count += 1
+        ev = events[0]
+        deliveries: list[dict] = []
+        if ev.id in claimed_event_ids:
+            claim_records.append({
+                "route": "captain",
+                "board": slug,
+                "token": token,
+                "owner": owner,
+                "expected_count": len(events),
+                "task_ids": {ev.task_id},
+                "signal_task_ids": (
+                    {ev.task_id} if ev.kind == "captain_signal" else set()
+                ),
+                "deliveries": deliveries,
+            })
+            continue  # already delivered via the exact-origin route this batch
+        task = task_cache.get(ev.task_id)
+        if task is None:
+            task = _kb.get_task(conn, ev.task_id)
+            task_cache[ev.task_id] = task
+        # Captain payloads are a stricter privacy boundary than the existing
+        # exact-origin notification: never copy the raw spawn/tool error, and
+        # force-redact credential-shaped text even when global redaction is off.
+        if ev.kind == "captain_signal":
+            payload = ev.payload or {}
+            try:
+                comment_id = int(payload.get("comment_id"))
+            except (TypeError, ValueError):
+                comment_id = 0
+            comment = _kb.get_comment(conn, comment_id) if comment_id else None
+            if comment is not None and comment.task_id != ev.task_id:
+                comment = None
+            text = _format_captain_signal_text(task, ev, slug, comment)
+        else:
+            text = _format_kanban_event_text(
+                {"task_id": ev.task_id},
+                task,
+                ev,
+                slug,
+                include_error_detail=False,
+            )
+        if text:
+            from agent.redact import redact_sensitive_text
+
+            text = redact_sensitive_text(text, force=True)
+            remaining = _CAPTAIN_POLL_BYTE_CAP - used_bytes
+            if remaining <= 0:
+                _kb.release_captain_reports(conn, token=token, owner=owner)
+                break
+            encoded = text.encode("utf-8")
+            if len(encoded) > remaining:
+                encoded = encoded[:remaining]
+                while encoded:
+                    try:
+                        text = encoded.decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        encoded = encoded[:-1]
+                if not encoded:
+                    _kb.release_captain_reports(conn, token=token, owner=owner)
+                    break
+            claimed_event_ids.add(ev.id)
+            texts.append(text)
+            used_bytes += len(text.encode("utf-8")) + 1
+            deliveries.append({
+                "id": f"kanban:{slug}:{ev.id}",
+                "event_id": ev.id,
+                "text": text,
+            })
+        claim_records.append({
+            "route": "captain",
+            "board": slug,
+            "token": token,
+            "owner": owner,
+            "expected_count": len(events),
+            "task_ids": {ev.task_id},
+            "signal_task_ids": (
+                {ev.task_id} if ev.kind == "captain_signal" else set()
+            ),
+            "deliveries": deliveries,
+        })
+    return leased_count
+
+
+def _touch_captain_receivers(session: dict) -> None:
+    """Publish this live receiver on every board, even while its turn is busy."""
+    session_key = str(session.get("session_key") or "")
+    if not session_key or session.get("_finalized"):
+        return
+    from hermes_cli import kanban_db as _kb
+
+    captain_profile = _session_captain_profile(session)
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [{"slug": _kb.DEFAULT_BOARD}]
+    seen_db_paths: set[str] = set()
+    for board_meta in boards:
+        slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
+        db_path = (board_meta or {}).get("db_path")
+        try:
+            resolved = (
+                str(Path(db_path).expanduser().resolve())
+                if db_path else str(_kb.kanban_db_path(slug).resolve())
+            )
+        except Exception:
+            resolved = f"slug:{slug}"
+        if resolved in seen_db_paths:
+            continue
+        seen_db_paths.add(resolved)
+        conn = None
+        try:
+            conn = _kb.connect(board=slug)
+            _kb.touch_captain_receiver(
+                conn,
+                profile=captain_profile,
+                session_key=session_key,
+                tenant=None,
+            )
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
@@ -11204,13 +11553,26 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             pass
 
 
-def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
+def _format_kanban_event_text(
+    sub: dict,
+    task,
+    ev,
+    board_slug: str,
+    latest_run=None,
+    *,
+    include_error_detail: bool = True,
+) -> Optional[str]:
     """Single-line notification text for one kanban event.
 
     Wording mirrors the gateway notifier (gateway/kanban_watchers.py) so a
     task completion reads the same in the TUI as it does on Telegram.
     Returns None for kinds that are claimed but intentionally silent.
     """
+    from hermes_cli.kanban_alerts import (
+        project_kanban_event_lineage,
+        render_kanban_alert,
+    )
+
     kind = getattr(ev, "kind", "")
     if not kind or kind in _KANBAN_SILENT_KINDS:
         return None
@@ -11229,28 +11591,59 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         elif getattr(task, "result", None):
             lines = str(task.result).strip().splitlines()
             handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+        return render_kanban_alert(
+            f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+        )
     if kind == "blocked":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
-        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+        return render_kanban_alert(
+            f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+        )
     if kind == "gave_up":
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
+        lineage = project_kanban_event_lineage(task, ev, latest_run)
+        err = (
+            f"\n{str(payload.get('error'))[:200]}"
+            if include_error_detail and payload.get("error")
+            else ""
+        )
+        blocked = "; task is blocked" if lineage.block_is_current else ""
+        return render_kanban_alert(
+            f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated "
+            f"spawn failures{blocked}{err}",
+            lineage=lineage,
+        )
     if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
+        lineage = project_kanban_event_lineage(task, ev, latest_run)
+        recovery = ""
+        if lineage.retry_is_current:
+            recovery = "; dispatcher will retry"
+        elif lineage.block_is_current:
+            recovery = "; task is blocked"
+        return render_kanban_alert(
+            f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone)"
+            f"{recovery}",
+            lineage=lineage,
+        )
     if kind == "timed_out":
         limit = 0
         try:
             limit = int(payload.get("limit_seconds") or 0)
         except (TypeError, ValueError):
             pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+        return render_kanban_alert(
+            f"⏱ {board_tag}{tag}Kanban {task_id} timed out "
+            f"(max_runtime={limit}s); will retry"
+        )
     if kind == "status":
-        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+        return render_kanban_alert(
+            f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+        )
     return None
 
 
-def _collect_kanban_notifications(session: dict) -> list:
+def _collect_kanban_notifications(
+    session: dict, *, claim_records: Optional[list[dict]] = None
+) -> list:
     """Claim unseen terminal kanban events for this TUI session's subscriptions.
 
     ``kanban_create`` auto-subscribes TUI/desktop sessions with
@@ -11262,7 +11655,10 @@ def _collect_kanban_notifications(session: dict) -> list:
     notifier, so a subscription is delivered exactly once even if a gateway
     and a TUI poll the same board DB.
 
-    Returns the list of formatted notification texts (may be empty).
+    Returns the list of formatted notification texts (may be empty). When
+    ``claim_records`` is provided, each durable claim is appended there so
+    the caller can either rewind it on rejection or finalize archive cleanup
+    after the synthetic turn has been accepted.
     """
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
@@ -11271,6 +11667,7 @@ def _collect_kanban_notifications(session: dict) -> list:
         from hermes_cli import kanban_db as _kb
     except Exception:
         return []
+    captain_profile = _session_captain_profile(session)
     texts: list = []
     try:
         boards = _kb.list_boards(include_archived=False)
@@ -11283,6 +11680,7 @@ def _collect_kanban_notifications(session: dict) -> list:
     # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
     # notifier).
     seen_db_paths: set = set()
+    captain_rows_leased = 0
     for board_meta in boards:
         slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
         db_path = (board_meta or {}).get("db_path")
@@ -11297,34 +11695,48 @@ def _collect_kanban_notifications(session: dict) -> list:
             continue
         seen_db_paths.add(resolved)
         # A poller runs per live TUI/Desktop session. Avoid opening this board
-        # writable unless it has a subscription owned by this exact session;
-        # subscriptions for gateways or other sessions are not actionable here.
+        # writable unless it has an exact-origin subscription owned by this
+        # session OR a Captain report waiting for this session's profile;
+        # everything else is not actionable here.
+        open_writable = False
         try:
-            if _kb.count_notify_subs(
+            open_writable = _kb.count_notify_subs(
                 board=slug,
                 platform="tui",
                 chat_id=session_key,
-            ) == 0:
-                continue
+            ) > 0
         except Exception:
             # Preserve delivery if the read-only probe cannot inspect a
             # locked, corrupt, or otherwise unusual database.
-            pass
+            open_writable = True
+        if not open_writable and claim_records is not None:
+            try:
+                open_writable = _kb.count_captain_pending(
+                    board=slug, profile=captain_profile
+                ) > 0
+            except Exception:
+                open_writable = True
+        if not open_writable:
+            continue
         try:
             conn = _kb.connect(board=slug)
         except Exception:
             continue
         try:
+            claimed_event_ids: set = set()
             try:
                 subs = _kb.list_notify_subs(conn)
             except Exception:
-                continue
-            for sub in subs:
+                subs = []
+            # Once this poll has leased its one Captain event, leave ordinary
+            # subscription cursors untouched for the next turn. Conversely, an
+            # earlier ordinary delivery prevents leasing a Captain row below.
+            for sub in (() if captain_rows_leased else subs):
                 if (sub.get("platform") or "").lower() != "tui":
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
+                old_cursor, claimed_cursor, events = _kb.claim_unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -11334,16 +11746,74 @@ def _collect_kanban_notifications(session: dict) -> list:
                 )
                 if not events:
                     continue
+                claim_record = None
+                if claim_records is not None:
+                    claim_record = {
+                        "board": slug,
+                        "sub": sub,
+                        "old_cursor": old_cursor,
+                        "claimed_cursor": claimed_cursor,
+                        "unsubscribe": False,
+                        "deliveries": [],
+                    }
+                    claim_records.append(claim_record)
                 task = _kb.get_task(conn, sub["task_id"])
+                latest_run = _kb.latest_run(conn, sub["task_id"])
+                if claim_record is not None:
+                    claim_record["unsubscribe"] = bool(
+                        task and getattr(task, "status", "") == "archived"
+                    )
                 for ev in events:
-                    text = _format_kanban_event_text(sub, task, ev, slug)
+                    captain_backed = conn.execute(
+                        "SELECT 1 FROM kanban_captain_inbox WHERE event_id = ?",
+                        (ev.id,),
+                    ).fetchone() is not None
+                    captain_owner = conn.execute(
+                        "SELECT profile, origin_session_key "
+                        "FROM kanban_captain_registry WHERE task_id = ?",
+                        (ev.task_id,),
+                    ).fetchone()
+                    captain_owned_here = bool(
+                        captain_owner
+                        and captain_owner["profile"] == captain_profile
+                        and (
+                            not captain_owner["origin_session_key"]
+                            or captain_owner["origin_session_key"] == session_key
+                        )
+                    )
+                    if (
+                        captain_backed
+                        and captain_owned_here
+                        and claim_records is not None
+                    ):
+                        # When this session owns both routes, the Captain lease
+                        # is the single delivery receipt. Other creator sessions
+                        # retain their independent exact-origin notification.
+                        continue
+                    # Record every event id the exact-origin route claimed so
+                    # the Captain route can settle-but-not-duplicate the same
+                    # task_event.id (both routes may see it for the origin).
+                    claimed_event_ids.add(ev.id)
+                    text = _format_kanban_event_text(
+                        sub, task, ev, slug, latest_run,
+                    )
                     if text:
                         texts.append(text)
+                        if claim_record is not None:
+                            claim_record["deliveries"].append({
+                                "id": f"kanban:{slug}:{ev.id}",
+                                "event_id": ev.id,
+                                "text": text,
+                            })
                 # Unsubscribe only on archive. ``done`` is reversible in
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop
                 # session. The claimed cursor prevents historical replay.
-                if task and getattr(task, "status", "") == "archived":
+                if (
+                    claim_records is None
+                    and task
+                    and getattr(task, "status", "") == "archived"
+                ):
                     try:
                         _kb.remove_notify_sub(
                             conn,
@@ -11354,9 +11824,384 @@ def _collect_kanban_notifications(session: dict) -> list:
                         )
                     except Exception:
                         pass
+            # Durable, profile-scoped Captain route (fallback + generalization
+            # of the exact-origin route above). Claims reportable terminal
+            # events for this session's profile, deduplicating any already
+            # rendered by the exact-origin route on this board.
+            try:
+                captain_rows_leased += _collect_captain_reports(
+                    conn, slug, session, captain_profile,
+                    claimed_event_ids, claim_records, texts,
+                    row_limit=(
+                        0
+                        if texts
+                        else _CAPTAIN_TURN_ROW_CAP - captain_rows_leased
+                    ),
+                )
+            except Exception as exc:
+                print(
+                    f"[tui_gateway] captain report collection failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
         finally:
             conn.close()
     return texts
+
+
+def _renew_kanban_notification_claims(
+    claim_records: list[dict],
+    *,
+    lease_seconds: int = _CAPTAIN_LEASE_SECONDS,
+    now: int | None = None,
+) -> None:
+    """Renew every Captain token and fail closed if any ownership fence is lost."""
+    from hermes_cli import kanban_db as _kb
+
+    for record in claim_records:
+        if record.get("route") != "captain":
+            continue
+        conn = _kb.connect(board=record["board"])
+        try:
+            expected = max(1, int(record.get("expected_count") or 1))
+            renewed = _kb.renew_captain_reports(
+                conn,
+                token=record["token"],
+                owner=record["owner"],
+                lease_seconds=lease_seconds,
+                now=now,
+            )
+            if renewed != expected:
+                raise RuntimeError(
+                    f"Captain lease renewal expected {expected} row(s), got {renewed}"
+                )
+        finally:
+            conn.close()
+
+
+def _settle_kanban_notification_claims(
+    claim_records: list[dict],
+    *,
+    accepted: bool,
+    reply_author: str | None = None,
+    reply_body: str | None = None,
+) -> None:
+    """Authoritatively ack accepted claims or rewind every rejected claim.
+
+    Captain rowcounts are ownership receipts, not diagnostics. Any exception or
+    mismatch is propagated after the still-owned failed token is released, so a
+    caller cannot emit a success frame for a settlement it did not commit.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    errors: list[Exception] = []
+    failed_captain_records: list[dict] = []
+    for record in claim_records:
+        if record.get("route") == "captain":
+            conn = None
+            try:
+                conn = _kb.connect(board=record["board"])
+                expected = max(1, int(record.get("expected_count") or 1))
+                owner = record.get("owner")
+                if not owner:
+                    raise RuntimeError("Captain settlement claim has no fenced owner")
+                if accepted:
+                    signal_task_ids = set(record.get("signal_task_ids") or ())
+                    if signal_task_ids:
+                        if not reply_author or not reply_body or not reply_body.strip():
+                            raise RuntimeError(
+                                "Captain signal settlement requires a persisted reply"
+                            )
+                        settled = _kb.ack_captain_reports_with_reply(
+                            conn,
+                            token=record["token"],
+                            owner=owner,
+                            reply_author=reply_author,
+                            reply_body=reply_body,
+                            reply_task_ids=signal_task_ids,
+                        )
+                    else:
+                        settled = _kb.ack_captain_reports(
+                            conn,
+                            token=record["token"],
+                            owner=owner,
+                        )
+                    if settled != expected:
+                        raise RuntimeError(
+                            f"Captain ack expected {expected} row(s), got {settled}"
+                        )
+                    # GC is retention-only after the authoritative ack. A GC
+                    # failure must not turn a committed delivery into a retry.
+                    for tid in record.get("task_ids") or ():
+                        try:
+                            _kb.captain_gc_task_if_settled(conn, tid)
+                        except Exception:
+                            logger.warning(
+                                "Captain settled-task GC failed for %s",
+                                tid,
+                                exc_info=True,
+                            )
+                else:
+                    _kb.release_captain_reports(
+                        conn,
+                        token=record["token"],
+                        owner=owner,
+                    )
+            except Exception as exc:
+                errors.append(exc)
+                if accepted:
+                    failed_captain_records.append(record)
+            finally:
+                if conn is not None:
+                    conn.close()
+            continue
+        if accepted and not record["unsubscribe"]:
+            continue
+        sub = record["sub"]
+        conn = None
+        try:
+            conn = _kb.connect(board=record["board"])
+            if accepted:
+                _kb.remove_notify_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                )
+            else:
+                _kb.rewind_notify_cursor(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    claimed_cursor=record["claimed_cursor"],
+                    old_cursor=record["old_cursor"],
+                )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    # Cross-board settlement cannot be one SQLite transaction. Release only
+    # tokens whose ack failed; already-acked siblings stay committed and each
+    # normal delivery turn carries one stable event identity.
+    if accepted:
+        for record in failed_captain_records:
+            conn = None
+            try:
+                conn = _kb.connect(board=record["board"])
+                _kb.release_captain_reports(
+                    conn,
+                    token=record["token"],
+                    owner=record.get("owner"),
+                )
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    if errors:
+        detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+        raise RuntimeError(f"Kanban notification settlement failed: {detail}") from errors[0]
+
+
+def _settle_captain_turn_claims(
+    session: dict,
+    claim_records: list[dict],
+    *,
+    completion_id: str,
+    captain_profile: str,
+    succeeded: bool,
+) -> None:
+    """Settle a Captain turn, posting its durable reply for signal claims."""
+    signal_tasks = {
+        task_id
+        for record in claim_records
+        if record.get("route") == "captain"
+        for task_id in (record.get("signal_task_ids") or ())
+    }
+    if not succeeded or not signal_tasks:
+        _settle_kanban_notification_claims(
+            claim_records,
+            accepted=bool(succeeded),
+        )
+        return
+
+    try:
+        receipt = _persisted_captain_report(session, completion_id)
+        if receipt is None:
+            raise RuntimeError("Captain signal reply is not durable")
+        reply_body = _captain_reply_text(receipt)
+        if not reply_body:
+            raise RuntimeError("Captain signal reply is empty")
+    except Exception:
+        _settle_kanban_notification_claims(claim_records, accepted=False)
+        raise
+
+    _settle_kanban_notification_claims(
+        claim_records,
+        accepted=True,
+        reply_author=captain_profile,
+        reply_body=reply_body,
+    )
+
+
+_CAPTAIN_COMPLETION_METADATA_KEY = "captain_completion_id"
+_CAPTAIN_TURN_PURPOSE = "captain_report"
+
+
+def _captain_completion_id(
+    claim_records: list[dict], report_texts: list[str]
+) -> str:
+    delivery_keys = sorted({
+        f"{record.get('board') or 'default'}:{delivery.get('id')}"
+        for record in claim_records
+        for delivery in (record.get("deliveries") or ())
+        if delivery.get("id")
+    })
+    receipt_material = "\n".join(delivery_keys or report_texts)
+    return (
+        "kanban-report:"
+        + hashlib.sha256(receipt_material.encode("utf-8")).hexdigest()[:24]
+    )
+
+
+def _persisted_captain_report(session: dict, completion_id: str):
+    """Return the profile-wide canonical receipt for a Captain event."""
+    agent = session.get("agent")
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None) or session.get("session_key")
+    if db is None or not session_id or not completion_id:
+        return None
+    rehome = getattr(db, "rehome_captain_report", None)
+    if callable(rehome):
+        try:
+            return rehome(completion_id, session_id)
+        except Exception:
+            logger.warning(
+                "Captain profile-wide transcript reconciliation failed for %s",
+                session_id,
+                exc_info=True,
+            )
+            raise
+
+    # Compatibility for narrow SessionDB test doubles and older embedders.
+    messages = db.get_messages_as_conversation(session_id)
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        metadata = message.get("display_metadata")
+        if (
+            isinstance(metadata, dict)
+            and metadata.get(_CAPTAIN_COMPLETION_METADATA_KEY) == completion_id
+        ):
+            return {
+                "report": message,
+                "messages": [message],
+                "source_session_id": session_id,
+                "destination_session_id": session_id,
+                "moved": False,
+            }
+    return None
+
+
+def _captain_reply_text(receipt: object) -> str:
+    """Return one bounded, force-redacted durable Captain reply."""
+    from agent.redact import redact_sensitive_text
+
+    if not isinstance(receipt, dict):
+        return ""
+    return _truncate_utf8(
+        redact_sensitive_text(
+            str((receipt.get("report") or {}).get("content") or ""),
+            force=True,
+        ),
+        _CAPTAIN_SIGNAL_BODY_BYTE_CAP,
+    ).strip()
+
+
+def _reconcile_persisted_captain_report(
+    sid: str,
+    session: dict,
+    claim_records: list[dict],
+    completion_id: str,
+) -> bool:
+    """Ack a durable Captain report without running the model a second time."""
+    receipt = _persisted_captain_report(session, completion_id)
+    if receipt is None:
+        return False
+    report = receipt["report"]
+    pending = session.setdefault("_captain_pending_projection_ids", set())
+    if receipt.get("moved"):
+        pending.add(completion_id)
+
+    _settle_kanban_notification_claims(
+        claim_records,
+        accepted=True,
+        reply_author=_session_captain_profile(session),
+        reply_body=_captain_reply_text(receipt),
+    )
+
+    with session["history_lock"]:
+        if not any(
+            isinstance(message, dict)
+            and isinstance(message.get("display_metadata"), dict)
+            and message["display_metadata"].get(_CAPTAIN_COMPLETION_METADATA_KEY)
+            == completion_id
+            for message in session.get("history") or ()
+        ):
+            session.setdefault("history", []).extend(receipt.get("messages") or [report])
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+
+    if isinstance(pending, set) and completion_id in pending:
+        pending.discard(completion_id)
+        text = str(report.get("content") or "")
+        payload = {
+            "id": completion_id,
+            "text": text,
+            "status": "complete",
+            "usage": _get_usage(session.get("agent")),
+        }
+        rendered = render_message(text, session.get("cols", 80))
+        if rendered:
+            payload["rendered"] = rendered
+        _emit("message.start", sid)
+        _emit("message.complete", sid, payload)
+    return True
+
+
+def _start_captain_lease_renewer(claim_records: list[dict]):
+    """Keep Captain ownership fenced for an otherwise unbounded model turn."""
+    if not any(record.get("route") == "captain" for record in claim_records):
+        return None
+    stop = threading.Event()
+    failures: list[Exception] = []
+
+    def _renew_loop() -> None:
+        while not stop.wait(_CAPTAIN_LEASE_RENEW_SECONDS):
+            try:
+                _renew_kanban_notification_claims(claim_records)
+            except Exception as exc:
+                failures.append(exc)
+                return
+
+    thread = _RealThread(target=_renew_loop, daemon=True)
+    thread.start()
+    return stop, thread, failures
+
+
+def _stop_captain_lease_renewer(handle) -> None:
+    if handle is None:
+        return
+    stop, thread, failures = handle
+    stop.set()
+    thread.join()
+    if failures:
+        raise RuntimeError("Captain lease renewal failed") from failures[0]
 
 
 def _notification_poller_loop(
@@ -11364,9 +12209,9 @@ def _notification_poller_loop(
 ) -> None:
     """Poll completion_queue and dispatch notifications autonomously.
 
-    Runs in a daemon thread started by _init_session(). Emits a
-    status.update (kind=process) for user visibility, then chains an
-    agent turn via _run_prompt_submit if the session is idle.
+    Runs in a daemon thread started by _init_session(). Chains an agent turn via
+    _run_prompt_submit when idle, then commits the claims after the transcript
+    is durable and before the stable-id assistant completion is emitted.
 
     The completion_queue is process-global. In multi-session Desktop each
     poller requeues events owned by another live session and drops addressed
@@ -11374,8 +12219,10 @@ def _notification_poller_loop(
 
     Also polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` for this
     session's TUI kanban subscriptions and delivers terminal task events the
-    same way (status.update + agent turn) — the delivery path
+    same way (agent turn + terminal receipt) — the delivery path
     tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
+    The poller reserves an idle turn before claiming the durable cursor; a
+    rejected dispatch rewinds that claim, so RAM is never the sole copy.
     """
     from tools.process_registry import process_registry, format_process_notification
 
@@ -11401,41 +12248,176 @@ def _notification_poller_loop(
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
             try:
-                _kanban_texts = _collect_kanban_notifications(session)
-            except Exception as _kb_exc:
+                _touch_captain_receivers(session)
+            except Exception as _heartbeat_exc:
                 print(
-                    f"[tui_gateway] kanban notification poll failed: "
-                    f"{type(_kb_exc).__name__}: {_kb_exc}",
+                    f"[tui_gateway] Captain receiver heartbeat failed: "
+                    f"{type(_heartbeat_exc).__name__}: {_heartbeat_exc}",
                     file=sys.stderr,
                 )
-                _kanban_texts = []
-            if _kanban_texts:
-                for _kb_text in _kanban_texts:
-                    _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
-            _pending = session.get("_kanban_pending") or []
-            if _pending:
-                _batch: list = []
-                with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
-                        _batch = list(_pending)
-                        session["_kanban_pending"] = []
-                if _batch:
-                    rid = f"__notif__{int(time.time() * 1000)}"
+            _reserved = False
+            _kanban_claims: list[dict] = []
+            _kanban_texts: list[str] = []
+            _kb_exc = None
+            _captain_runtime_deferred = (
+                getattr(session.get("agent"), "api_mode", "")
+                == "codex_app_server"
+            )
+            with session["history_lock"]:
+                if _captain_runtime_deferred:
+                    # The Codex app-server owns a persistent external thread;
+                    # Captain's bounded task-only synthesis cannot safely run
+                    # there. Do not lease the durable row at all. A later
+                    # supported session/runtime can claim the same pending event.
+                    pass
+                elif not session.get("running"):
+                    # Hold the lock through the DB claim. A concurrent user
+                    # submit waits here instead of observing a transient busy
+                    # state on empty polls; when events exist, running=True is
+                    # already reserved before their cursor advances.
+                    session["running"] = True
+                    _reserved = True
                     try:
-                        _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
-                    except Exception as exc:
-                        print(
-                            f"[tui_gateway] kanban notification dispatch failed: "
-                            f"{type(exc).__name__}: {exc}",
-                            file=sys.stderr,
+                        _kanban_texts = _collect_kanban_notifications(
+                            session, claim_records=_kanban_claims
                         )
-                        with session["history_lock"]:
-                            session["running"] = False
+                    except Exception as exc:
+                        _kb_exc = exc
+                    if _kb_exc is not None:
+                        try:
+                            _settle_kanban_notification_claims(
+                                _kanban_claims, accepted=False
+                            )
+                        except Exception as settle_exc:
+                            _kb_exc = settle_exc
+                        session["running"] = False
+                    elif not _kanban_texts:
+                        try:
+                            _settle_kanban_notification_claims(
+                                _kanban_claims, accepted=True
+                            )
+                        except Exception as settle_exc:
+                            _kb_exc = settle_exc
+                        session["running"] = False
+            if _reserved:
+                if _kb_exc is not None:
+                    print(
+                        f"[tui_gateway] kanban notification poll failed: "
+                        f"{type(_kb_exc).__name__}: {_kb_exc}",
+                        file=sys.stderr,
+                    )
+                else:
+                    if _kanban_texts:
+                        rid = f"__notif__{int(time.time() * 1000)}"
+                        _settled = threading.Event()
+                        _settled_lock = threading.Lock()
+                        _lease_renewer = None
+                        completion_id = _captain_completion_id(
+                            _kanban_claims,
+                            _kanban_texts,
+                        )
+                        try:
+                            _reconciled = _reconcile_persisted_captain_report(
+                                sid,
+                                session,
+                                _kanban_claims,
+                                completion_id,
+                            )
+                        except Exception as _reconcile_exc:
+                            _release_exc = None
+                            try:
+                                _settle_kanban_notification_claims(
+                                    _kanban_claims,
+                                    accepted=False,
+                                )
+                            except Exception as exc:
+                                _release_exc = exc
+                            print(
+                                f"[tui_gateway] Captain receipt reconciliation failed: "
+                                f"{type(_reconcile_exc).__name__}: {_reconcile_exc}",
+                                file=sys.stderr,
+                            )
+                            if _release_exc is not None:
+                                print(
+                                    f"[tui_gateway] Captain reconciliation release failed: "
+                                    f"{type(_release_exc).__name__}: {_release_exc}",
+                                    file=sys.stderr,
+                                )
+                            with session["history_lock"]:
+                                session["running"] = False
+                            continue
+                        if _reconciled:
+                            with session["history_lock"]:
+                                session["running"] = False
+                            continue
+                        _lease_renewer = _start_captain_lease_renewer(
+                            _kanban_claims
+                        )
+
+                        def _settle_after_terminal(succeeded: Optional[bool]) -> None:
+                            with _settled_lock:
+                                if _settled.is_set():
+                                    return
+                                try:
+                                    _stop_captain_lease_renewer(_lease_renewer)
+                                except Exception:
+                                    if succeeded is None:
+                                        _settled.set()
+                                        raise
+                                    try:
+                                        _settle_kanban_notification_claims(
+                                            _kanban_claims, accepted=False
+                                        )
+                                    finally:
+                                        _settled.set()
+                                    raise
+                                if succeeded is None:
+                                    # Rollback of the crash-staged input failed.
+                                    # Leave the claim leased rather than making a
+                                    # dirty retry immediately eligible; normal
+                                    # lease expiry provides the bounded retry.
+                                    _settled.set()
+                                    return
+                                try:
+                                    _settle_captain_turn_claims(
+                                        session,
+                                        _kanban_claims,
+                                        completion_id=completion_id,
+                                        captain_profile=_session_captain_profile(session),
+                                        succeeded=bool(succeeded),
+                                    )
+                                finally:
+                                    # Mark after the authoritative attempt, not
+                                    # before it. Callback failures must propagate
+                                    # through _run_prompt_submit and suppress the
+                                    # visible success frame.
+                                    _settled.set()
+
+                        try:
+                            _emit("message.start", sid)
+                            accepted = _run_prompt_submit(
+                                rid,
+                                sid,
+                                session,
+                                "\n".join(_kanban_texts),
+                                on_terminal=_settle_after_terminal,
+                                completion_id=completion_id,
+                                require_persisted=True,
+                                turn_purpose=_CAPTAIN_TURN_PURPOSE,
+                            )
+                            if accepted is False:
+                                raise RuntimeError("synthetic turn was not accepted")
+                        except Exception as exc:
+                            _settle_after_terminal(False)
+                            print(
+                                f"[tui_gateway] kanban notification dispatch failed: "
+                                f"{type(exc).__name__}: {exc}",
+                                file=sys.stderr,
+                            )
+                            with session["history_lock"]:
+                                session["running"] = False
+                            _drain_queued_prompt(rid, sid, session)
+
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -11939,7 +12921,12 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    on_terminal: Optional[Callable[[Optional[bool]], None]] = None,
+    completion_id: str | None = None,
+    require_persisted: bool = False,
+    turn_purpose: str = "ordinary",
 ) -> bool:
+    captain_turn = turn_purpose == _CAPTAIN_TURN_PURPOSE
     with session["history_lock"]:
         if session.get("_closing"):
             session["running"] = False
@@ -11950,16 +12937,21 @@ def _run_prompt_submit(
         ):
             session["running"] = False
             return False
-        if image_paths is None:
+        if require_persisted:
+            # Captain reports are task-only model turns. Do not consume or send
+            # image attachments staged for the user's next ordinary prompt.
+            images = []
+        elif image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
         else:
             images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
+        if not captain_turn:
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new ordinary turn starts — replace it, never append.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -12006,10 +12998,21 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
-        one_turn_restore = session.pop("one_turn_model_restore", None)
+        # Captain is a task-only background report, not the user's next turn.
+        # Leave every one-shot/recovery controller exactly where the user turn
+        # expects it; the synthetic turn neither consumes nor retires them.
+        one_turn_restore = (
+            None
+            if captain_turn
+            else session.pop("one_turn_model_restore", None)
+        )
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
+        turn_succeeded = False
+        terminal_callback_called = False
+        terminal_callback_committed = False
+        terminal_settlement: Optional[bool] = False
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -12018,9 +13021,21 @@ def _run_prompt_submit(
         # session_key mid-turn, so remember the key we wrote under.
         marker_home = _session_home(session)
         marker_key = str(session.get("session_key") or "")
-        marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
-        marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
+        marker_attempt = (
+            0
+            if captain_turn
+            else int(session.pop("_auto_continue_attempt", 0) or 0)
+        )
+        marker_text = (
+            text
+            if captain_turn
+            else session.pop("_auto_continue_prompt", None) or text
+        )
+        if (
+            not captain_turn
+            and isinstance(marker_text, str)
+            and marker_text.strip()
+        ):
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
             from tools.approval import (
@@ -12051,7 +13066,7 @@ def _run_prompt_submit(
             # once-override back to the config model before the turn runs
             # (#29923 review defect). Any config.yaml change is adopted on
             # the NEXT turn, after the finally-restore below.
-            if not one_turn_restore:
+            if not captain_turn and not one_turn_restore:
                 # A model picked mid-turn was queued (not applied in-place) —
                 # apply it now, on the turn thread before the first model call,
                 # so this turn runs on the model the user chose. Runs before the
@@ -12061,8 +13076,11 @@ def _run_prompt_submit(
                 _sync_agent_compression_with_config(sid, session)
             # Bot Chat capability sync — adopt Settings→Capabilities edits
             # (skills/toolsets/MCP/SOUL) into the eternal bot session before
-            # the turn runs. No-op for every other session shape.
-            _sync_bot_capabilities(sid, session)
+            # an ordinary turn runs. Captain is deliberately excluded: its
+            # minimal no-tools prompt cannot use the refreshed surface, and a
+            # rebuild here would mutate controls reserved for the next user.
+            if not captain_turn:
+                _sync_bot_capabilities(sid, session)
             agent = session["agent"]
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.
@@ -12075,7 +13093,7 @@ def _run_prompt_submit(
             streamer = make_stream_renderer(cols)
             prompt = text
 
-            if isinstance(prompt, str) and "@" in prompt:
+            if not require_persisted and isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
 
@@ -12212,27 +13230,63 @@ def _run_prompt_submit(
             # Barged mid-speech? Tell the model (API-message note, same
             # enrichment channel as attached images) so it can react
             # ("rude!") instead of being oblivious to its own interruption.
-            from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
+            if not require_persisted:
+                from tools.tts_streaming import (
+                    SPEECH_INTERRUPTED_NOTE,
+                    take_speech_interrupted,
+                )
 
-            if take_speech_interrupted():
-                run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
+                if take_speech_interrupted():
+                    run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
 
-            # Reactions the user added since the last turn.
-            run_message = _prepend_note(run_message, _pending_reaction_notes(session))
+                # Reactions the user added since the last turn.
+                run_message = _prepend_note(
+                    run_message, _pending_reaction_notes(session)
+                )
 
-            # Which window the message was typed into. HUD mode is per-turn
-            # state, so it cannot live in the (byte-stable) system prompt.
-            run_message = _prepend_note(run_message, _hud_surface_note(session))
+                # Which window the message was typed into. HUD mode is per-turn
+                # state, so it cannot live in the (byte-stable) system prompt.
+                run_message = _prepend_note(run_message, _hud_surface_note(session))
 
-            def _stream(delta):
-                with session["history_lock"]:
-                    _append_inflight_delta(session, delta)
+            _deferred_assistant_events = []
+            _original_model_callbacks = {}
+            if require_persisted:
+                for _callback_name in ("reasoning_callback", "thinking_callback"):
+                    _callback = getattr(agent, _callback_name, None)
+                    if not callable(_callback):
+                        continue
+                    _original_model_callbacks[_callback_name] = _callback
+
+                    def _defer_model_callback(
+                        *args,
+                        _callback=_callback,
+                        **kwargs,
+                    ):
+                        _deferred_assistant_events.append(
+                            ("callback", (_callback, args, kwargs))
+                        )
+
+                    setattr(agent, _callback_name, _defer_model_callback)
+
+            def _publish_stream_delta(delta):
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
                 if tts_queue is not None and isinstance(delta, str):
                     tts_queue.put(delta)
                 _emit("message.delta", sid, payload)
+
+            def _stream(delta):
+                # Captain reports are not user-visible until their transcript
+                # is durable and their fenced inbox lease is authoritatively
+                # acknowledged. Keep the ordered draft buffered so a failed
+                # settlement cannot leave text or TTS audio that a retry duplicates.
+                if require_persisted:
+                    _deferred_assistant_events.append(("delta", delta))
+                    return
+                with session["history_lock"]:
+                    _append_inflight_delta(session, delta)
+                _publish_stream_delta(delta)
 
             # Surface interim assistant text (commentary emitted alongside
             # tool calls, or the attempted final answer before a verify-on-stop
@@ -12241,17 +13295,25 @@ def _run_prompt_submit(
             # Gated on display.interim_assistant_messages (default true).
             if _load_interim_assistant_messages():
                 def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-                    _emit("message.interim", sid, {
+                    payload = {
                         "text": text,
                         "already_streamed": already_streamed,
-                    })
+                    }
+                    if require_persisted:
+                        _deferred_assistant_events.append(("interim", payload))
+                        return
+                    _emit("message.interim", sid, payload)
 
                 agent.interim_assistant_callback = _interim_assistant_cb
             else:
                 agent.interim_assistant_callback = None
 
             run_kwargs = {
-                "conversation_history": list(history),
+                # Captain generation is a bounded task/event report, not a turn
+                # in the user's active conversation. The agent supplies a
+                # dedicated minimal Captain prompt, and no ordinary session
+                # prompt or messages cross this model boundary.
+                "conversation_history": [] if require_persisted else list(history),
                 "stream_callback": _stream,
                 "persist_user_message": (
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
@@ -12269,9 +13331,27 @@ def _run_prompt_submit(
                 _run_params = {}
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
+            if require_persisted and "task_only_context" in _run_params:
+                run_kwargs["task_only_context"] = True
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if (
+                captain_turn
+                and completion_id
+                and "persist_user_display_metadata" in _run_params
+            ):
+                run_kwargs["persist_user_display_metadata"] = {
+                    _CAPTAIN_COMPLETION_METADATA_KEY: completion_id,
+                }
+            if (
+                require_persisted
+                and completion_id
+                and "persist_assistant_display_metadata" in _run_params
+            ):
+                run_kwargs["persist_assistant_display_metadata"] = {
+                    _CAPTAIN_COMPLETION_METADATA_KEY: completion_id,
+                }
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -12316,7 +13396,7 @@ def _run_prompt_submit(
                             if display_metadata:
                                 message["display_metadata"] = display_metadata
                             break
-            if "moa_one_shot_restore" in session:
+            if not captain_turn and "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
                 # The one-shot did a real in-place agent.switch_model() to MoA
@@ -12361,11 +13441,20 @@ def _run_prompt_submit(
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
-                if isinstance(result.get("messages"), list):
+                result_is_durable = (
+                    not require_persisted
+                    or result.get("session_persisted") is True
+                )
+                if isinstance(result.get("messages"), list) and result_is_durable:
+                    result_messages = (
+                        [*history, *result["messages"]]
+                        if require_persisted
+                        else result["messages"]
+                    )
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            session["history"] = result_messages
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn.
@@ -12402,12 +13491,12 @@ def _run_prompt_submit(
                                 # turn-start history.  Guard against
                                 # auto-compression making result["messages"]
                                 # shorter than history (#77274 review).
-                                if len(result["messages"]) > len(history):
-                                    new_messages = result["messages"][len(history):]
+                                if len(result_messages) > len(history):
+                                    new_messages = result_messages[len(history):]
                                 else:
                                     # Compression rebound the messages list —
                                     # use the full result as the base.
-                                    new_messages = list(result["messages"])
+                                    new_messages = list(result_messages)
                                 session["history"] = current_history + new_messages
                                 session["history_version"] = current_version + 1
                             else:
@@ -12470,8 +13559,36 @@ def _run_prompt_submit(
             else:
                 raw = str(result)
                 status = "complete"
+            if require_persisted and status == "complete" and not (
+                isinstance(result, dict)
+                and result.get("session_persisted") is True
+            ):
+                status = "error"
+                raw = (
+                    "Captain report could not be committed to session storage; "
+                    "the durable inbox claim was released for retry."
+                )
+                if isinstance(result, dict):
+                    result["error"] = raw
+                    result["failed"] = True
+            turn_succeeded = status == "complete"
+            terminal_settlement = turn_succeeded
+            if (
+                captain_turn
+                and isinstance(result, dict)
+                and result.get("captain_retry_safe") is False
+            ):
+                # The staged durable input may still be active. Keep the inbox
+                # row fenced until its lease expires instead of releasing an
+                # immediate retry that would race unresolved cleanup.
+                terminal_settlement = None
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            # The stable Captain id is a success receipt. Failed/interrupted
+            # attempts release or retain the inbox lease for retry and must not
+            # teach clients that the durable report was already delivered.
+            if completion_id and status == "complete":
+                payload["id"] = completion_id
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -12507,20 +13624,21 @@ def _run_prompt_submit(
                     )
                 except Exception:
                     _error_surface = None
-            with session["history_lock"]:
-                if status == "error":
-                    # Returned-error result (provider 4xx, budget, etc.): retain
-                    # the failed turn for resume replay instead of clearing it.
-                    # If this terminal frame is lost to a disconnect, resume's
-                    # inflight payload is the only carrier of the failure.
-                    _fail_inflight_turn(
-                        session,
-                        result.get("error") if isinstance(result, dict) else raw,
-                        error_surface=_error_surface,
-                    )
-                    turn_error_retained = True
-                else:
-                    _clear_inflight_turn(session)
+            if not captain_turn:
+                with session["history_lock"]:
+                    if status == "error":
+                        # Returned-error result (provider 4xx, budget, etc.): retain
+                        # the failed turn for resume replay instead of clearing it.
+                        # If this terminal frame is lost to a disconnect, resume's
+                        # inflight payload is the only carrier of the failure.
+                        _fail_inflight_turn(
+                            session,
+                            result.get("error") if isinstance(result, dict) else raw,
+                            error_surface=_error_surface,
+                        )
+                        turn_error_retained = True
+                    else:
+                        _clear_inflight_turn(session)
             if status == "error":
                 payload["error"] = str(
                     (result.get("error") if isinstance(result, dict) else "") or raw
@@ -12528,7 +13646,25 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
-            _retire_turn_marker(session, marker_key)
+            if on_terminal is not None:
+                terminal_callback_called = True
+                on_terminal(terminal_settlement)
+                terminal_callback_committed = terminal_settlement is True
+            if require_persisted and turn_succeeded:
+                for event_kind, event_payload in _deferred_assistant_events:
+                    if event_kind == "delta":
+                        if not captain_turn:
+                            with session["history_lock"]:
+                                _append_inflight_delta(session, event_payload)
+                        _publish_stream_delta(event_payload)
+                    elif event_kind == "callback":
+                        callback, callback_args, callback_kwargs = event_payload
+                        callback(*callback_args, **callback_kwargs)
+                    else:
+                        _emit("message.interim", sid, event_payload)
+                _deferred_assistant_events.clear()
+            if not captain_turn:
+                _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -12542,32 +13678,35 @@ def _run_prompt_submit(
             compression_exhausted = bool(
                 isinstance(result, dict) and result.get("compression_exhausted")
             )
-            try:
-                recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
-                    session,
-                    result,
-                    status=status,
-                    raw=raw,
-                )
-                if recovery_notice:
-                    _emit(
-                        "status.update",
-                        sid,
-                        {"kind": "goal", "text": recovery_notice},
+            if not captain_turn:
+                try:
+                    recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
+                        session,
+                        result,
+                        status=status,
+                        raw=raw,
                     )
-                if recovery_prompt:
-                    goal_followup = recovery_prompt
-            except Exception as _goal_recovery_exc:
-                print(
-                    f"[tui_gateway] goal compression recovery failed: "
-                    f"{type(_goal_recovery_exc).__name__}: {_goal_recovery_exc}",
-                    file=sys.stderr,
-                )
+                    if recovery_notice:
+                        _emit(
+                            "status.update",
+                            sid,
+                            {"kind": "goal", "text": recovery_notice},
+                        )
+                    if recovery_prompt:
+                        goal_followup = recovery_prompt
+                except Exception as _goal_recovery_exc:
+                    print(
+                        f"[tui_gateway] goal compression recovery failed: "
+                        f"{type(_goal_recovery_exc).__name__}: {_goal_recovery_exc}",
+                        file=sys.stderr,
+                    )
 
             # Compression failures are never judge input: the error text is
             # not work toward the goal, and evaluating it would spend a turn.
-            if not compression_exhausted and _is_successful_goal_turn(
-                result, status, raw
+            if (
+                not captain_turn
+                and not compression_exhausted
+                and _is_successful_goal_turn(result, status, raw)
             ):
                 try:
                     from hermes_cli.goals import GoalManager
@@ -12616,7 +13755,7 @@ def _run_prompt_submit(
             # If the turn that just finished was a /loop wakeup (fired by
             # the notification poller), evaluate it: LOOP_COMPLETE marker,
             # --until judge, --times / max_ticks caps, next-tick schedule.
-            if status == "complete":
+            if not captain_turn and status == "complete":
                 try:
                     from hermes_cli.loops import LoopManager
 
@@ -12688,6 +13827,12 @@ def _run_prompt_submit(
         except Exception as e:
             import traceback
 
+            # Once the transcript and Captain claim were committed, a transport
+            # write failure must not manufacture a second terminal assistant
+            # frame. Reconnect hydration recovers the durable reply.
+            terminal_committed = terminal_callback_committed and turn_succeeded
+            if not terminal_committed:
+                turn_succeeded = False
             trace = traceback.format_exc()
             try:
                 os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
@@ -12702,26 +13847,41 @@ def _run_prompt_submit(
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
-            # The agent persists its working transcript on normal finalization,
-            # but an exception in that finalizer can otherwise leave the
-            # gateway's separate in-memory history at the turn-start snapshot.
-            # Keep the partial turn available to the next prompt; the durable
-            # inflight record still carries the recoverable error state.
-            _restore_agent_history_after_turn_error(session, agent)
-            try:
-                # Close the turn with the same terminal error frame shape as
-                # the returned-error path (uniform client handling), retaining
-                # the failed turn for resume replay.
-                _emit_terminal_turn_error(sid, session, e)
-                turn_error_retained = True
-            except Exception as emit_exc:
-                print(
-                    f"[gateway-turn] terminal error emit failed: "
-                    f"{type(emit_exc).__name__}: {emit_exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                _emit("error", sid, {"message": str(e)})
+            if not terminal_committed:
+                # The agent persists its working transcript on normal finalization,
+                # but an exception in that finalizer can otherwise leave the
+                # gateway's separate in-memory history at the turn-start snapshot.
+                # Keep the partial turn available to the next prompt; the durable
+                # inflight record still carries the recoverable error state.
+                _restore_agent_history_after_turn_error(session, agent)
+                if (
+                    require_persisted
+                    and completion_id
+                    and _persisted_captain_report(session, completion_id) is not None
+                ):
+                    with session["history_lock"]:
+                        session.setdefault(
+                            "_captain_pending_projection_ids", set()
+                        ).add(completion_id)
+                try:
+                    # Close the turn with the same terminal error frame shape as
+                    # the returned-error path (uniform client handling), retaining
+                    # the failed turn for resume replay.
+                    _emit_terminal_turn_error(
+                        sid,
+                        session,
+                        e,
+                        retain_inflight=not captain_turn,
+                    )
+                    turn_error_retained = not captain_turn
+                except Exception as emit_exc:
+                    print(
+                        f"[gateway-turn] terminal error emit failed: "
+                        f"{type(emit_exc).__name__}: {emit_exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _emit("error", sid, {"message": str(e)})
         finally:
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
@@ -12774,10 +13934,14 @@ def _run_prompt_submit(
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
+            for callback_name, callback in (
+                locals().get("_original_model_callbacks") or {}
+            ).items():
+                setattr(agent, callback_name, callback)
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
-                if not turn_error_retained:
+                if not captain_turn and not turn_error_retained:
                     _clear_inflight_turn(session)
             # Closing bookend of the "tui prompt accepted" record above —
             # fires on every path (success, returned error, exception,
@@ -12806,10 +13970,17 @@ def _run_prompt_submit(
                 time.monotonic() - _turn_started_monotonic,
             )
             # Backstop for turns that never reached a terminal frame (the
-            # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
-            session.pop("_auto_continue_scheduled", None)
+            # frame paths retire the marker as they emit). Captain reports do
+            # not own the user's pending recovery marker or scheduled state.
+            if not captain_turn:
+                _retire_turn_marker(session, marker_key)
+                session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
+            if on_terminal is not None and not terminal_callback_called:
+                try:
+                    on_terminal(terminal_settlement)
+                except Exception:
+                    logger.exception("TUI turn terminal callback failed")
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;

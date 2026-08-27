@@ -48,6 +48,51 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         conn.close()
 
 
+def test_create_swarm_registers_configured_captain_for_every_generated_task(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    from hermes_cli import config, profiles
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"orchestrator_profile": "otto"}},
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "otto-swarm-origin")
+
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Build a routed task tree.",
+            workers=[
+                SwarmWorkerSpec(profile="researcher-a", title="A", body="A"),
+                SwarmWorkerSpec(profile="researcher-b", title="B", body="B"),
+            ],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+        )
+        task_ids = [
+            created.root_id,
+            *created.worker_ids,
+            created.verifier_id,
+            created.synthesizer_id,
+        ]
+        rows = conn.execute(
+            "SELECT task_id, profile, origin_session_key "
+            "FROM kanban_captain_registry ORDER BY task_id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert {row["task_id"] for row in rows} == set(task_ids)
+    assert {row["profile"] for row in rows} == {"otto"}
+    # A process-wide session key does not prove the current session belongs to
+    # the configured Captain profile. Unattached swarms remain profile-routed.
+    assert {row["origin_session_key"] for row in rows} == {None}
+
+
 def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):

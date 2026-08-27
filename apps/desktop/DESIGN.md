@@ -10,6 +10,11 @@ This file owns the visual and interaction contract. Read
 [`AGENTS.md`](./AGENTS.md) for architecture, state, resolver, transport, and
 testing rules.
 
+Desktop consumes backend-owned Captain and Kanban events through the gateway;
+it does not own or reimplement their lifecycle. Changes at that seam must follow
+the [multi-gateway Kanban contract](../../docs/kanban/multi-gateway.md) and the
+[session lifecycle contract](../../docs/session-lifecycle.md).
+
 This doc contains two kinds of content, maintained differently:
 
 - **Principles** (flatness, intent, feedback, motion, cancellation) are durable.

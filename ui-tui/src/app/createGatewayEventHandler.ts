@@ -418,6 +418,10 @@ const normalizeSubagentStatus = (status: unknown, fallback: SubagentStatus): Sub
 export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev: GatewayEvent) => void {
   syncThemeToTerminalBackground()
 
+  // Survives gateway reconnects for the life of this UI handler. Captain
+  // retries intentionally reuse the event-derived completion id.
+  const messageReceiptIds = new Set<string>()
+
   const { rpc } = ctx.gateway
   const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
   const { bellOnComplete, stdout, sys } = ctx.system
@@ -1422,9 +1426,28 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.complete': {
+        const terminalFailed = ev.payload?.status === 'error' || ev.payload?.status === 'interrupted'
+        // Stable Captain ids are durable success receipts. A retryable failure
+        // may carry the same backend id, but must not consume it before the
+        // successful retry becomes visible.
+        const receiptId = !terminalFailed && typeof ev.payload?.id === 'string' ? ev.payload.id : ''
+        const replayedReceipt = Boolean(receiptId && messageReceiptIds.has(receiptId))
+
+        if (receiptId && !replayedReceipt) {
+          if (messageReceiptIds.size >= 1024) {
+            const oldest = messageReceiptIds.values().next().value
+
+            if (oldest) {
+              messageReceiptIds.delete(oldest)
+            }
+          }
+
+          messageReceiptIds.add(receiptId)
+        }
+
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
 
-        if (!wasInterrupted) {
+        if (!wasInterrupted && !replayedReceipt) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
           msgs.forEach(appendMessage)
 

@@ -1,4 +1,5 @@
 import asyncio
+import time
 import pytest
 
 from pathlib import Path
@@ -33,6 +34,99 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["thread_id"] == "topic1"
     assert subs[0]["user_id"] == "user1"
     assert subs[0]["notifier_profile"] == "default"
+
+
+def _subscribe_lineage_surfaces(task_id: str, *, session_key: str) -> None:
+    with kb.connect() as conn:
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="lineage-chat",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="tui",
+            chat_id=session_key,
+        )
+
+
+def _record_crash_event(conn, task_id: str, *, error: str = "pid gone") -> int:
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.current_run_id is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (task_id,),
+        )
+        run_id = kb._end_run(
+            conn,
+            task_id,
+            outcome="crashed",
+            status="crashed",
+            error=error,
+        )
+        assert run_id == task.current_run_id
+        kb._append_event(
+            conn,
+            task_id,
+            "crashed",
+            {"error": error, "retry_status": "ready"},
+            run_id=run_id,
+        )
+    assert run_id is not None
+    return int(run_id)
+
+
+async def _collect_gateway_lineage_messages() -> list[str]:
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    runner._kanban_notifier_profile = "default"
+    runner._profile_adapters = {}
+
+    delivered: list[str] = []
+    adapter = MagicMock()
+    adapter.name = "telegram"
+
+    async def _send(_chat_id, message, metadata=None):
+        delivered.append(message)
+        runner._running = False
+
+    adapter.send = AsyncMock(side_effect=_send)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._authorization_adapter = lambda platform, profile=None: adapter
+
+    real_sleep = asyncio.sleep
+
+    async def _fast_sleep(_seconds):
+        await real_sleep(0)
+
+    with patch("gateway.kanban_watchers.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+    return delivered
+
+
+async def _assert_gateway_tui_lineage_parity(
+    *, session_key: str, matching_text: str,
+) -> str:
+    from tui_gateway.server import _collect_kanban_notifications
+
+    gateway_messages = await _collect_gateway_lineage_messages()
+    tui_messages = _collect_kanban_notifications({"session_key": session_key})
+    gateway_message = next(message for message in gateway_messages if matching_text in message)
+    tui_message = next(message for message in tui_messages if matching_text in message)
+    assert gateway_message == tui_message
+    return gateway_message
 
 
 def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
@@ -1130,3 +1224,246 @@ def test_gc_archived_rows_already_removed_by_unsub(kanban_home):
         assert kb.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
+
+@pytest.mark.asyncio
+async def test_lineage_old_crash_is_superseded_by_new_active_run(kanban_home):
+    session_key = "lineage-old-crash"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="race crash", assignee="worker1")
+    _subscribe_lineage_surfaces(task_id, session_key=session_key)
+
+    with kb.connect() as conn:
+        first = kb.claim_task(conn, task_id, claimer="worker1:first")
+        assert first is not None and first.current_run_id is not None
+        old_run_id = _record_crash_event(conn, task_id)
+        second = kb.claim_task(conn, task_id, claimer="worker1:second")
+        assert second is not None and second.current_run_id is not None
+        new_run_id = second.current_run_id
+
+    message = await _assert_gateway_tui_lineage_parity(
+        session_key=session_key,
+        matching_text="worker crashed",
+    )
+
+    assert f"event_run_id={old_run_id}" in message
+    assert "status=running" in message
+    assert "assignee=worker1" in message
+    assert f"current_run_id={new_run_id}" in message
+    assert "lineage=superseded" in message
+    assert "will retry" not in message
+
+
+@pytest.mark.asyncio
+async def test_lineage_old_gave_up_is_superseded_by_later_completion(kanban_home):
+    session_key = "lineage-old-gave-up"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="race gave up", assignee="worker1")
+    _subscribe_lineage_surfaces(task_id, session_key=session_key)
+
+    with kb.connect() as conn:
+        first = kb.claim_task(conn, task_id, claimer="worker1:first")
+        assert first is not None and first.current_run_id is not None
+        old_run_id = first.current_run_id
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "spawn failed",
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        assert kb.unblock_task(conn, task_id)
+        second = kb.claim_task(conn, task_id, claimer="worker1:second")
+        assert second is not None and second.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="recovered",
+            expected_run_id=second.current_run_id,
+        )
+
+    message = await _assert_gateway_tui_lineage_parity(
+        session_key=session_key,
+        matching_text="gave up",
+    )
+
+    assert f"event_run_id={old_run_id}" in message
+    assert "status=done" in message
+    assert "current_run_id=none" in message
+    assert "lineage=superseded" in message
+    assert "task is blocked" not in message
+
+
+@pytest.mark.asyncio
+async def test_lineage_current_crash_keeps_true_retry_language(kanban_home):
+    session_key = "lineage-current-crash"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="current crash", assignee="worker1")
+    _subscribe_lineage_surfaces(task_id, session_key=session_key)
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task_id, claimer="worker1:first")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = _record_crash_event(conn, task_id)
+
+    message = await _assert_gateway_tui_lineage_parity(
+        session_key=session_key,
+        matching_text="worker crashed",
+    )
+
+    assert f"event_run_id={run_id}" in message
+    assert "status=ready" in message
+    assert "current_run_id=none" in message
+    assert "lineage=current" in message
+    assert "dispatcher will retry" in message
+
+
+@pytest.mark.asyncio
+async def test_lineage_current_gave_up_keeps_block_and_redacts_bounded_payload(
+    kanban_home,
+):
+    session_key = "lineage-current-gave-up"
+    secret = "sk-proj-" + ("A" * 80)
+    long_error = f"spawn failed with {secret} " + ("x" * 2_000)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="current gave up", assignee="worker1")
+    _subscribe_lineage_surfaces(task_id, session_key=session_key)
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task_id, claimer="worker1:first")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            long_error,
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+
+    message = await _assert_gateway_tui_lineage_parity(
+        session_key=session_key,
+        matching_text="gave up",
+    )
+
+    assert f"event_run_id={run_id}" in message
+    assert "status=blocked" in message
+    assert "assignee=worker1" in message
+    assert "current_run_id=none" in message
+    assert "lineage=current" in message
+    assert "task is blocked" in message
+    assert secret not in message
+    assert len(message) <= 700
+
+
+@pytest.mark.asyncio
+async def test_lineage_crash_breaker_preserves_run_and_current_block_alert(
+    kanban_home,
+    monkeypatch,
+):
+    session_key = "lineage-crash-breaker"
+    secret = "sk-proj-" + ("B" * 80)
+    long_exit_code = f"failure with {secret} " + ("x" * 2_000)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="crash breaker",
+            assignee="worker1",
+            max_retries=1,
+        )
+    _subscribe_lineage_surfaces(task_id, session_key=session_key)
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        kb._set_worker_pid(conn, task_id, 991001)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb,
+            "_classify_worker_exit",
+            lambda _pid: ("nonzero_exit", long_exit_code),
+        )
+        assert kb.detect_crashed_workers(conn) == [task_id]
+
+        task = kb.get_task(conn, task_id)
+        gave_up = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "gave_up"
+        )
+        assert task is not None and task.status == "blocked"
+        assert gave_up.run_id == run_id
+
+    from agent import redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    message = await _assert_gateway_tui_lineage_parity(
+        session_key=session_key,
+        matching_text="gave up",
+    )
+
+    assert f"event_run_id={run_id}" in message
+    assert "status=blocked" in message
+    assert "current_run_id=none" in message
+    assert "lineage=current" in message
+    assert "task is blocked" in message
+    assert secret not in message
+    assert len(message) <= 700
+
+
+@pytest.mark.asyncio
+async def test_lineage_timeout_breaker_preserves_run_and_current_block_alert(
+    kanban_home,
+    monkeypatch,
+):
+    session_key = "lineage-timeout-breaker"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="timeout breaker",
+            assignee="worker1",
+            max_runtime_seconds=1,
+            max_retries=1,
+        )
+    _subscribe_lineage_surfaces(task_id, session_key=session_key)
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        kb._set_worker_pid(conn, task_id, 991002)
+        old_started = int(time.time()) - 30
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (old_started, run_id),
+            )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        assert kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None) == [
+            task_id
+        ]
+
+        task = kb.get_task(conn, task_id)
+        gave_up = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "gave_up"
+        )
+        assert task is not None and task.status == "blocked"
+        assert gave_up.run_id == run_id
+
+    message = await _assert_gateway_tui_lineage_parity(
+        session_key=session_key,
+        matching_text="gave up",
+    )
+
+    assert f"event_run_id={run_id}" in message
+    assert "status=blocked" in message
+    assert "current_run_id=none" in message
+    assert "lineage=current" in message
+    assert "task is blocked" in message
+    assert len(message) <= 700

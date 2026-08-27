@@ -56,13 +56,18 @@ import threading
 import time
 import webbrowser
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
+
+_CALLBACK_REQUEST_TIMEOUT_SECONDS = 0.5
+_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
+_PASTE_READER_POLL_INTERVAL_SECONDS = 0.05
+_PASTE_READER_JOIN_TIMEOUT_SECONDS = 1.0
 
 # ---------------------------------------------------------------------------
 # Lazy imports -- MCP SDK with OAuth support is optional
@@ -165,10 +170,11 @@ _oauth_interactive_enabled: "contextvars.ContextVar[bool]" = contextvars.Context
 )
 
 # Forces _is_interactive() past the stdin-TTY check for flows driven from a
-# GUI (dashboard/desktop REST): the browser + localhost callback server do all
-# the work there, and the stdin paste fallback degrades harmlessly (EOF is
-# swallowed by _paste_callback_reader). Suppression still wins — background
-# discovery must never start a browser flow.
+# GUI (dashboard/desktop REST) or an explicit ``hermes mcp login`` command:
+# the browser + localhost callback server do all the work there. This permits
+# the authorization flow; it does NOT make stdin a usable paste channel (see
+# _paste_callback_available). Suppression still wins — background discovery
+# must never start a browser flow.
 _oauth_interactive_forced: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "_oauth_interactive_forced", default=False
 )
@@ -328,6 +334,24 @@ def _is_interactive() -> bool:
         return False
     if _oauth_interactive_forced.get():
         return True
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _paste_callback_available() -> bool:
+    """Return True only when stdin itself can accept paste-back input.
+
+    ``force_interactive_oauth`` means a user explicitly authorized a browser
+    flow even though the process may have pipe/FIFO stdin (desktop, TUI, or a
+    background terminal). Treating that override as proof of a readable TTY
+    starts a competing ``readline()`` which immediately sees EOF and can race
+    the launcher's own stdin lifecycle. Keep the loopback listener available
+    in those flows, but offer paste-back only for a real terminal stdin.
+    """
+    if not _oauth_interactive_enabled.get():
+        return False
     try:
         return sys.stdin.isatty()
     except (AttributeError, ValueError):
@@ -744,6 +768,40 @@ def _authorization_code_result(code: str, state: "str | None", iss: "str | None"
     return AuthorizationCodeResult(code=code, state=state, iss=iss)
 
 
+def _try_set_callback_result(
+    result: dict[str, Any],
+    *,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    iss: str | None = None,
+) -> bool:
+    """Atomically latch the first terminal callback result."""
+    if code is None and error is None:
+        return False
+
+    lock = result.get("_lock")
+    if lock is None:
+        if result.get("auth_code") is not None or result.get("error") is not None:
+            return False
+        result.update(auth_code=code, state=state, error=error, iss=iss)
+        return True
+
+    with lock:
+        if result.get("auth_code") is not None or result.get("error") is not None:
+            return False
+        result.update(auth_code=code, state=state, error=error, iss=iss)
+        return True
+
+
+def _callback_result_is_terminal(result: dict[str, Any]) -> bool:
+    lock = result.get("_lock")
+    if lock is None:
+        return result.get("auth_code") is not None or result.get("error") is not None
+    with lock:
+        return result.get("auth_code") is not None or result.get("error") is not None
+
+
 def _make_callback_handler() -> tuple[type, dict]:
     """Create a per-flow callback HTTP handler class with its own result dict.
 
@@ -754,9 +812,17 @@ def _make_callback_handler() -> tuple[type, dict]:
     """
     result: dict[str, Any] = {
         "auth_code": None, "state": None, "error": None, "iss": None,
+        "_lock": threading.Lock(),
     }
 
     class _Handler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            # A browser/probe can connect and then never finish its request.
+            # Bound reads so that accepted callback connections cannot retain
+            # handler resources indefinitely after the listener shuts down.
+            self.request.settimeout(_CALLBACK_REQUEST_TIMEOUT_SECONDS)
+            super().setup()
+
         def do_GET(self) -> None:  # noqa: N802
             params = parse_qs(urlparse(self.path).query)
             code = params.get("code", [None])[0]
@@ -769,10 +835,12 @@ def _make_callback_handler() -> tuple[type, dict]:
             # here would break login against those providers.
             iss = params.get("iss", [None])[0]
 
-            result["auth_code"] = code
-            result["state"] = state
-            result["error"] = error
-            result["iss"] = iss
+            # Browsers commonly follow the callback with /favicon.ico. Only a
+            # real terminal response may win, and the first code/error stays
+            # latched so a later request cannot erase or replace it.
+            _try_set_callback_result(
+                result, code=code, state=state, error=error, iss=iss
+            )
 
             body = (
                 "<html><body><h2>Authorization Successful</h2>"
@@ -787,7 +855,10 @@ def _make_callback_handler() -> tuple[type, dict]:
             self.wfile.write(body.encode())
 
         def log_message(self, fmt: str, *args: Any) -> None:
-            logger.debug("OAuth callback: %s", fmt % args)
+            # BaseHTTPRequestHandler includes the full request target in its
+            # default message. OAuth callback targets contain the code and
+            # state, so never forward the formatted request line to logs.
+            logger.debug("OAuth callback HTTP request handled")
 
     return _Handler, result
 
@@ -985,7 +1056,7 @@ def _make_callback_waiter(
         # TIME_WAIT socket from a previous flow cannot block the next one
         # (#44590).
         try:
-            server = HTTPServer(
+            server = ThreadingHTTPServer(
                 ("127.0.0.1", port), handler_cls, bind_and_activate=False
             )
             reserved = _reserved_sockets.pop(port, None)
@@ -1011,7 +1082,19 @@ def _make_callback_waiter(
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        # Keep accepting until the async waiter has a terminal result. A
+        # one-shot ``handle_request`` thread can stay blocked in accept/select
+        # after paste, skip, EOF-driven cancellation, or timeout wins; merely
+        # closing the server socket from another thread does not synchronously
+        # reap that waiter and the callback port can still be owned when the
+        # surrounding MCP transport retries. The threaded server also keeps
+        # ``serve_forever`` responsive when a client connects but never sends a
+        # complete request; each bounded handler runs independently.
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+        )
         server_thread.start()
 
         # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -1019,7 +1102,8 @@ def _make_callback_waiter(
         # result dict. The HTTP listener and this thread race for the result;
         # whichever fills it first wins.
         paste_thread: threading.Thread | None = None
-        if _is_interactive():
+        paste_stop = threading.Event()
+        if _paste_callback_available():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
                 "portion) and press Enter. Type ``skip`` + Enter to continue "
@@ -1028,7 +1112,10 @@ def _make_callback_waiter(
                 flush=True,
             )
             paste_thread = threading.Thread(
-                target=_paste_callback_reader, args=(result,), daemon=True
+                target=_paste_callback_reader,
+                args=(result, paste_stop),
+                name=f"mcp-oauth-paste-{port}",
+                daemon=True,
             )
             paste_thread.start()
 
@@ -1036,12 +1123,21 @@ def _make_callback_waiter(
         elapsed = 0.0
         try:
             while elapsed < timeout:
-                if result["auth_code"] is not None or result["error"] is not None:
+                if _callback_result_is_terminal(result):
                     break
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
+            paste_stop.set()
+            if paste_thread is not None:
+                paste_thread.join(timeout=_PASTE_READER_JOIN_TIMEOUT_SECONDS)
+                if paste_thread.is_alive():
+                    logger.warning("OAuth paste reader did not stop promptly")
+            server.shutdown()
             server.server_close()
+            server_thread.join(timeout=_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS)
+            if server_thread.is_alive():
+                logger.warning("OAuth callback listener did not stop promptly")
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
@@ -1070,7 +1166,83 @@ def _make_callback_waiter(
     return _wait
 
 
-def _paste_callback_reader(result: dict) -> None:
+def _read_windows_paste_line(stop_event: threading.Event) -> str | None:
+    """Poll a Windows console for one line without an uncancellable read."""
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:  # pragma: no cover - only reachable on Windows
+        return None
+    msvcrt: Any = _msvcrt
+
+    chars: list[str] = []
+    while not stop_event.wait(_PASTE_READER_POLL_INTERVAL_SECONDS):
+        while msvcrt.kbhit():
+            if stop_event.is_set():
+                return None
+            char = msvcrt.getwch()
+            if char in {"\r", "\n"}:
+                return "".join(chars) + "\n"
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == "\x1a":
+                return ""
+            if char in {"\x00", "\xe0"}:
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
+            if char == "\b":
+                if chars:
+                    chars.pop()
+                continue
+            chars.append(char)
+    return None
+
+
+def _read_paste_line(stop_event: threading.Event) -> str | None:
+    """Wait for one TTY line while remaining responsive to cancellation."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        return _read_windows_paste_line(stop_event)
+
+    try:
+        import select
+
+        stdin_fd = sys.stdin.fileno()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+    line = bytearray()
+    while not stop_event.is_set():
+        try:
+            readable, _, _ = select.select(
+                [stdin_fd], [], [], _PASTE_READER_POLL_INTERVAL_SECONDS
+            )
+        except (OSError, TypeError, ValueError):
+            return None
+        if stop_event.is_set():
+            return None
+        if readable:
+            # Read one byte at a time instead of entering TextIOWrapper.readline:
+            # on a raw or otherwise unusual TTY, readiness may mean only one
+            # character is available, and readline would become uncancellable
+            # again while waiting for the newline.
+            try:
+                char = os.read(stdin_fd, 1)
+            except OSError:
+                return None
+            if not char:
+                return ""
+            line.extend(char)
+            if char in {b"\r", b"\n"}:
+                return line.decode(
+                    getattr(sys.stdin, "encoding", None) or "utf-8",
+                    errors="replace",
+                )
+    return None
+
+
+def _paste_callback_reader(
+    result: dict, stop_event: threading.Event | None = None
+) -> None:
     """Read one line from stdin, parse it as an OAuth redirect, write to result.
 
     Accepts any of:
@@ -1086,7 +1258,11 @@ def _paste_callback_reader(result: dict) -> None:
     fallback alongside the HTTP listener, which remains the primary path.
     """
     try:
-        line = sys.stdin.readline()
+        line = (
+            sys.stdin.readline()
+            if stop_event is None
+            else _read_paste_line(stop_event)
+        )
     except (KeyboardInterrupt, OSError, ValueError):
         return
     if not line:
@@ -1095,18 +1271,13 @@ def _paste_callback_reader(result: dict) -> None:
     if not line:
         return
 
-    # Skip if HTTP listener already won.
-    if result.get("auth_code") is not None or result.get("error") is not None:
-        return
-
     # Skip token: user explicitly opted out of authorization. Mark the
     # result with a sentinel error string that _wait_for_callback maps
     # to OAuthNonInteractiveError (already handled by mcp_tool.py as a
     # non-fatal "skip this server and continue startup" path).
     if line.lower() in _SKIP_TOKENS:
-        if result.get("auth_code") is not None or result.get("error") is not None:
+        if not _try_set_callback_result(result, error=_USER_SKIPPED_SENTINEL):
             return
-        result["error"] = _USER_SKIPPED_SENTINEL
         print(
             "  OAuth skipped. Run `hermes mcp login <server>` later to "
             "authenticate, or set ``enabled: false`` on that server in "
@@ -1144,14 +1315,10 @@ def _paste_callback_reader(result: dict) -> None:
         )
         return
 
-    # One more race-check before writing.
-    if result.get("auth_code") is not None or result.get("error") is not None:
+    if not _try_set_callback_result(
+        result, code=code, state=state, error=error, iss=iss
+    ):
         return
-
-    result["auth_code"] = code
-    result["state"] = state
-    result["error"] = error
-    result["iss"] = iss
     if code:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 
@@ -1195,6 +1362,17 @@ def _get_hermes_oauth_provider_class() -> type | None:
             if ua:
                 request.headers["User-Agent"] = ua
             return request
+
+        async def _perform_authorization(self):
+            """Redact callback state before the SDK logs a mismatch failure."""
+            from mcp.client.auth import OAuthFlowError
+
+            try:
+                return await super()._perform_authorization()
+            except OAuthFlowError as exc:
+                if str(exc).startswith("State parameter mismatch:"):
+                    raise OAuthFlowError("OAuth state parameter mismatch") from None
+                raise
 
         def _coerce_client_secret_post(self) -> None:
             info = getattr(self.context, "client_info", None)

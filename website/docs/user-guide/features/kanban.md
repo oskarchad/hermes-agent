@@ -61,7 +61,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   word "board" outside this docs section.
 - **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
-- **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
+- **Comment** — the inter-agent protocol. Agents and humans append comments. Spawn-time context carries the latest material comment and a count; an explicit `kanban_show` returns the full thread.
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
@@ -244,6 +244,39 @@ policy forbids long-lived services, etc.) a `--force` escape hatch keeps
 the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
+
+### Bound a task's worker tool surface
+
+By default, a task inherits the assignee profile's normal CLI toolsets. For a
+narrow lane, set a task-level allowlist so unrelated MCP servers and media or
+communication tools never enter that worker's model schema:
+
+```bash
+hermes kanban create "implement parser fix" --assignee patch \
+  --toolset terminal --toolset file --toolset context7
+
+# Replace the allowlist on an existing task.
+hermes kanban set-toolsets t_abcd terminal file context7
+
+# Restore legacy profile inheritance.
+hermes kanban set-toolsets t_abcd --clear
+```
+
+The dashboard's create dialog and task drawer expose the same setting, and
+orchestrators can pass `enabled_toolsets` to `kanban_create`. Requested names
+are deduplicated in first-seen order and validated against built-in toolsets,
+registry aliases, and enabled MCP server names from the assignee profile. The
+list is bounded to 32 names of at most 128 characters each.
+
+Hermes adds the mandatory `context7` and `kanban` toolsets to every explicit
+allowlist. `kanban` preserves lifecycle handoff tools; `context7` preserves the
+profile's required documentation lookup lane. Both the requested
+`enabled_toolsets` and computed `effective_toolsets` appear in JSON/API task
+readback for auditing. If an MCP server disappears or a stored row is tampered
+with, dispatch fails closed before process spawn, blocks the card once, and
+records a sanitized `toolsets_validation_failed` event instead of retrying in a
+crash loop. Tasks with no allowlist (`NULL`) retain the previous profile
+inheritance behavior unchanged.
 
 ### Idempotent create (for automation / webhooks)
 
@@ -768,7 +801,7 @@ hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
         [--failure-limit N] [--json]
 hermes kanban daemon --force                           # DEPRECATED — standalone dispatcher (use `hermes gateway start` instead)
         [--failure-limit N] [--pidfile PATH] [-v]
-hermes kanban stats [--json]                           # per-status + per-assignee counts
+hermes kanban stats [--json]                           # per-status + per-assignee counts + unreported Captain report backlog
 hermes kanban log <id> [--tail BYTES]                  # worker log from ~/.hermes/kanban/logs/
 hermes kanban notify-subscribe <id>                    # gateway bridge hook (used by /kanban in the gateway)
         --platform <name> --chat-id <id> [--thread-id <id>] [--user-id <id>]
@@ -1006,6 +1039,38 @@ The Desktop app's Kanban plugin surfaces the same terminal events natively — n
 
 Coverage window: desktop notifications ride the live event stream, so they fire only while the app is running with the Kanban plugin enabled. Events that land while the app is closed are not replayed as notifications on next launch — use a gateway subscription (below) for delivery that must survive the app being closed.
 
+## TUI &amp; Desktop Captain reports (durable)
+
+The Desktop toasts above ride the live event socket and are **not replayed** if the app was closed when the event landed. Gateway subscriptions (below) survive closure but deliver to a **chat**. Between them sits a third path for the TUI/Desktop *Captain* — the orchestrator persona you drive locally: a **durable, profile-scoped reporting inbox** that reports each reportable terminal event **exactly once** to an active TUI/Desktop session bound to the task's profile, even across restarts.
+
+This is TUI/Desktop **profile reporting, not a cross-gateway relay.** A report is only ever adopted by a live TUI/Desktop session on the **same normalized profile**. It is never routed across profiles, boards, tenants, gateway accounts/platforms, or to an unrelated user, and it never invents a chat or human destination.
+
+**Exact origin first, durable fallback second.**
+
+- **Exact origin-session delivery remains the first choice.** Every live TUI/Desktop session publishes a durable receiver heartbeat on each board even while a long model turn is running and before any report exists. The session that created the task remains the only eligible receiver while that heartbeat is live.
+- **When that origin session is absent or its heartbeat expires, the Captain inbox takes over for unscoped rows.** The next active TUI/Desktop session bound to the **same** normalized profile may claim an untenant report — exactly one of them wins, no matter how many same-profile sessions are polling.
+- **Tenant-tagged fallback deliberately fails closed.** Current TUI/Desktop transport sessions do not carry an authoritative tenant identity, so a tenant-tagged report may return only to its exact origin. Adding a client/session field does not make a fallback eligible. The tenant columns and receiver migration remain durable for a future authenticated transport binding.
+
+**Exactly-once, crash-safe claim.** Each reportable terminal event durably materializes an inbox row that moves through a small state machine:
+
+- `pending` → `leased` → `acked`. A poll rechecks origin liveness and tenant eligibility in the **same write transaction** that leases the row under an opaque token, so an origin that refreshes between candidate read and lease cannot be stolen by a sibling gateway. While the synthetic model turn is live, Hermes durably renews that lease; every renewal and final acknowledgement verifies both the opaque token and its owner, and a lost fence suppresses visible success.
+- Each synthetic Captain turn carries **one event** and therefore one stable event-derived completion ID. This keeps retry identity unchanged even when another board is independently locked or unavailable. TUI and Desktop deduplicate that ID defensively.
+- During that synthetic turn, response deltas remain buffered rather than visible or spoken. Hermes requires an explicit successful final transcript-persistence receipt, verifies the unexpired owner-fenced acknowledgement rowcount, and only then emits the assistant `message.complete`. A persistence exception, lock, expired fence, or zero-row acknowledgement becomes a recoverable error and releases every still-owned unsettled token for retry; the poller clears the failed reservation and continues polling and refreshing receiver heartbeats instead of terminating.
+- The durable receipt lookup spans the session database owned by the normalized profile. If session A commits the report but disappears before acknowledgement, a distinct same-profile session B reuses and atomically rehomes that committed synthetic turn before acknowledging it; it does **not** run a second model turn or persist a second canonical assistant report. Because profile databases are isolated and the completion identity includes the board-local event identity, reconciliation never searches across profiles, tenants, or boards.
+- If the transport dies after accepting the completion frame, no pending inbox row remains to replay. If it dies just before the frame, reconnect hydration reads the already-durable assistant row. Rejection, interruption, model failure, persistence failure, or settlement failure before that commit leaves the report retryable.
+- Each lease also carries an expiry as the crash backstop. A process that dies before settlement and can no longer renew strands the row only until expiry; the first eligible poll after restart can reclaim it.
+- When an event is visible through both the exact-origin subscription and the Captain inbox (the origin session is live), the two routes are **deduplicated** by event id and settled together, so you still get a single report.
+
+**Bounded, privacy-safe payload and model context.** A Captain report carries only task/event-derived fields: board/task ids, title, assignee, event kind, and the **first line** of the worker's handoff. One poll applies a single row cap across all boards plus a global UTF-8 byte cap, so adding boards cannot multiply one session's prompt. The report never includes the task body, arbitrary metadata, or raw tool/spawn errors; credential-shaped text is force-redacted at this boundary even when global redaction is off. The model receives this bounded event prompt plus the agent's approved static system/persona context, but **not the claiming session's ordinary conversation history**. Only the generated Captain turn is persisted into the destination transcript and merged into that session's in-memory history.
+
+**Reopen, archive, and retention.** Completion is reversible, so a `done` card that is reopened and completed again produces a **new** reportable event — prior **acked** cycles are never replayed. Archiving **preserves any still-pending report**: the registration, inbox row, and source event survive archive/event-retention cleanup until the report is accepted, then are eligible for purge. An archive with nothing left to report cleans up immediately.
+
+**Unattached creators register too.** A task created outside a TUI/Desktop session — from the CLI, cron, or an unattached orchestrator — registers only to its **explicit owning profile** (the session-bound Hermes profile — `HERMES_SESSION_PROFILE`, else the launch/active profile, canonicalized so `Otto` and `otto` are one owner — *not* the task's `--created-by` author label), with no origin session and **no guessed platform/chat/human destination**. So a gateway `/kanban create` from the `otto` profile owns its Captain reports under `otto`, even though the card's author label may be a plain string like `user`. If the row is untenant, a same-profile TUI/Desktop session can later pick it up; a tenant-tagged unattached row remains pending until authoritative tenant transport identity exists (and shows in diagnostics, below).
+
+**Diagnostics.** `hermes kanban stats` surfaces the unreported Captain backlog — the overall count of not-yet-acked reports, the age of the oldest, and a **bounded per-profile breakdown** (up to 20 profiles ordered by backlog size, each with its `count` and oldest age, plus a count of any further profiles omitted) — so you can see *which* profile's reports are stranded (for example, a profile with no live TUI/Desktop session). `hermes kanban stats --json` exposes the same under `captain_unreported`: `count`, `oldest_age_seconds`, `by_profile` (a list of `{profile, count, oldest_age_seconds}`), and `profiles_truncated`. The diagnostic is **ownership-only** — it never includes task/event ids, titles, or payloads.
+
+**How it differs from its neighbors.** Desktop live plugin toasts (above) are best-effort and **no-replay**; the Captain inbox is durable and exactly-once. Gateway `notify` / `notify+wake` subscriptions (below) are **profile-owned gateway delivery** to a chat destination; the Captain inbox is local TUI/Desktop reporting to the owning profile's session and carries no chat destination at all. The two coexist — a task can both notify its gateway chat and report to its Captain — without either duplicating the other.
+
 ## Gateway notifications
 
 When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
@@ -1021,7 +1086,7 @@ hermes kanban notify-unsubscribe t_abcd \
     --platform telegram --chat-id 12345678 --thread-id 7
 ```
 
-A subscription removes itself automatically once the task reaches `done` or `archived`; no cleanup needed.
+A subscription is **retained through `done`** — completion is reversible, so a reopened task still notifies the origin chat — and removes itself automatically once the task reaches `archived` (the irreversible end state); no cleanup needed. On boards that never archive, the notifier GC purges subscriptions for tasks that have sat in `done` with no new activity for `kanban.done_sub_retention_days` days.
 
 ### Delivery modes
 

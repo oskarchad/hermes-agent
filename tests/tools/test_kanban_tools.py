@@ -921,6 +921,95 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_create_registers_captain_owner_without_notify_sub_when_unattached(
+    monkeypatch, worker_env
+):
+    """An unattached orchestrator/CLI/cron create has no persistent chat
+    channel, so it must NOT invent a notify subscription — but it MUST still
+    register its creator profile in the durable Captain inbox so a same-profile
+    TUI/Desktop session can report the terminal event later (requirement 7)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    # worker_env pins HERMES_PROFILE=test-worker → that is the creator profile.
+
+    out = kt._handle_create({"title": "orchestrator card", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is False, d
+    tid = d["task_id"]
+
+    # No guessed platform/chat destination.
+    assert _list_subs_for_task(tid) == []
+
+    conn = kb.connect()
+    try:
+        reg = conn.execute(
+            "SELECT profile, origin_session_key FROM kanban_captain_registry "
+            "WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert reg is not None
+        assert reg["profile"] == "default"
+        assert reg["origin_session_key"] is None
+        # The 'created' event predates registration → it never materializes.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_captain_inbox WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_create_reports_atomic_captain_registration(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({"title": "atomic captain", "assignee": "peer"})
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["captain_registered"] is True
+
+
+def test_captain_origin_requires_active_profile_to_match_logical_captain(
+    monkeypatch
+):
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_KEY", "desktop-origin")
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "wrench")
+    assert kt._resolve_captain_origin_session_key("otto") is None
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "otto")
+    assert kt._resolve_captain_origin_session_key("otto") == "desktop-origin"
+
+
+def test_create_registration_failure_rolls_back_instead_of_silent_success(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    def fail_registration(*_args, **_kwargs):
+        raise RuntimeError("captain registry unavailable")
+
+    monkeypatch.setattr(kb, "register_captain_owner", fail_registration)
+    out = kt._handle_create({"title": "must rollback", "assignee": "peer"})
+    payload = json.loads(out)
+    assert "captain registry unavailable" in payload["error"]
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = 'must rollback'"
+        ).fetchone()[0] == 0
+
+
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery

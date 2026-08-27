@@ -128,6 +128,7 @@ def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
     try:
         tid = kb.create_task(conn, title="t", assignee="worker")
         kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, 89401)
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 100, tid),
@@ -142,7 +143,7 @@ def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
     kw = fired[0][1]
     assert kw["task_id"] == tid
     assert kw["assignee"] == "worker"
-    assert kw["worker_pid"] is None
+    assert kw["worker_pid"] == 89401
     assert kw["heartbeat_stale"] is False
     assert kw["retry_status"] == "ready"
     assert kw["run_id"] is not None
@@ -172,9 +173,9 @@ def test_raising_callbacks_never_break_worker_lifecycle(
             assert kb.detect_crashed_workers(conn) == [tid]
 
             kb.claim_task(conn, tid)
+            kb._set_worker_pid(conn, tid, 89402)
             conn.execute(
-                "UPDATE tasks SET claim_expires = ?, worker_pid = NULL "
-                "WHERE id = ?",
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
                 (int(time.time()) - 100, tid),
             )
             conn.commit()

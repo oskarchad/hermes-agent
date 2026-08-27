@@ -138,6 +138,48 @@ class TestIdentityFlush:
             finally:
                 db.close()
 
+    def test_persist_session_receipt_requires_new_canonical_rows(self):
+        """A normal return is not a receipt when SQLite performed no commit."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                agent = _make_agent(db)
+                messages = [{"role": "user", "content": "captain event"}]
+
+                assert agent._persist_session(messages, []) is True
+                assert agent._persist_session(messages, []) is False
+
+                assistant = {
+                    "role": "assistant",
+                    "content": "verified candidate",
+                }
+                messages.append(assistant)
+                assert agent._persist_session(messages, []) is True
+                assistant["display_metadata"] = {
+                    "captain_completion_id": "kanban-report:default:verified",
+                }
+                assistant["_db_display_metadata_dirty"] = True
+                assert agent._persist_session(messages, []) is True
+
+                candidates = [
+                    message
+                    for message in db.get_messages_as_conversation(agent.session_id)
+                    if message.get("role") == "assistant"
+                    and message.get("content") == "verified candidate"
+                ]
+                assert len(candidates) == 1
+                assert candidates[0]["display_metadata"] == {
+                    "captain_completion_id": "kanban-report:default:verified",
+                }
+
+                messages.append({"role": "assistant", "content": "not durable"})
+                with patch.object(agent, "_session_db", None):
+                    assert agent._persist_session(messages, []) is False
+            finally:
+                db.close()
+
     def test_cursor_reset_starts_new_turn_identity_window(self):
         """Gateway resets _last_flushed_db_idx=0 before a cached-agent turn."""
         from hermes_state import SessionDB
