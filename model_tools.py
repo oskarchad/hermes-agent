@@ -480,8 +480,15 @@ def _compute_tool_definitions(
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
     if disabled_toolsets:
+        irreducible_worker_canonicals = {
+            registry.get_toolset_alias_target(name) or name
+            for name in irreducible_worker_toolsets
+        }
         for toolset_name in disabled_toolsets:
-            if toolset_name in irreducible_worker_toolsets:
+            disabled_canonical = (
+                registry.get_toolset_alias_target(toolset_name) or toolset_name
+            )
+            if disabled_canonical in irreducible_worker_canonicals:
                 continue
             if validate_toolset(toolset_name):
                 from toolsets import bundle_non_core_tools, get_toolset

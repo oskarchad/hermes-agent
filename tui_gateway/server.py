@@ -11642,7 +11642,10 @@ def _format_kanban_event_text(
 
 
 def _collect_kanban_notifications(
-    session: dict, *, claim_records: Optional[list[dict]] = None
+    session: dict,
+    *,
+    claim_records: Optional[list[dict]] = None,
+    include_captain: bool = True,
 ) -> list:
     """Claim unseen terminal kanban events for this TUI session's subscriptions.
 
@@ -11709,7 +11712,7 @@ def _collect_kanban_notifications(
             # Preserve delivery if the read-only probe cannot inspect a
             # locked, corrupt, or otherwise unusual database.
             open_writable = True
-        if not open_writable and claim_records is not None:
+        if not open_writable and claim_records is not None and include_captain:
             try:
                 open_writable = _kb.count_captain_pending(
                     board=slug, profile=captain_profile
@@ -11782,7 +11785,8 @@ def _collect_kanban_notifications(
                         )
                     )
                     if (
-                        captain_backed
+                        include_captain
+                        and captain_backed
                         and captain_owned_here
                         and claim_records is not None
                     ):
@@ -11828,22 +11832,23 @@ def _collect_kanban_notifications(
             # of the exact-origin route above). Claims reportable terminal
             # events for this session's profile, deduplicating any already
             # rendered by the exact-origin route on this board.
-            try:
-                captain_rows_leased += _collect_captain_reports(
-                    conn, slug, session, captain_profile,
-                    claimed_event_ids, claim_records, texts,
-                    row_limit=(
-                        0
-                        if texts
-                        else _CAPTAIN_TURN_ROW_CAP - captain_rows_leased
-                    ),
-                )
-            except Exception as exc:
-                print(
-                    f"[tui_gateway] captain report collection failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                )
+            if include_captain:
+                try:
+                    captain_rows_leased += _collect_captain_reports(
+                        conn, slug, session, captain_profile,
+                        claimed_event_ids, claim_records, texts,
+                        row_limit=(
+                            0
+                            if texts
+                            else _CAPTAIN_TURN_ROW_CAP - captain_rows_leased
+                        ),
+                    )
+                except Exception as exc:
+                    print(
+                        f"[tui_gateway] captain report collection failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
         finally:
             conn.close()
     return texts
@@ -12247,30 +12252,25 @@ def _notification_poller_loop(
                 )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
-            try:
-                _touch_captain_receivers(session)
-            except Exception as _heartbeat_exc:
-                print(
-                    f"[tui_gateway] Captain receiver heartbeat failed: "
-                    f"{type(_heartbeat_exc).__name__}: {_heartbeat_exc}",
-                    file=sys.stderr,
-                )
-            _reserved = False
-            _kanban_claims: list[dict] = []
-            _kanban_texts: list[str] = []
-            _kb_exc = None
             _captain_runtime_deferred = (
                 getattr(session.get("agent"), "api_mode", "")
                 == "codex_app_server"
             )
+            if not _captain_runtime_deferred:
+                try:
+                    _touch_captain_receivers(session)
+                except Exception as _heartbeat_exc:
+                    print(
+                        f"[tui_gateway] Captain receiver heartbeat failed: "
+                        f"{type(_heartbeat_exc).__name__}: {_heartbeat_exc}",
+                        file=sys.stderr,
+                    )
+            _reserved = False
+            _kanban_claims: list[dict] = []
+            _kanban_texts: list[str] = []
+            _kb_exc = None
             with session["history_lock"]:
-                if _captain_runtime_deferred:
-                    # The Codex app-server owns a persistent external thread;
-                    # Captain's bounded task-only synthesis cannot safely run
-                    # there. Do not lease the durable row at all. A later
-                    # supported session/runtime can claim the same pending event.
-                    pass
-                elif not session.get("running"):
+                if not session.get("running"):
                     # Hold the lock through the DB claim. A concurrent user
                     # submit waits here instead of observing a transient busy
                     # state on empty polls; when events exist, running=True is
@@ -12279,7 +12279,9 @@ def _notification_poller_loop(
                     _reserved = True
                     try:
                         _kanban_texts = _collect_kanban_notifications(
-                            session, claim_records=_kanban_claims
+                            session,
+                            claim_records=_kanban_claims,
+                            include_captain=not _captain_runtime_deferred,
                         )
                     except Exception as exc:
                         _kb_exc = exc
@@ -12316,12 +12318,20 @@ def _notification_poller_loop(
                             _kanban_claims,
                             _kanban_texts,
                         )
+                        _has_captain_claim = any(
+                            record.get("route") == "captain"
+                            for record in _kanban_claims
+                        )
                         try:
-                            _reconciled = _reconcile_persisted_captain_report(
-                                sid,
-                                session,
-                                _kanban_claims,
-                                completion_id,
+                            _reconciled = (
+                                _reconcile_persisted_captain_report(
+                                    sid,
+                                    session,
+                                    _kanban_claims,
+                                    completion_id,
+                                )
+                                if _has_captain_claim
+                                else False
                             )
                         except Exception as _reconcile_exc:
                             _release_exc = None
@@ -12354,35 +12364,46 @@ def _notification_poller_loop(
                             _kanban_claims
                         )
 
-                        def _settle_after_terminal(succeeded: Optional[bool]) -> None:
-                            with _settled_lock:
-                                if _settled.is_set():
+                        def _settle_after_terminal(
+                            succeeded: Optional[bool],
+                            *,
+                            _claim_records=list(_kanban_claims),
+                            _completion_id=completion_id,
+                            _lease_handle=_lease_renewer,
+                            _settled_event=_settled,
+                            _settlement_lock=_settled_lock,
+                        ) -> None:
+                            # The prompt turn is asynchronous. Bind every
+                            # per-dispatch value now so later poll intervals
+                            # cannot rebind this closure to another claim set.
+                            with _settlement_lock:
+                                if _settled_event.is_set():
                                     return
                                 try:
-                                    _stop_captain_lease_renewer(_lease_renewer)
+                                    _stop_captain_lease_renewer(_lease_handle)
                                 except Exception:
                                     if succeeded is None:
-                                        _settled.set()
+                                        _settled_event.set()
                                         raise
                                     try:
                                         _settle_kanban_notification_claims(
-                                            _kanban_claims, accepted=False
+                                            _claim_records, accepted=False
                                         )
                                     finally:
-                                        _settled.set()
+                                        _settled_event.set()
                                     raise
                                 if succeeded is None:
                                     # Rollback of the crash-staged input failed.
                                     # Leave the claim leased rather than making a
                                     # dirty retry immediately eligible; normal
                                     # lease expiry provides the bounded retry.
-                                    _settled.set()
+                                    _settled_event.set()
                                     return
                                 try:
                                     _settle_captain_turn_claims(
                                         session,
-                                        _kanban_claims,
-                                        completion_id=completion_id,
+                                        _claim_records,
+                                        completion_id=_completion_id,
                                         captain_profile=_session_captain_profile(session),
                                         succeeded=bool(succeeded),
                                     )
@@ -12391,7 +12412,7 @@ def _notification_poller_loop(
                                     # before it. Callback failures must propagate
                                     # through _run_prompt_submit and suppress the
                                     # visible success frame.
-                                    _settled.set()
+                                    _settled_event.set()
 
                         try:
                             _emit("message.start", sid)
@@ -12402,8 +12423,12 @@ def _notification_poller_loop(
                                 "\n".join(_kanban_texts),
                                 on_terminal=_settle_after_terminal,
                                 completion_id=completion_id,
-                                require_persisted=True,
-                                turn_purpose=_CAPTAIN_TURN_PURPOSE,
+                                require_persisted=_has_captain_claim,
+                                turn_purpose=(
+                                    _CAPTAIN_TURN_PURPOSE
+                                    if _has_captain_claim
+                                    else "ordinary"
+                                ),
                             )
                             if accepted is False:
                                 raise RuntimeError("synthetic turn was not accepted")

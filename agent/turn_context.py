@@ -654,6 +654,11 @@ def build_turn_context(
     agent._run_budget_wrapup_injected = False
 
     # Log conversation turn start for debugging/observability.
+    # Task-only Captain synthesis is a one-event privacy boundary. A caller may
+    # still hold the ordinary session transcript, but none of it may enter this
+    # request or the task-only persistence path.
+    if task_only_context:
+        conversation_history = []
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
     _msg_preview = _msg_preview.replace("\n", " ")

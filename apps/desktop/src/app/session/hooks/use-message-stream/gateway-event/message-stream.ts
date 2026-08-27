@@ -335,12 +335,12 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
 
     const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
 
-    // Terminal error frames (status "error") carry the failure in
+    // Terminal failure frames (status "error" or "interrupted") carry the failure in
     // structured fields: `error` is the message, `partial` marks
     // `text` as streamed output to keep rather than the error string, and
     // `error_surface` (newer gateways) names the failing layer for the card.
     const failure =
-      payload?.status === 'error'
+      payload?.status === 'error' || payload?.status === 'interrupted'
         ? {
             error: coerceGatewayText(payload.error).trim() || finalText || 'Hermes reported an error',
             partial: Boolean(payload.partial),

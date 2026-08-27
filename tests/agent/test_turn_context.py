@@ -326,6 +326,23 @@ def test_task_only_context_skips_dynamic_session_context():
     assert ctx.ext_prefetch_cache == ""
 
 
+def test_task_only_context_discards_caller_history():
+    agent = _FakeAgent()
+    ordinary_history = [
+        {"role": "user", "content": "PRIVATE ORDINARY USER CONTEXT"},
+        {"role": "assistant", "content": "PRIVATE ORDINARY ASSISTANT CONTEXT"},
+    ]
+
+    ctx = _build(
+        agent,
+        conversation_history=ordinary_history,
+        task_only_context=True,
+    )
+
+    assert ctx.conversation_history == []
+    assert [message.get("content") for message in ctx.messages] == ["hello"]
+
+
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)

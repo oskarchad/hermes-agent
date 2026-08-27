@@ -408,6 +408,107 @@ class TestNotificationPollerLoopKanbanWiring:
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
 
+    def test_codex_runtime_keeps_exact_origin_notifications(self, monkeypatch):
+        tid = _create_subscribed_task()
+        _complete(tid, summary="codex exact-origin delivery")
+        session = self._poller_session(running=False)
+        session["agent"] = SimpleNamespace(api_mode="codex_app_server")
+        emits: list = []
+        submits: list[str] = []
+
+        self._run_poller_once(
+            session,
+            monkeypatch,
+            emits=emits,
+            submit=lambda _rid, _sid, _session, text: submits.append(text),
+        )
+
+        assert any(tid in text for text in submits), submits
+
+    def test_codex_runtime_does_not_advertise_captain_receiver(self, monkeypatch):
+        import tui_gateway.server as server
+
+        session = self._poller_session(running=False)
+        session["agent"] = SimpleNamespace(api_mode="codex_app_server")
+        heartbeats: list[dict] = []
+        monkeypatch.setattr(
+            server,
+            "_touch_captain_receivers",
+            lambda current_session: heartbeats.append(current_session),
+        )
+        monkeypatch.setattr(
+            server,
+            "_collect_kanban_notifications",
+            lambda *_args, **_kwargs: [],
+        )
+
+        self._run_poller_once(
+            session,
+            monkeypatch,
+            emits=[],
+            submit=lambda *_args: True,
+        )
+
+        assert heartbeats == []
+
+    def test_long_captain_turn_settles_the_claims_captured_for_that_turn(
+        self, monkeypatch
+    ):
+        import time as _time
+
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        _complete(tid, summary="long Captain turn")
+        session = self._poller_session(running=False)
+        callbacks = []
+        settled_claims: list[dict] = []
+
+        monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
+        monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(server, "_start_captain_lease_renewer", lambda *_args: None)
+        monkeypatch.setattr(server, "_stop_captain_lease_renewer", lambda *_args: None)
+        monkeypatch.setattr(
+            server,
+            "_settle_captain_turn_claims",
+            lambda _session, claim_records, **_kwargs: settled_claims.extend(
+                claim_records
+            ),
+        )
+
+        def defer_terminal(
+            _rid,
+            _sid,
+            _session,
+            _text,
+            *,
+            on_terminal=None,
+            **_kwargs,
+        ):
+            callbacks.append(on_terminal)
+            return True
+
+        monkeypatch.setattr(server, "_run_prompt_submit", defer_terminal)
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop, "sid-poller-test", session),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            assert self._wait_for(lambda: callbacks), "Captain turn was not dispatched"
+            # Let the poller enter another interval while the asynchronous turn
+            # remains active. Its next loop must not rebind this turn's closure.
+            _time.sleep(0.05)
+            callbacks[0](True)
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert any(tid in record.get("task_ids", set()) for record in settled_claims)
+
     def test_captain_signal_terminal_settlement_posts_reply_exactly_once(
         self, monkeypatch, tmp_path
     ):
@@ -749,7 +850,8 @@ class TestNotificationPollerLoopKanbanWiring:
         user_prompt_started = threading.Event()
         prompt_response: dict = {}
 
-        def collect(_session, *, claim_records):
+        def collect(_session, *, claim_records, include_captain):
+            assert include_captain is True
             collection_started.set()
             assert release_collection.wait(2.0), "test did not release collection"
             if outcome == "error":

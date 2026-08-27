@@ -419,6 +419,42 @@ def test_review_transition_preserves_requested_and_effective_toolsets(
     assert task.effective_toolsets == ["terminal", "file", "context7", "kanban"]
 
 
+def test_bounded_worker_mandatory_alias_target_survives_profile_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from model_tools import get_tool_definitions
+    from tools.registry import registry
+
+    context7_probe = "mcp__context7__mandatory_alias_probe"
+    registry.register(
+        name=context7_probe,
+        toolset="mcp-context7",
+        schema={
+            "name": context7_probe,
+            "description": "Mandatory alias protection probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: "{}",
+    )
+    monkeypatch.setitem(registry._toolset_aliases, "context7", "mcp-context7")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bounded_alias")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "17")
+    monkeypatch.setenv("HERMES_KANBAN_TASK_TOOLSETS_BOUNDED", "1")
+
+    try:
+        definitions = get_tool_definitions(
+            enabled_toolsets=["terminal", "context7", "kanban"],
+            disabled_toolsets=["mcp-context7"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    finally:
+        registry.deregister(context7_probe)
+
+    names = {item["function"]["name"] for item in definitions}
+    assert context7_probe in names
+
+
 def test_dispatch_blocks_tampered_unknown_toolset_before_spawn(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -489,7 +489,7 @@ def _user_messages(req: dict) -> list:
 
 class TestWireInvariant:
     def test_task_only_turn_bypasses_dynamic_context_and_finalization_hooks(
-        self, wire_env
+        self, wire_env, monkeypatch
     ):
         """A Captain-style turn reaches the provider and persistence seams cleanly.
 
@@ -591,7 +591,28 @@ class TestWireInvariant:
         cached_static_before = agent._cached_system_prompt_static
         handler.response_queue.append(_text_resp("Captain bounded report"))
 
-        with patch("hermes_cli.lifecycle.invoke_hook", side_effect=invoke_dynamic_hook):
+        from hermes_cli.middleware import (
+            apply_llm_request_middleware as real_request_middleware,
+            run_llm_execution_middleware as real_execution_middleware,
+        )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "captain-task")
+
+        with (
+            patch("hermes_cli.lifecycle.has_hook", return_value=True),
+            patch(
+                "hermes_cli.lifecycle.invoke_hook",
+                side_effect=invoke_dynamic_hook,
+            ),
+            patch(
+                "hermes_cli.middleware.apply_llm_request_middleware",
+                wraps=real_request_middleware,
+            ) as request_middleware,
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                wraps=real_execution_middleware,
+            ) as execution_middleware,
+        ):
             result = agent.run_conversation(
                 "Captain bounded task",
                 conversation_history=[],
@@ -612,6 +633,8 @@ class TestWireInvariant:
         for marker in ordinary_prompt_markers.values():
             assert marker not in json.dumps(sent_messages)
         assert result["final_response"] == "Captain bounded report"
+        request_middleware.assert_not_called()
+        execution_middleware.assert_not_called()
         assert agent._cached_system_prompt == cached_prompt_before
         assert agent._cached_system_prompt_static == cached_static_before
         assert db.get_session(sid)["system_prompt"] == ordinary_system_prompt
