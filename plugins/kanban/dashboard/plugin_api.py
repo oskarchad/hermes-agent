@@ -886,6 +886,54 @@ def _mutation_prevalidation_error(task, status, assignee) -> Optional[tuple[int,
     return None
 
 
+def _toolset_patch_prevalidation_error(
+    task, payload: UpdateTaskBody,
+) -> Optional[tuple[int, str]]:
+    """Validate a bounded-toolset PATCH before cleanup or task mutation."""
+    has_list = payload.enabled_toolsets is not None
+    has_clear = payload.clear_enabled_toolsets
+    if not has_list and not has_clear:
+        return None
+    if has_list and has_clear:
+        return 400, "cannot combine enabled_toolsets with clear_enabled_toolsets"
+
+    effective_assignee = (
+        payload.assignee or None
+        if payload.assignee is not None
+        else task.assignee
+    )
+    try:
+        kanban_db.normalize_enabled_toolsets(
+            None if has_clear else payload.enabled_toolsets,
+            hermes_home=kanban_db._profile_home_for_task(effective_assignee),
+        )
+    except ValueError as exc:
+        return 400, str(exc)
+
+    other_mutation = any(
+        value is not None
+        for value in (
+            payload.status,
+            payload.assignee,
+            payload.priority,
+            payload.title,
+            payload.body,
+            payload.result,
+            payload.block_reason,
+            payload.summary,
+            payload.metadata,
+            payload.model_override,
+            payload.provider_override,
+            payload.reasoning_effort,
+        )
+    ) or payload.clear_model_override or payload.clear_reasoning_effort
+    if other_mutation:
+        return 400, "enabled toolset changes must be submitted in a separate PATCH"
+    if task.status == "archived":
+        return 400, f"cannot set enabled toolsets on archived task {task.id}"
+    return None
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -899,6 +947,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         )
         if prevalidation_error is not None:
             status_code, detail = prevalidation_error
+            raise HTTPException(status_code=status_code, detail=detail)
+
+        toolset_prevalidation_error = _toolset_patch_prevalidation_error(task, payload)
+        if toolset_prevalidation_error is not None:
+            status_code, detail = toolset_prevalidation_error
             raise HTTPException(status_code=status_code, detail=detail)
 
         verified_worker_identity = None

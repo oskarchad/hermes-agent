@@ -155,6 +155,95 @@ def test_task_toolsets_create_edit_clear_and_readback(client, monkeypatch):
     assert cleared.json()["task"]["effective_toolsets"] is None
 
 
+def test_patch_rejects_conflicting_toolset_list_and_clear_without_mutation(
+    client, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb,
+        "_available_task_toolset_names",
+        lambda *_args, **_kwargs: {"context7", "file", "kanban", "web"},
+    )
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "toolset conflict", "assignee": "patch"},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"enabled_toolsets": ["file"], "clear_enabled_toolsets": True},
+    )
+
+    assert response.status_code == 400, response.text
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task["id"])
+        assert held is not None
+        assert held.status == task["status"]
+        assert held.assignee == "patch"
+        assert held.enabled_toolsets is None
+
+
+def test_patch_invalid_toolset_precedes_running_worker_cleanup(client, monkeypatch):
+    monkeypatch.setattr(
+        kb,
+        "_available_task_toolset_names",
+        lambda *_args, **_kwargs: {"context7", "file", "kanban", "web"},
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="invalid before cleanup", assignee="patch")
+        claim_lock = kb._dispatcher_claim_lock(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
+        assert claimed is not None
+        assert kb._set_worker_pid(conn, task_id, 86701)
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "blocked", "enabled_toolsets": ["not-a-toolset"]},
+    )
+
+    assert response.status_code == 400, response.text
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task_id)
+        assert held is not None
+        assert held.status == "running"
+        assert held.assignee == "patch"
+        assert held.current_run_id == claimed.current_run_id
+        assert held.claim_lock == claim_lock
+        assert held.worker_pid == 86701
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.id == claimed.current_run_id
+        assert run.status == "running"
+        assert run.ended_at is None
+
+
+def test_patch_rejects_archived_status_with_toolset_update_before_side_effects(
+    client, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb,
+        "_available_task_toolset_names",
+        lambda *_args, **_kwargs: {"context7", "file", "kanban", "web"},
+    )
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "archive conflict", "assignee": "patch"},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "archived", "enabled_toolsets": ["file"]},
+    )
+
+    assert response.status_code == 400, response.text
+    with kb.connect() as conn:
+        held = kb.get_task(conn, task["id"])
+        assert held is not None
+        assert held.status == task["status"]
+        assert held.assignee == "patch"
+        assert held.enabled_toolsets is None
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

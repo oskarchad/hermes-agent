@@ -14505,13 +14505,25 @@ def captain_gc_task_if_settled(conn: sqlite3.Connection, task_id: str) -> bool:
     work remains the registration/inbox rows are kept so the poller can still
     deliver them. Returns True when a purge happened.
     """
-    task = get_task(conn, task_id)
-    if task is None or getattr(task, "status", "") != "archived":
-        return False
-    if captain_unreported_for_task(conn, task_id) > 0:
-        return False
-    purge_captain_task(conn, task_id)
-    return True
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None or task["status"] != "archived":
+            return False
+        if conn.execute(
+            "SELECT 1 FROM kanban_captain_inbox "
+            "WHERE task_id = ? AND state != 'acked' LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None:
+            return False
+        conn.execute(
+            "DELETE FROM kanban_captain_inbox WHERE task_id = ?", (task_id,)
+        )
+        conn.execute(
+            "DELETE FROM kanban_captain_registry WHERE task_id = ?", (task_id,)
+        )
+        return True
 
 
 def count_captain_pending(

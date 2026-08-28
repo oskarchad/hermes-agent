@@ -58,6 +58,81 @@ def _inbox_states():
     return {r["state"]: int(r["n"]) for r in rows}
 
 
+def test_captain_gc_rechecks_eligibility_after_concurrent_reopen():
+    """A writer queued behind reopen must not purge the reopened task."""
+    profile = _profile_for(_session("gc-race"))
+    seed = kb.connect()
+    try:
+        tid = kb.create_task(seed, title="gc race", assignee="worker")
+        kb.register_captain_owner(
+            seed, tid, profile=profile, origin_session_key="gc-race"
+        )
+        with kb.write_txn(seed):
+            seed.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (tid,))
+    finally:
+        seed.close()
+
+    reopen = kb.connect()
+    begin_attempted = threading.Event()
+    outcome = {}
+    failures = []
+
+    def run_gc():
+        conn = kb.connect()
+        try:
+            conn.set_trace_callback(
+                lambda sql: begin_attempted.set()
+                if sql.strip().upper().startswith("BEGIN IMMEDIATE")
+                else None
+            )
+            outcome["purged"] = kb.captain_gc_task_if_settled(conn, tid)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+        finally:
+            conn.close()
+
+    try:
+        reopen.execute("BEGIN IMMEDIATE")
+        reopen.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        kb.add_comment(
+            reopen,
+            tid,
+            author="operator",
+            body="CAPTAIN NOTE — materialized while GC waits",
+        )
+
+        gc_thread = threading.Thread(target=run_gc, daemon=True)
+        gc_thread.start()
+        assert begin_attempted.wait(5), "GC never attempted its writer boundary"
+        assert gc_thread.is_alive(), "GC did not wait behind the reopen writer"
+
+        reopen.commit()
+        gc_thread.join(timeout=5)
+        assert not gc_thread.is_alive(), "GC did not finish after reopen committed"
+    finally:
+        if reopen.in_transaction:
+            reopen.rollback()
+        reopen.close()
+
+    assert failures == []
+    assert outcome == {"purged": False}
+    check = kb.connect()
+    try:
+        task = kb.get_task(check, tid)
+        assert task is not None and task.status == "ready"
+        assert check.execute(
+            "SELECT COUNT(*) FROM kanban_captain_registry WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0] == 1
+        assert check.execute(
+            "SELECT COUNT(*) FROM kanban_captain_inbox "
+            "WHERE task_id = ? AND state != 'acked'",
+            (tid,),
+        ).fetchone()[0] == 1
+    finally:
+        check.close()
+
+
 # ── requirement 1: two live same-profile sessions ──────────────────────────
 def test_live_origin_owns_report_sibling_gets_none():
     origin = _session(ORIGIN_KEY)
