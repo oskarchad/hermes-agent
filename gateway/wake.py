@@ -59,6 +59,8 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    profile: str = "",
+    api_key: Optional[str] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -91,11 +93,21 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    kwargs = {"text": text, "session_id": session_id}
+    if profile:
+        kwargs["profile"] = profile
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+    await _self_post_chat_completion(adapter, **kwargs)
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any,
+    *,
+    text: str,
+    session_id: str,
+    profile: str = "",
+    api_key: Optional[str] = None,
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -112,8 +124,12 @@ async def _self_post_chat_completion(
         # Wildcard bind address — connect over loopback.
         host = "127.0.0.1"
     port = int(getattr(adapter, "_port", 0) or 8642)
-    api_key = str(getattr(adapter, "_api_key", "") or "")
-    if not api_key:
+    resolved_api_key = (
+        str(getattr(adapter, "_api_key", "") or "")
+        if api_key is None
+        else str(api_key or "")
+    )
+    if not resolved_api_key:
         raise RuntimeError(
             "wake self-post requires API_SERVER_KEY: session continuation via "
             "X-Hermes-Session-Id is rejected (403) on an unauthenticated API "
@@ -122,9 +138,14 @@ async def _self_post_chat_completion(
 
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    profile_prefix = ""
+    if profile and profile not in {"default", "custom"}:
+        from urllib.parse import quote
+
+        profile_prefix = f"/p/{quote(profile, safe='')}"
+    url = f"http://{host}:{port}{profile_prefix}/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {resolved_api_key}",
         "X-Hermes-Session-Id": session_id,
     }
     payload = {

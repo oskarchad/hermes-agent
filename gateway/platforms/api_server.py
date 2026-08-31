@@ -1917,6 +1917,15 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return ""
 
+    def _api_key_for_profile(self, profile: str) -> str:
+        """Resolve the same scoped key a profile-prefixed request expects."""
+        token = _api_request_profile.set(profile)
+        try:
+            with self._profile_scope(profile):
+                return self._expected_api_key()
+        finally:
+            _api_request_profile.reset(token)
+
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
         Validate Bearer token from Authorization header.
@@ -7259,6 +7268,49 @@ class APIServerAdapter(BasePlatformAdapter):
         request_browser_control_transport_family = (
             _api_request_browser_control_transport_family.get()
         )
+
+        # This handler runs only after the API auth middleware admitted the
+        # request.  Let the gateway-owned bridge consume an unambiguous,
+        # session-bound protected-write decision before any text reaches the
+        # model.  Ordinary text and sessions without a pending request fall
+        # through unchanged.
+        bridge = getattr(
+            getattr(self, "gateway_runner", None),
+            "protected_approval_bridge",
+            None,
+        )
+        if (
+            bridge is not None
+            and (gateway_session_key or session_id)
+            and isinstance(user_message, str)
+        ):
+            decision_profile = request_profile
+            if not decision_profile:
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+
+                    decision_profile = get_active_profile_name()
+                except Exception:
+                    decision_profile = "default"
+            approval_reply = bridge.handle_operator_text(
+                profile=decision_profile or "default",
+                session_key=gateway_session_key or session_id or "",
+                session_id=session_id,
+                text=user_message,
+            )
+            if approval_reply is not None:
+                if stream_delta_callback is not None:
+                    stream_delta_callback(approval_reply)
+                return (
+                    {
+                        "final_response": approval_reply,
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                        "session_id": session_id,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
 
         def _run():
             from gateway.session_context import clear_session_vars

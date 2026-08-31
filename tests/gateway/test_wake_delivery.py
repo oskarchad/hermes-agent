@@ -9,12 +9,13 @@ Two strategies:
 """
 
 import asyncio
+import inspect
 
 import pytest
 
 from gateway.config import Platform
 from gateway.session import SessionSource
-from gateway.wake import deliver_wake, adapter_supports_push
+from gateway.wake import _self_post_chat_completion, deliver_wake, adapter_supports_push
 
 
 class PushAdapter:
@@ -96,6 +97,39 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
     ]
+
+
+def test_self_post_can_target_a_multiplex_profile():
+    assert "profile" in inspect.signature(_self_post_chat_completion).parameters
+
+    from aiohttp import web
+
+    seen = {}
+
+    async def handler(request):
+        seen["path"] = request.path
+        return web.json_response({"choices": []})
+
+    async def run():
+        app = web.Application()
+        app.router.add_post("/p/otto/v1/chat/completions", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            await _self_post_chat_completion(
+                ApiServerLikeAdapter(port=port),
+                text="approval requested",
+                session_id="sid",
+                profile="otto",
+            )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen["path"] == "/p/otto/v1/chat/completions"
 
 
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):

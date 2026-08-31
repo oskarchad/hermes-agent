@@ -237,7 +237,7 @@ class GatewayControlServer:
         self,
         home: Optional[Path] = None,
         *,
-        verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+        verb_handlers: Optional[dict[str, Callable[..., dict[str, Any]]]] = None,
     ) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
@@ -248,7 +248,7 @@ class GatewayControlServer:
         self._pipe_server: Any = None  # Windows proactor pipe server
         self._bind_path: Optional[Path] = None
         self._pointer_file: Optional[Path] = None
-        self._handlers: dict[str, Callable[[], dict[str, Any]]] = {
+        self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload,
             "status": build_status_payload,
         }
@@ -361,10 +361,13 @@ class GatewayControlServer:
                     "supported_verbs": sorted(self._handlers),
                 }
             else:
+                payload = request.get("request")
+                if payload is not None and not isinstance(payload, dict):
+                    raise ValueError("request payload must be a JSON object")
                 response = {
                     "ok": True,
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "result": handler(),
+                    "result": handler(payload) if payload is not None else handler(),
                 }
         except Exception as exc:
             response = {
@@ -441,6 +444,7 @@ def query_gateway_control(
     home: Path,
     verb: str,
     *,
+    request: Optional[dict[str, Any]] = None,
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
 ) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; None when unanswered.
@@ -450,16 +454,21 @@ def query_gateway_control(
     ``ok: false`` — returns None so callers fall back to the scan layer.
     Never raises.
     """
-    request = (
-        json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
-        .encode("utf-8")
-        + b"\n"
-    )
+    envelope: dict[str, Any] = {
+        "verb": verb,
+        "id": 1,
+        "protocol": CONTROL_PROTOCOL_VERSION,
+    }
+    if request is not None:
+        envelope["request"] = request
+    encoded_request = json.dumps(envelope).encode("utf-8") + b"\n"
+    if len(encoded_request) > _MAX_REQUEST_BYTES:
+        return None
     try:
         if _IS_WINDOWS:
-            raw = _query_windows_pipe(Path(home), request, timeout)
+            raw = _query_windows_pipe(Path(home), encoded_request, timeout)
         else:
-            raw = _query_unix_socket(Path(home), request, timeout)
+            raw = _query_unix_socket(Path(home), encoded_request, timeout)
     except Exception:
         return None
     if not raw:

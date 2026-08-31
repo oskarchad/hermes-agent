@@ -399,18 +399,23 @@ class TestProtectedInstructionFiles:
         monkeypatch.setattr(
             ft, "_protected_instruction_config", lambda: (True, [])
         )
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "41")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claim-secret")
         yield
 
     @pytest.fixture
     def approvals(self, monkeypatch):
         """Install a CLI approval callback; record calls; scripted answers."""
         from tools.terminal_tool import set_approval_callback
-        state = {"calls": [], "answer": "deny"}
+        state = {"calls": [], "answer": "deny", "on_call": None}
 
         def cb(command, description, **kwargs):
             state["calls"].append(
                 {"command": command, "description": description, **kwargs}
             )
+            if state["on_call"] is not None:
+                state["on_call"]()
             return state["answer"]
 
         set_approval_callback(cb)
@@ -488,6 +493,203 @@ class TestProtectedInstructionFiles:
         assert res.get("error") and "BLOCKED" in res["error"]
         assert not target.exists()
 
+    def test_headless_kanban_write_uses_exact_gateway_operator_decision(
+        self, tmp_path, monkeypatch
+    ):
+        """A headless worker may consume one exact authenticated gateway grant."""
+        import gateway.control_socket as control_socket
+        from tools.terminal_tool import set_approval_callback
+
+        target = tmp_path / "AGENTS.md"
+        calls = []
+
+        def query(_home, verb, *, request=None, **_kwargs):
+            assert request is not None
+            calls.append((verb, request))
+            if verb == "protected_approval.submit":
+                return {
+                    "ok": True,
+                    "request_id": request["request_id"],
+                    "operation_fingerprint": request["operation_fingerprint"],
+                    "status": "pending",
+                }
+            if verb == "protected_approval.poll":
+                return {
+                    "ok": True,
+                    "request_id": request["request_id"],
+                    "operation_fingerprint": request["operation_fingerprint"],
+                    "status": "approved",
+                    "choice": "once",
+                    "consumed": True,
+                }
+            raise AssertionError(verb)
+
+        set_approval_callback(None)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_exact")
+        monkeypatch.setattr(control_socket, "query_gateway_control", query)
+
+        res = self._write(target, "approved exact content")
+
+        assert not res.get("error"), res
+        assert target.read_text(encoding="utf-8") == "approved exact content"
+        assert [verb for verb, _ in calls] == [
+            "protected_approval.submit",
+            "protected_approval.poll",
+        ]
+        submitted = calls[0][1]
+        assert submitted["task_id"] == "t_exact"
+        assert submitted["board"] == "default"
+        assert submitted["run_id"] == 41
+        assert submitted["claim_lock"] == "claim-secret"
+        assert submitted["operation"] == "write_file"
+        assert submitted["paths"] == [str(target.resolve())]
+        assert len(submitted["operation_fingerprint"]) == 64
+        assert calls[1][1]["operation_fingerprint"] == submitted["operation_fingerprint"]
+
+    def test_headless_named_profile_uses_its_profile_gateway_socket(
+        self, tmp_path, monkeypatch
+    ):
+        """A standalone named-profile gateway owns the profile-local socket."""
+        import gateway.control_socket as control_socket
+        import hermes_constants
+        from tools.terminal_tool import set_approval_callback
+
+        target = tmp_path / "AGENTS.md"
+        root_home = tmp_path / "hermes-root"
+        profile_home = root_home / "profiles" / "wrench"
+        seen_homes = []
+
+        def query(home, verb, *, request=None, **_kwargs):
+            assert request is not None
+            seen_homes.append(Path(home))
+            if Path(home) != profile_home:
+                return None
+            if verb == "protected_approval.submit":
+                return {
+                    "ok": True,
+                    "request_id": request["request_id"],
+                    "operation_fingerprint": request["operation_fingerprint"],
+                    "status": "pending",
+                }
+            return {
+                "ok": True,
+                "request_id": request["request_id"],
+                "operation_fingerprint": request["operation_fingerprint"],
+                "status": "approved",
+                "choice": "once",
+                "consumed": True,
+            }
+
+        set_approval_callback(None)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_profile")
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root_home)
+        monkeypatch.setattr(control_socket, "query_gateway_control", query)
+
+        res = self._write(target, "profile-owned approval")
+
+        assert not res.get("error"), res
+        assert seen_homes == [profile_home, profile_home]
+
+    def test_headless_named_profile_falls_back_to_root_multiplex_gateway(
+        self, tmp_path, monkeypatch
+    ):
+        """A root gateway multiplexing profiles owns the root control socket."""
+        import gateway.control_socket as control_socket
+        import hermes_constants
+        from tools.terminal_tool import set_approval_callback
+
+        target = tmp_path / "AGENTS.md"
+        root_home = tmp_path / "hermes-root"
+        profile_home = root_home / "profiles" / "wrench"
+        seen_homes = []
+
+        def query(home, verb, *, request=None, **_kwargs):
+            assert request is not None
+            seen_homes.append(Path(home))
+            if Path(home) == profile_home:
+                return None
+            if verb == "protected_approval.submit":
+                return {
+                    "ok": True,
+                    "request_id": request["request_id"],
+                    "operation_fingerprint": request["operation_fingerprint"],
+                    "status": "pending",
+                }
+            return {
+                "ok": True,
+                "request_id": request["request_id"],
+                "operation_fingerprint": request["operation_fingerprint"],
+                "status": "approved",
+                "choice": "once",
+                "consumed": True,
+            }
+
+        set_approval_callback(None)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_root")
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: root_home)
+        monkeypatch.setattr(control_socket, "query_gateway_control", query)
+
+        res = self._write(target, "root-multiplex approval")
+
+        assert not res.get("error"), res
+        assert seen_homes == [profile_home, root_home, root_home]
+
+    def test_headless_producer_rejects_decision_after_its_monotonic_deadline(
+        self, tmp_path, monkeypatch
+    ):
+        import time
+
+        import gateway.control_socket as control_socket
+        import hermes_constants
+        import tools.file_tools as ft
+        from tools import approval
+
+        home = tmp_path / "hermes-home"
+        now = [10.0]
+        verbs = []
+
+        def query(_home, verb, *, request=None, **_kwargs):
+            assert request is not None
+            verbs.append(verb)
+            if verb == "protected_approval.submit":
+                now[0] = 10.2
+                return {
+                    "ok": True,
+                    "request_id": request["request_id"],
+                    "operation_fingerprint": request["operation_fingerprint"],
+                    "status": "pending",
+                }
+            if verb == "protected_approval.poll":
+                return {
+                    "ok": True,
+                    "request_id": request["request_id"],
+                    "operation_fingerprint": request["operation_fingerprint"],
+                    "status": "approved",
+                    "choice": "once",
+                    "consumed": True,
+                }
+            return {"ok": True, "status": "cancelled"}
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_deadline")
+        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(approval, "_get_approval_timeout", lambda: 0.1)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: home)
+        monkeypatch.setattr(control_socket, "query_gateway_control", query)
+
+        result = ft._await_headless_protected_approval(
+            task_id="t_deadline",
+            operation="write_file",
+            paths=[str(tmp_path / "AGENTS.md")],
+            payload={"content": "late"},
+            description="deadline test",
+        )
+
+        assert result == {"status": "timeout"}
+        assert verbs == ["protected_approval.submit", "protected_approval.cancel"]
+
     def test_config_disabled_skips_gate(self, tmp_path, approvals, monkeypatch):
         import tools.file_tools as ft
         monkeypatch.setattr(
@@ -518,6 +720,115 @@ class TestProtectedInstructionFiles:
         res = self._write(link, "injected")
         assert res.get("error") and "BLOCKED" in res["error"]
         assert real.read_text(encoding="utf-8") == "original"
+
+    def test_write_rejects_symlink_target_drift_after_approval(
+        self, tmp_path, approvals
+    ):
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first = first_dir / "AGENTS.md"
+        second = second_dir / "AGENTS.md"
+        first.write_text("first", encoding="utf-8")
+        second.write_text("second", encoding="utf-8")
+        link = tmp_path / "instructions.md"
+        link.symlink_to(first)
+
+        def drift():
+            link.unlink()
+            link.symlink_to(second)
+
+        approvals["answer"] = "once"
+        approvals["on_call"] = drift
+
+        res = self._write(link, "changed")
+
+        assert res.get("error") and "changed after approval" in res["error"]
+        assert first.read_text(encoding="utf-8") == "first"
+        assert second.read_text(encoding="utf-8") == "second"
+
+    def test_patch_rejects_symlink_target_drift_after_approval(
+        self, tmp_path, approvals
+    ):
+        import json
+        from tools.file_tools import patch_tool
+
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first = first_dir / "AGENTS.md"
+        second = second_dir / "AGENTS.md"
+        first.write_text("value = 1\n", encoding="utf-8")
+        second.write_text("value = 1\n", encoding="utf-8")
+        link = tmp_path / "instructions.md"
+        link.symlink_to(first)
+
+        def drift():
+            link.unlink()
+            link.symlink_to(second)
+
+        approvals["answer"] = "once"
+        approvals["on_call"] = drift
+
+        res = json.loads(patch_tool(
+            mode="replace",
+            path=str(link),
+            old_string="value = 1",
+            new_string="value = 2",
+        ))
+
+        assert res.get("error") and "changed after approval" in res["error"]
+        assert first.read_text(encoding="utf-8") == "value = 1\n"
+        assert second.read_text(encoding="utf-8") == "value = 1\n"
+
+    def test_patch_uses_locked_target_after_post_revalidation_symlink_swap(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import json
+
+        import tools.file_tools as ft
+
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first = first_dir / "AGENTS.md"
+        second = second_dir / "AGENTS.md"
+        first.write_text("value = 1\n", encoding="utf-8")
+        second.write_text("value = 1\n", encoding="utf-8")
+        link = tmp_path / "instructions.md"
+        link.symlink_to(first)
+
+        original_identity = ft._protected_operation_identity
+        identity_calls = 0
+
+        def swap_after_revalidation(**kwargs):
+            nonlocal identity_calls
+            identity = original_identity(**kwargs)
+            identity_calls += 1
+            if identity_calls == 2:
+                link.unlink()
+                link.symlink_to(second)
+            return identity
+
+        monkeypatch.setattr(
+            ft, "_protected_operation_identity", swap_after_revalidation
+        )
+        approvals["answer"] = "once"
+
+        res = json.loads(ft.patch_tool(
+            mode="replace",
+            path=str(link),
+            old_string="value = 1",
+            new_string="value = 2",
+        ))
+
+        assert not res.get("error"), res
+        assert identity_calls == 2
+        assert first.read_text(encoding="utf-8") == "value = 2\n"
+        assert second.read_text(encoding="utf-8") == "value = 1\n"
 
     def test_case_variant_is_gated(self, tmp_path, approvals):
         approvals["answer"] = "deny"

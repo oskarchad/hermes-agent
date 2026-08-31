@@ -840,8 +840,145 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
+def _protected_operation_identity(
+    *, operation: str, paths: list[str], payload: dict, task_id: str
+) -> tuple[str, list[str]]:
+    """Return an exact, content-free fingerprint and canonical target paths."""
+    import hashlib
+
+    canonical_paths: list[str] = []
+    for path in paths:
+        try:
+            resolved = os.path.realpath(str(_resolve_path_for_task(path, task_id)))
+        except Exception:
+            resolved = os.path.realpath(_expand_tilde(path))
+        if resolved not in canonical_paths:
+            canonical_paths.append(resolved)
+    canonical_paths.sort()
+    payload_digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    identity = {
+        "schema_version": 1,
+        "operation": operation,
+        "paths": canonical_paths,
+        "payload_sha256": payload_digest,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return fingerprint, canonical_paths
+
+
+def _await_headless_protected_approval(
+    *, task_id: str, operation: str, paths: list[str], payload: dict,
+    description: str,
+) -> dict | None:
+    """Ask the owning gateway to broker one exact Kanban-worker approval."""
+    import time
+    import uuid
+
+    if not os.getenv("HERMES_KANBAN_TASK"):
+        return None
+    try:
+        from gateway.control_socket import query_gateway_control
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        from tools import approval as _approval
+    except Exception:
+        return {"status": "unavailable"}
+
+    board = (os.getenv("HERMES_KANBAN_BOARD") or "").strip()
+    claim_lock = os.getenv("HERMES_KANBAN_CLAIM_LOCK") or ""
+    try:
+        run_id = int(os.getenv("HERMES_KANBAN_RUN_ID") or "")
+    except ValueError:
+        return {"status": "invalid_run"}
+    if not board or run_id <= 0 or not claim_lock:
+        return {"status": "invalid_run"}
+
+    fingerprint, canonical_paths = _protected_operation_identity(
+        operation=operation, paths=paths, payload=payload, task_id=task_id
+    )
+    request_id = uuid.uuid4().hex
+    timeout = max(float(_approval._get_approval_timeout()), 0.0)
+    deadline = time.monotonic() + timeout
+    request = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "task_id": os.getenv("HERMES_KANBAN_TASK") or task_id,
+        "board": board,
+        "run_id": run_id,
+        "claim_lock": claim_lock,
+        "operation": operation,
+        "paths": canonical_paths,
+        "operation_fingerprint": fingerprint,
+        "summary": description[:500],
+        "timeout_seconds": timeout,
+    }
+    home = None
+    submitted = None
+    for candidate_home in dict.fromkeys(
+        (get_hermes_home(), get_default_hermes_root())
+    ):
+        submitted = query_gateway_control(
+            candidate_home,
+            "protected_approval.submit",
+            request=request,
+            timeout=2.0,
+        )
+        if isinstance(submitted, dict):
+            home = candidate_home
+            break
+    if not isinstance(submitted, dict) or not submitted.get("ok"):
+        return {"status": "unavailable"}
+    if home is None:
+        return {"status": "unavailable"}
+    if submitted.get("request_id") != request_id or submitted.get("operation_fingerprint") != fingerprint:
+        return {"status": "stale"}
+
+    poll = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "task_id": request["task_id"],
+        "board": board,
+        "run_id": run_id,
+        "claim_lock": claim_lock,
+        "operation_fingerprint": fingerprint,
+    }
+
+    def timeout_result() -> dict:
+        try:
+            query_gateway_control(
+                home,
+                "protected_approval.cancel",
+                request={**poll, "reason": "worker_timeout"},
+                timeout=2.0,
+            )
+        except Exception:
+            pass
+        return {"status": "timeout"}
+
+    while True:
+        if time.monotonic() >= deadline:
+            return timeout_result()
+        result = query_gateway_control(
+            home, "protected_approval.poll", request=poll, timeout=2.0
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            return {"status": "unavailable"}
+        if result.get("request_id") != request_id or result.get("operation_fingerprint") != fingerprint:
+            return {"status": "stale"}
+        if time.monotonic() >= deadline:
+            return timeout_result()
+        if result.get("status") != "pending":
+            return result
+        time.sleep(min(0.25, max(deadline - time.monotonic(), 0.0)))
+
+
 def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
+        reasons: list[str], task_id: str = "default", *,
+        operation: str = "protected_write", paths: list[str] | None = None,
+        payload: dict | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s).
 
     Returns ``None`` when approved, or a BLOCKED error string. This gate
@@ -932,6 +1069,30 @@ def _request_protected_instruction_approval(
                     "Silence is not consent.")
         return blocked.format(why="was denied by the user.")
 
+    bridged = _await_headless_protected_approval(
+        task_id=task_id,
+        operation=operation,
+        paths=paths or [],
+        payload=payload or {},
+        description=description,
+    )
+    if bridged is not None:
+        if (
+            bridged.get("status") == "approved"
+            and bridged.get("choice") == "once"
+            and bridged.get("consumed") is True
+        ):
+            return None
+        if bridged.get("status") == "timeout":
+            return blocked.format(
+                why="approval prompt timed out without a user response. Silence is not consent."
+            )
+        if bridged.get("status") == "denied":
+            return blocked.format(why="was denied by the user.")
+        return blocked.format(
+            why="requires approval but no authenticated operator decision was available."
+        )
+
     # No human channel at all (script, cron, background thread): fail
     # closed. Auto-approving here would recreate the persistence vector.
     return blocked.format(
@@ -940,11 +1101,15 @@ def _request_protected_instruction_approval(
 
 
 def _check_protected_instruction_write(paths: list[str],
-                                       task_id: str = "default") -> str | None:
+                                       task_id: str = "default", *,
+                                       operation: str = "protected_write",
+                                       payload: dict | None = None
+                                       ) -> tuple[str | None, tuple[str, tuple[str, ...]] | None]:
     """Gate a write/patch touching protected instruction files.
 
-    Returns ``None`` when no target is protected or the human approved;
-    otherwise a BLOCKED error string. For multi-file V4A patches, ONE
+    Returns ``(error, approved_identity)``. The identity is present only when
+    a protected operation was approved and must be revalidated under the file
+    locks immediately before mutation. For multi-file V4A patches, ONE
     protected file gates the ENTIRE patch: a single prompt lists every
     protected target, and a deny applies nothing (including innocent
     files) — partial application of an approved-in-part patch would be
@@ -952,7 +1117,7 @@ def _check_protected_instruction_write(paths: list[str],
     """
     enabled, extra = _protected_instruction_config()
     if not enabled:
-        return None
+        return None, None
     reasons: list[str] = []
     for p in paths:
         reason = _protected_instruction_reason(
@@ -960,8 +1125,23 @@ def _check_protected_instruction_write(paths: list[str],
         if reason:
             reasons.append(reason)
     if not reasons:
-        return None
-    return _request_protected_instruction_approval(reasons, task_id)
+        return None, None
+    protected_payload = payload or {}
+    fingerprint, canonical_paths = _protected_operation_identity(
+        operation=operation,
+        paths=paths,
+        payload=protected_payload,
+        task_id=task_id,
+    )
+    error = _request_protected_instruction_approval(
+        reasons,
+        task_id,
+        operation=operation,
+        paths=paths,
+        payload=protected_payload,
+    )
+    identity = (fingerprint, tuple(canonical_paths)) if error is None else None
+    return error, identity
 
 
 def _check_approval_required_write(paths: list[str],
@@ -2248,7 +2428,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
-    protected_err = _check_protected_instruction_write([path], task_id)
+    _protected_payload = {"content": content}
+    protected_err, protected_identity = _check_protected_instruction_write(
+        [path], task_id, operation="write_file", payload=_protected_payload
+    )
     if protected_err:
         return tool_error(protected_err)
     approval_err = _check_approval_required_write([path], task_id)
@@ -2274,6 +2457,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _resolved = None
 
         if _resolved is None:
+            if protected_identity is not None:
+                return tool_error(
+                    "BLOCKED: protected write target could not be locked and "
+                    "revalidated after approval."
+                )
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
@@ -2289,6 +2477,18 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            if protected_identity is not None:
+                current_fingerprint, current_paths = _protected_operation_identity(
+                    operation="write_file",
+                    paths=[path],
+                    payload=_protected_payload,
+                    task_id=task_id,
+                )
+                if (current_fingerprint, tuple(current_paths)) != protected_identity:
+                    return tool_error(
+                        "BLOCKED: protected write target changed after approval; "
+                        "the approved operation was not executed."
+                    )
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -2399,16 +2599,32 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return tool_error(binary_doc_err)
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
-    protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
+    _protected_payload = {
+        "mode": mode,
+        "path": path,
+        "old_string": old_string,
+        "new_string": new_string,
+        "replace_all": replace_all,
+        "patch": patch,
+    }
+    protected_err, protected_identity = _check_protected_instruction_write(
+        _paths_to_check,
+        task_id,
+        operation="patch",
+        payload=_protected_payload,
+    )
     if protected_err:
         return tool_error(protected_err)
     approval_err = _check_approval_required_write(_paths_to_check, task_id)
     if approval_err:
         return tool_error(approval_err)
     try:
-        # Resolve paths for locking.  Ordered + deduplicated so concurrent
-        # callers lock in the same order — prevents deadlock on overlapping
+        # Resolve paths once for locking and application.  This map is the
+        # authoritative canonical target set after protected revalidation;
+        # re-resolving an original symlink below would escape these locks.
+        # Ordered + deduplicated locks prevent deadlock on overlapping
         # multi-file V4A patches.
+        _path_to_resolved: dict[str, str] = {}
         _resolved_paths: list[str] = []
         _seen: set[str] = set()
         for _p in _paths_to_check:
@@ -2416,10 +2632,17 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 _r = str(_resolve_path_for_task(_p, task_id))
             except Exception:
                 _r = None
-            if _r and _r not in _seen:
-                _resolved_paths.append(_r)
-                _seen.add(_r)
+            if _r:
+                _path_to_resolved[_p] = _r
+                if _r not in _seen:
+                    _resolved_paths.append(_r)
+                    _seen.add(_r)
         _resolved_paths.sort()
+        if protected_identity is not None and not _resolved_paths:
+            return tool_error(
+                "BLOCKED: protected patch targets could not be locked and "
+                "revalidated after approval."
+            )
 
         # Acquire per-path locks in sorted order via ExitStack.  On single
         # path this degenerates to one lock; on empty list (unresolvable)
@@ -2429,16 +2652,24 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             for _r in _resolved_paths:
                 _locks.enter_context(file_state.lock_path(_r))
 
+            if protected_identity is not None:
+                current_fingerprint, current_paths = _protected_operation_identity(
+                    operation="patch",
+                    paths=_paths_to_check,
+                    payload=_protected_payload,
+                    task_id=task_id,
+                )
+                if (current_fingerprint, tuple(current_paths)) != protected_identity:
+                    return tool_error(
+                        "BLOCKED: protected patch target changed after approval; "
+                        "the approved operation was not executed."
+                    )
+
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
             for _p in _paths_to_check:
-                try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
-                    _r = None
-                _path_to_resolved[_p] = _r
+                _r = _path_to_resolved.get(_p)
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
                 if not _sw and _r:

@@ -128,6 +128,35 @@ def test_server_answers_identify_and_status(home: Path):
     assert status == {"gateway_state": "running"}
 
 
+def test_mutating_handler_receives_bounded_request_payload(home: Path):
+    seen = []
+
+    def submit(request):
+        seen.append(request)
+        return {"accepted": request["request_id"]}
+
+    async def scenario():
+        server = GatewayControlServer(
+            home, verb_handlers={"protected_approval.submit": submit}
+        )
+        assert await server.start()
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: query_gateway_control(
+                    home,
+                    "protected_approval.submit",
+                    request={"request_id": "req-1", "summary": "AGENTS.md"},
+                ),
+            )
+        finally:
+            await server.stop()
+
+    assert _run(scenario()) == {"accepted": "req-1"}
+    assert seen == [{"request_id": "req-1", "summary": "AGENTS.md"}]
+
+
 def test_unknown_verb_and_malformed_request(home: Path):
     async def scenario():
         server = GatewayControlServer(

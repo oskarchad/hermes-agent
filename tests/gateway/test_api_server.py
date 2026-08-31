@@ -2411,6 +2411,45 @@ class TestSessionKeyHeader:
             assert captured_kwargs.get("gateway_session_key") == "agent:main:webui:dm:user-7"
 
     @pytest.mark.asyncio
+    async def test_authenticated_webui_turn_resolves_exact_pending_protected_write(
+        self, auth_adapter
+    ):
+        bridge = MagicMock()
+        bridge.handle_operator_text.return_value = (
+            "Approved once: protected write req-1 (fingerprint 0123456789ab)."
+        )
+        auth_adapter.gateway_runner = MagicMock(protected_approval_bridge=bridge)
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter,
+                "_create_agent",
+                side_effect=AssertionError("approval decision must not reach the model"),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Key": "agent:main:webui:dm:user-7",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "wrzucaj"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert "Approved once" in data["choices"][0]["message"]["content"]
+        bridge.handle_operator_text.assert_called_once()
+        decision = bridge.handle_operator_text.call_args.kwargs
+        assert decision["profile"] == "default"
+        assert decision["session_key"] == "agent:main:webui:dm:user-7"
+        assert decision["session_id"].startswith("api-")
+        assert decision["text"] == "wrzucaj"
+
+    @pytest.mark.asyncio
     async def test_responses_endpoint_accepts_session_key(self, auth_adapter):
         """Responses API honors the same X-Hermes-Session-Key contract."""
         mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}

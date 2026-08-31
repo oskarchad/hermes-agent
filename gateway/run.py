@@ -31461,6 +31461,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _control_server = None
     try:
         from gateway.control_socket import GatewayControlServer
+        from gateway.protected_approval_bridge import create_runtime_bridge
 
         # pause-for-update (#92091 step 2): the updater asks this gateway to
         # drain in-flight turns and exit cleanly — releasing every venv file
@@ -31500,8 +31501,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 "drain_timeout": _drain,
             }
 
+        runner.protected_approval_bridge = create_runtime_bridge(runner, loop)
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler}
+            verb_handlers={
+                **runner.protected_approval_bridge.control_handlers,
+                "pause-for-update": _pause_for_update_handler,
+            }
         )
         if not await _control_server.start():
             _control_server = None
