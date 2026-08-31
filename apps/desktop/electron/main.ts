@@ -87,7 +87,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
-import { applyConnectionChange, teardownSshState } from './connection-apply'
+import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
   authModeFromStatus,
@@ -187,12 +187,14 @@ import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { registerFsIpc } from './fs-ipc'
 import {
   filenameFromContentDisposition,
+  fsPumpDeps,
   gatewayFilePath,
   gatewayFileRequestPaths,
   isNotFoundError,
   parseDataUrlToBuffer,
   pumpStreamToFile,
-  resolveGatewayFileBackend
+  resolveGatewayFileBackend,
+  writeBufferToFile
 } from './gateway-file-download'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
@@ -244,6 +246,7 @@ import {
   waitForManagedSshBootstrapFence,
   waitForManagedUpdateOperations
 } from './managed-ssh-update'
+import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
   oauthGuardMayHardFail,
@@ -3807,7 +3810,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       }
 
       if (scanOutcome.kind === 'probe-failure') {
-        const message = formatProbeFailedMessage()
+        const message = formatProbeFailedMessage(scanOutcome.error)
 
         rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
         emitUpdateProgress({ stage: 'error', message, percent: null })
@@ -7709,10 +7712,9 @@ async function finalizeGatewayDownload(res, statusCode, headers, ctx: any = {}) 
   }
 
   try {
-    await pumpStreamToFile(res, result.filePath, {
-      createWriteStream: (destPath: string) => fs.createWriteStream(destPath),
-      unlink: (destPath: string) => fs.promises.unlink(destPath)
-    })
+    // Failure-atomic: exclusive temp create beside the destination, rename into
+    // place only once the body is complete (#96597).
+    await pumpStreamToFile(res, result.filePath, fsPumpDeps())
   } catch (error) {
     ctx.abort?.()
     throw error
@@ -7864,7 +7866,9 @@ async function saveGatewayFileViaDataUrl(
     return { canceled: true, saved: false }
   }
 
-  await fs.promises.writeFile(result.filePath, buffer)
+  // Same failure-atomic contract as the streaming path: a direct writeFile
+  // truncates an existing destination before the write completes (#96597).
+  await writeBufferToFile(buffer, result.filePath, fsPumpDeps())
 
   return { path: result.filePath, saved: true }
 }
@@ -9847,6 +9851,7 @@ function clearManagedSshRecovery(connectionId, correlationId) {
 const sshBootstrapCoordinator = createBootstrapCoordinator()
 
 let sshQuitTeardownDone = false
+let sshQuitTeardownPromise: Promise<void> | null = null
 let backendQuitTeardownDone = false
 
 function sshScopeKey(profile) {
@@ -11147,7 +11152,8 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
       return {
         ...primaryDescriptor,
         profile: profileKey,
-        connectionId: id
+        connectionId: id,
+        sharedRemote: true
       }
     }
   }
@@ -13533,6 +13539,11 @@ function spawnHudWindow(sessionId, profile) {
     // `hermes:hud:set-bounds`, which flips resizable on for the call — the
     // same pattern the pet overlay uses for its wheel-scale.
     resizable: false,
+    // macOS AppKit's constrainFrameRect clamps setBounds to the current
+    // display unless this is on. The HUD is moved by renderer-driven
+    // setBounds (not a native titlebar drag), so without it the bar cannot
+    // be dragged onto another monitor. No-op on Windows/Linux.
+    enableLargerThanScreen: true,
     movable: true,
     minimizable: false,
     maximizable: false,
@@ -16833,6 +16844,10 @@ registerFsIpc({
 // Git-driven features (worktrees, review pane, repo scan) — see git-ipc.ts.
 registerGitIpc({ resolveGitBinary, resolveGhBinary })
 
+// Client-side loopback callback for MCP OAuth against remote backends — see
+// mcp-oauth-callback-ipc.ts.
+registerMcpOauthCallbackIpc()
+
 // Embedded terminal PTY host (hermes:terminal:*) — see terminal-ipc.ts.
 const terminalIpc = registerTerminalIpc({
   isWindows: IS_WINDOWS,
@@ -17526,20 +17541,39 @@ app.on('before-quit', event => {
     })
   }
 
-  if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
+  // backendShutdown.finally() re-enters before-quit. teardownSshConnection
+  // already deleted the map entries, so size===0 would skip the kill wait
+  // and let window-X quit finish while SSH exec is still running (#91668).
+  if (
+    sshQuitShouldBlock({
+      teardownDone: sshQuitTeardownDone,
+      connectionCount: sshConnections.size,
+      bootstrapPending: sshBootstrapCoordinator.promises().length,
+      inFlight: sshQuitTeardownPromise
+    })
+  ) {
     event.preventDefault()
-    const scopes = [...sshConnections.keys()]
 
-    const pending = Promise.allSettled([
-      ...scopes.map(scope => teardownSshConnection(scope || null)),
-      ...sshBootstrapCoordinator.promises()
-    ])
+    if (!sshQuitTeardownPromise) {
+      const scopes = [...sshConnections.keys()]
+      const pending = Promise.allSettled([
+        ...scopes.map(scope => teardownSshConnection(scope || null)),
+        ...sshBootstrapCoordinator.promises()
+      ])
 
-    // cleanupStale waits up to 5s for the owned pid to exit (50 * 100ms).
-    // The previous 4s race could close SSH first and leave serve --isolated
-    // reparented to pid 1.
-    void Promise.race([pending, new Promise(resolve => setTimeout(resolve, 6_000))]).then(async () => {
-      await sshBootstrapCoordinator.forceCleanupAll()
+      // cleanupStale waits up to 5s for the owned pid to exit (50 * 100ms).
+      // The previous 4s race could close SSH first and leave serve --isolated
+      // reparented to pid 1. Latch this promise BEFORE those deletes land so
+      // a re-entrant quit still waits.
+      sshQuitTeardownPromise = Promise.race([
+        pending,
+        new Promise<void>(resolve => setTimeout(resolve, 6_000))
+      ]).then(async () => {
+        await sshBootstrapCoordinator.forceCleanupAll()
+      })
+    }
+
+    void sshQuitTeardownPromise.then(() => {
       sshQuitTeardownDone = true
       app.quit()
     })
