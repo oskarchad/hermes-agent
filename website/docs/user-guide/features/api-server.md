@@ -501,6 +501,28 @@ running.
 
 Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
 
+Protected-write approvals delegated to a Kanban worker use this same transport
+instead of creating a second chat completion. The exact live origin run emits
+an `approval.request` event with `protected_write: true`, the originating
+`task_id` and `worker_run_id`, a `request_id`, and a 12-character
+`operation_fingerprint`. Only `once` and `deny` are offered. Echo
+both correlation fields back to the authenticated run endpoint:
+
+```json
+{
+  "choice": "once",
+  "request_id": "approval_...",
+  "operation_fingerprint": "0123456789ab"
+}
+```
+
+The fingerprint is a bounded public correlation prefix, not the full protected
+operation digest. A missing, wrong, stale, replayed, cross-run, or
+cross-profile response fails closed. The full digest, worker claim, and bridge
+approval-session key remain server-side. If no single live run matches the
+origin profile and session, Hermes denies the worker request rather than
+guessing a destination.
+
 ## Jobs API (background scheduled work)
 
 The server exposes a lightweight jobs CRUD surface for managing scheduled / background agent runs from a remote client. All endpoints are gated behind the same bearer auth.

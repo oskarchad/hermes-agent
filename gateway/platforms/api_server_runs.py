@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -53,6 +54,7 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._run_idempotency_store = store_factory()
     self._run_idempotency_ids: set[str] = set()
     self._run_owners: Dict[str, str] = {}
+    self._run_operator_sessions: Dict[str, frozenset[str]] = {}
     self._run_owner_pid = os.getpid()
     try:
         from gateway.status import get_process_start_time
@@ -78,6 +80,10 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # Active approval session key for each run_id. The approval core resolves
     # requests by session key, while API clients address them by run_id.
     self._run_approval_sessions: Dict[str, str] = {}
+    # Protected-write approvals originate in a separate Kanban worker but are
+    # presented by one exact live API run. Keep their bridge-owned approval
+    # session keys private and correlate only by run + exact request id.
+    self._run_protected_approvals = {}
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -100,6 +106,24 @@ def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
 
 
 def _close_run_state(self) -> None:
+    for approvals in list(
+        getattr(self, "_run_protected_approvals", {}).values()
+    ):
+        for record in list(approvals.values()):
+            handle = record.get("expiry_handle")
+            if handle is not None:
+                handle.cancel()
+            try:
+                from tools.approval import resolve_gateway_approval
+
+                resolve_gateway_approval(
+                    record["approval_session_key"],
+                    "deny",
+                    request_id=record["request_id"],
+                )
+            except Exception:
+                pass
+    getattr(self, "_run_protected_approvals", {}).clear()
     store = getattr(self, "_run_idempotency_store", None)
     if store is None:
         return
@@ -135,6 +159,25 @@ def _set_run_status(
     if status != "waiting_for_approval":
         current.pop("approval", None)
     self._run_statuses[run_id] = current
+    if status in {"completed", "failed", "cancelled", "interrupted"}:
+        approvals = self._run_protected_approvals.pop(run_id, {})
+        for record in approvals.values():
+            handle = record.get("expiry_handle")
+            if handle is not None:
+                handle.cancel()
+            try:
+                from tools.approval import resolve_gateway_approval
+
+                resolve_gateway_approval(
+                    record["approval_session_key"],
+                    "deny",
+                    request_id=record["request_id"],
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] failed to deny protected approval for terminal run %s",
+                    run_id,
+                )
     should_persist = (
         status != previous_status
         or status in {"completed", "failed", "cancelled", "interrupted"}
@@ -151,6 +194,226 @@ def _set_run_status(
                 "[api_server] failed to persist idempotent run status %s", run_id
             )
     return current
+
+
+def _discard_protected_approval(
+    self,
+    run_id: str,
+    request_id: str,
+    *,
+    deny: bool,
+) -> Optional[Dict[str, Any]]:
+    approvals = self._run_protected_approvals.get(run_id)
+    record = approvals.pop(request_id, None) if approvals is not None else None
+    if approvals == {}:
+        self._run_protected_approvals.pop(run_id, None)
+    if record is None:
+        return None
+    handle = record.get("expiry_handle")
+    if handle is not None:
+        handle.cancel()
+    if deny:
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolve_gateway_approval(
+                record["approval_session_key"],
+                "deny",
+                request_id=request_id,
+            )
+        except Exception:
+            logger.exception(
+                "[api_server] failed to deny expired protected approval for run %s",
+                run_id,
+            )
+    return record
+
+
+def _expire_protected_approval(
+    self,
+    run_id: str,
+    request_id: str,
+    approval_session_key: str,
+) -> None:
+    record = self._run_protected_approvals.get(run_id, {}).get(request_id)
+    if (
+        record is None
+        or record.get("approval_session_key") != approval_session_key
+        or time.monotonic() < float(record.get("deadline_monotonic") or 0)
+    ):
+        return
+    _discard_protected_approval(self, run_id, request_id, deny=True)
+    status = self._run_statuses.get(run_id, {})
+    task = self._active_run_tasks.get(run_id)
+    current_approval = status.get("approval")
+    owns_visible_prompt = (
+        isinstance(current_approval, dict)
+        and current_approval.get("protected_write") is True
+        and current_approval.get("request_id") == request_id
+    )
+    if owns_visible_prompt and task is not None and not task.done():
+        self._set_run_status(run_id, "running", last_event="approval.expired")
+    q = self._run_streams.get(run_id)
+    if q is not None:
+        q.put_nowait(
+            {
+                "event": "approval.expired",
+                "run_id": run_id,
+                "request_id": request_id,
+                "timestamp": time.time(),
+            }
+        )
+
+
+async def _present_protected_approval(
+    self,
+    *,
+    profile: str,
+    session_id: str,
+    approval_session_key: str,
+    approval_data: Dict[str, Any],
+    _api_server,
+) -> bool:
+    """Present one bridge-owned approval on one unambiguous live API run."""
+    if (
+        not isinstance(profile, str)
+        or not profile
+        or len(profile) > 128
+        or not isinstance(session_id, str)
+        or not session_id
+        or len(session_id) > 1024
+        or not isinstance(approval_session_key, str)
+        or not approval_session_key
+        or len(approval_session_key) > 256
+        or not isinstance(approval_data, dict)
+    ):
+        logger.debug("[api_server] protected approval presentation rejected: envelope")
+        return False
+    request_id = approval_data.get("request_id")
+    task_id = approval_data.get("task_id")
+    worker_run_id = approval_data.get("worker_run_id")
+    fingerprint = approval_data.get("operation_fingerprint")
+    summary = approval_data.get("summary")
+    operation = approval_data.get("operation")
+    paths = approval_data.get("paths")
+    raw_timeout_seconds = approval_data.get("timeout_seconds")
+    raw_deadline_monotonic = approval_data.get("deadline_monotonic")
+    try:
+        if isinstance(raw_timeout_seconds, bool) or isinstance(
+            raw_deadline_monotonic, bool
+        ):
+            return False
+        timeout_seconds = float(raw_timeout_seconds)
+        deadline = float(raw_deadline_monotonic)
+    except (TypeError, ValueError):
+        logger.debug("[api_server] protected approval presentation rejected: timing")
+        return False
+    now = time.monotonic()
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or len(request_id) > 128
+        or any(not (char.isascii() and (char.isalnum() or char in "_-")) for char in request_id)
+        or not isinstance(task_id, str)
+        or not 1 <= len(task_id) <= 128
+        or any(not (char.isascii() and (char.isalnum() or char in "_-")) for char in task_id)
+        or approval_session_key != f"protected-write:{request_id}"
+        or not isinstance(worker_run_id, int)
+        or isinstance(worker_run_id, bool)
+        or worker_run_id <= 0
+        or not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(char not in "0123456789abcdef" for char in fingerprint)
+        or not isinstance(summary, str)
+        or not summary.strip()
+        or len(summary) > 500
+        or operation not in {"patch", "write_file"}
+        or not isinstance(paths, list)
+        or not 1 <= len(paths) <= 16
+        or any(not isinstance(path, str) or not path or len(path) > 1024 for path in paths)
+        or not 0.1 <= timeout_seconds <= 3600.0
+        or not now < deadline <= now + timeout_seconds + 1.0
+    ):
+        logger.debug("[api_server] protected approval presentation rejected: payload")
+        return False
+
+    candidates = []
+    for run_id, status in self._run_statuses.items():
+        task = self._active_run_tasks.get(run_id)
+        if (
+            status.get("profile") == profile
+            and session_id
+            in self._run_operator_sessions.get(run_id, frozenset())
+            and status.get("status") in {"queued", "running"}
+            and self._run_streams.get(run_id) is not None
+            and task is not None
+            and not task.done()
+        ):
+            candidates.append(run_id)
+    if len(candidates) != 1:
+        logger.debug(
+            "[api_server] protected approval presentation rejected: live run count=%d",
+            len(candidates),
+        )
+        return False
+    run_id = candidates[0]
+    if any(
+        request_id in approvals
+        for approvals in self._run_protected_approvals.values()
+    ):
+        logger.debug("[api_server] protected approval presentation rejected: duplicate")
+        return False
+
+    fingerprint_prefix = fingerprint[:12]
+    redact = _api_server.redact_sensitive_text
+    from gateway.run import _redact_approval_command
+
+    event = {
+        "event": "approval.request",
+        "run_id": run_id,
+        "timestamp": time.time(),
+        "request_id": request_id,
+        "task_id": task_id,
+        "worker_run_id": worker_run_id,
+        "command": _redact_approval_command(summary.strip()),
+        "description": _redact_approval_command(summary.strip()),
+        "operation": operation,
+        "paths": [redact(path, force=True) for path in paths],
+        "operation_fingerprint": fingerprint_prefix,
+        "protected_write": True,
+        "allow_session": False,
+        "allow_permanent": False,
+        "choices": ["once", "deny"],
+    }
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        logger.debug("[api_server] protected approval presentation rejected: expired")
+        return False
+    record: Dict[str, Any] = {
+        "request_id": request_id,
+        "operation_fingerprint": fingerprint,
+        "fingerprint_prefix": fingerprint_prefix,
+        "approval_session_key": approval_session_key,
+        "deadline_monotonic": deadline,
+    }
+    self._run_protected_approvals.setdefault(run_id, {})[request_id] = record
+    loop = asyncio.get_running_loop()
+    record["expiry_handle"] = loop.call_later(
+        remaining_seconds,
+        _expire_protected_approval,
+        self,
+        run_id,
+        request_id,
+        approval_session_key,
+    )
+    self._set_run_status(
+        run_id,
+        "waiting_for_approval",
+        last_event="approval.request",
+        approval=event,
+    )
+    self._run_streams[run_id].put_nowait(event)
+    return True
 
 
 def _make_run_event_callback(
@@ -544,6 +807,15 @@ async def _handle_runs(
                 conversation_history.append({"role": msg["role"], "content": str(content)})
 
     session_id = body.get("session_id") or stored_session_id
+    approval_profile = _api_request_profile.get()
+    if not approval_profile:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            approval_profile = get_active_profile_name()
+        except Exception:
+            approval_profile = "default"
+    approval_profile = str(approval_profile or "default")
     route = self._resolve_route(body.get("model"))
     agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
     selection_error = self._request_route_conflict_error(
@@ -605,6 +877,11 @@ async def _handle_runs(
     run_id = f"run_{uuid.uuid4().hex}"
     self._run_owners[run_id] = self._run_idempotency_scope(request)
     session_id = session_id or run_id
+    self._run_operator_sessions[run_id] = frozenset(
+        value
+        for value in (str(session_id), str(gateway_session_key or ""))
+        if value
+    )
     # Approval queues gate host-side tool execution and must be isolated
     # per API run. Client-provided session IDs and memory session keys are
     # conversation/memory scopes, not authorization namespaces: multiple
@@ -647,6 +924,7 @@ async def _handle_runs(
         "queued",
         created_at=created_at,
         session_id=session_id,
+        profile=approval_profile,
         model=body.get("model", self._model_name),
     )
     if idempotency_key:
@@ -666,6 +944,7 @@ async def _handle_runs(
             self._run_approval_sessions.pop(run_id, None)
             self._run_statuses.pop(run_id, None)
             self._run_owners.pop(run_id, None)
+            self._run_operator_sessions.pop(run_id, None)
             if outcome == "conflict":
                 return web.json_response(
                     _openai_error(
@@ -1180,7 +1459,21 @@ async def _handle_run_approval(
             ),
             status=400,
         )
-    allowed = {"once", "deny"} if room_scoped else {
+    protected_by_request = self._run_protected_approvals.get(run_id, {})
+    protected_approval = protected_by_request.get(request_id) if request_id else None
+    if protected_by_request and protected_approval is None:
+        return web.json_response(
+            _openai_error(
+                "Run has no matching pending protected approval.",
+                code=(
+                    "approval_request_required"
+                    if not request_id
+                    else "approval_not_pending"
+                ),
+            ),
+            status=400 if not request_id else 409,
+        )
+    allowed = {"once", "deny"} if room_scoped or protected_approval else {
         "once",
         "session",
         "always",
@@ -1200,6 +1493,14 @@ async def _handle_run_approval(
         _coerce_request_bool(body.get("all"), default=False)
         or _coerce_request_bool(body.get("resolve_all"), default=False)
     )
+    if protected_approval and resolve_all:
+        return web.json_response(
+            _openai_error(
+                "Protected approvals resolve only one exact request.",
+                code="invalid_approval_scope",
+            ),
+            status=400,
+        )
     if room_scoped and resolve_all:
         return web.json_response(
             _openai_error(
@@ -1217,7 +1518,46 @@ async def _handle_run_approval(
             status=400,
         )
 
-    approval_session_key = self._run_approval_sessions.get(run_id)
+    if protected_approval:
+        supplied_fingerprint = body.get("operation_fingerprint")
+        if (
+            not isinstance(supplied_fingerprint, str)
+            or not hmac.compare_digest(
+                supplied_fingerprint,
+                protected_approval["fingerprint_prefix"],
+            )
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Protected approval fingerprint does not match.",
+                    code="approval_fingerprint_mismatch",
+                ),
+                status=409,
+            )
+        task = self._active_run_tasks.get(run_id)
+        expired = time.monotonic() > float(
+            protected_approval.get("deadline_monotonic") or 0
+        )
+        zombie = (
+            status.get("status") not in {"queued", "running", "waiting_for_approval"}
+            or task is None
+            or task.done()
+        )
+        if expired or zombie:
+            _discard_protected_approval(self, run_id, request_id, deny=True)
+            return web.json_response(
+                _openai_error(
+                    "Protected approval is no longer active.",
+                    code="approval_not_active",
+                ),
+                status=409,
+            )
+
+    approval_session_key = (
+        protected_approval["approval_session_key"]
+        if protected_approval
+        else self._run_approval_sessions.get(run_id)
+    )
     if not approval_session_key:
         return web.json_response(
             _openai_error(
@@ -1240,6 +1580,8 @@ async def _handle_run_approval(
         return web.json_response(_openai_error(str(exc)), status=500)
 
     if resolved <= 0:
+        if protected_approval:
+            _discard_protected_approval(self, run_id, request_id, deny=False)
         return web.json_response(
             _openai_error(
                 f"Run has no pending approval: {run_id}",
@@ -1248,7 +1590,15 @@ async def _handle_run_approval(
             status=409,
         )
 
-    self._set_run_status(run_id, "running", last_event="approval.responded")
+    if protected_approval:
+        _discard_protected_approval(self, run_id, request_id, deny=False)
+    current_approval = self._run_statuses.get(run_id, {}).get("approval")
+    owns_visible_prompt = current_approval is None or (
+        isinstance(current_approval, dict)
+        and current_approval.get("request_id") == request_id
+    )
+    if owns_visible_prompt:
+        self._set_run_status(run_id, "running", last_event="approval.responded")
     q = self._run_streams.get(run_id)
     if q is not None:
         try:
@@ -1472,3 +1822,4 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         self._run_statuses.pop(run_id, None)
         self._run_idempotency_ids.discard(run_id)
         self._run_owners.pop(run_id, None)
+        self._run_operator_sessions.pop(run_id, None)

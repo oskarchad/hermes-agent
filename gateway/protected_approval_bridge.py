@@ -1,9 +1,11 @@
-"""Gateway-owned authority for headless protected-write approvals.
+"""Gateway-owned authority for protected-write approvals.
 
 A Kanban worker submits only a bounded operation digest over the local gateway
-control socket.  This broker binds the request to the task's single origin
-WebUI/API session, uses the existing blocking approval primitive, and accepts a
-natural-language decision only from that exact authenticated API session.
+control socket. This broker binds the request to the task's single origin
+WebUI/API session and uses the existing blocking approval primitive. The API
+run transport presents a structured request through its documented approval
+event/endpoint. Plaintext/headless approval remains a separate transport and
+cannot resolve this broker's requests.
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ import logging
 import re
 import threading
 import time
-import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -25,9 +26,6 @@ logger = logging.getLogger(__name__)
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_APPROVE_TEXT = frozenset({"approve", "approved", "wrzucaj", "zatwierdzam"})
-_DENY_TEXT = frozenset({"deny", "denied", "odrzuc", "odrzucam"})
-
 
 @dataclass(frozen=True)
 class OperatorTarget:
@@ -58,7 +56,7 @@ class ProtectedApprovalBridge:
         self,
         *,
         resolve_target: Callable[[dict], Optional[OperatorTarget]],
-        notify: Callable[[OperatorTarget, str], bool],
+        notify: Callable[[OperatorTarget, dict], bool],
         validate_run: Callable[[dict], bool],
         monotonic: Callable[[], float] = time.monotonic,
         terminal_retention_seconds: float = 60.0,
@@ -199,16 +197,6 @@ class ProtectedApprovalBridge:
             "timeout_seconds": timeout,
         }
 
-    @staticmethod
-    def _decision_text(text: str) -> Optional[str]:
-        normalized = unicodedata.normalize("NFKD", text.strip().casefold())
-        normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-        normalized = normalized.rstrip(".!?")
-        if normalized in _APPROVE_TEXT:
-            return "once"
-        if normalized in _DENY_TEXT:
-            return "deny"
-        return None
 
     @staticmethod
     def _notification(record: _PendingRequest) -> str:
@@ -220,8 +208,8 @@ class ProtectedApprovalBridge:
             f"{request['summary']}\n"
             f"Operation: {request['operation']}\n"
             f"Paths: {paths}\n"
-            "Reply ‘wrzucaj’ to approve this exact operation once, or ‘odrzuć’ "
-            "to deny it. Other text will not decide the request.\n"
+            "Approve or deny this exact request using the authenticated API run "
+            "approval controls; ordinary chat text cannot decide it.\n"
             f"Request {request['request_id']}; fingerprint "
             f"{request['operation_fingerprint'][:12]}."
         )
@@ -295,7 +283,20 @@ class ProtectedApprovalBridge:
         request = record.request
 
         def notify(_approval_data: dict) -> None:
-            if not self._notify(record.target, self._notification(record)):
+            notice = {
+                "request_id": request["request_id"],
+                "task_id": request["task_id"],
+                "worker_run_id": request["run_id"],
+                "operation_fingerprint": request["operation_fingerprint"],
+                "operation": request["operation"],
+                "paths": list(request["paths"]),
+                "summary": request["summary"],
+                "timeout_seconds": request["timeout_seconds"],
+                "deadline_monotonic": record.deadline_monotonic,
+                "approval_session_key": record.approval_session_key,
+                "message": self._notification(record),
+            }
+            if not self._notify(record.target, notice):
                 raise RuntimeError("operator notification was not delivered")
 
         result = _await_gateway_decision(
@@ -324,58 +325,6 @@ class ProtectedApprovalBridge:
                 record.status = "approved" if record.choice == "once" else "denied"
             record.terminal_at_monotonic = self._monotonic()
 
-    def handle_operator_text(
-        self,
-        *,
-        profile: str,
-        session_key: str,
-        text: str,
-        session_id: Optional[str] = None,
-    ) -> Optional[str]:
-        decision = self._decision_text(text)
-        if decision is None:
-            return None
-        self._cleanup()
-        identities = {session_key}
-        if session_id:
-            identities.add(session_id)
-        with self._lock:
-            matches = [
-                record
-                for record in self._pending.values()
-                if record.status == "pending"
-                and record.target.profile == profile
-                and record.target.session_id in identities
-            ]
-        if not matches:
-            return None
-        if len(matches) != 1:
-            return "More than one protected write is pending; no request was decided."
-        record = matches[0]
-        count = resolve_gateway_approval(
-            record.approval_session_key,
-            decision,
-            request_id=record.request["request_id"],
-        )
-        if count != 1:
-            return "The protected write request is no longer pending; nothing was approved."
-        label = "Approved once" if decision == "once" else "Denied"
-        session_ref = hashlib.sha256(
-            record.target.session_id.encode("utf-8")
-        ).hexdigest()[:12]
-        logger.info(
-            "protected write approval decided task=%s request=%s fingerprint=%s profile=%s session_ref=%s decision=%s",
-            record.request["task_id"],
-            record.request["request_id"],
-            record.request["operation_fingerprint"][:12],
-            profile,
-            session_ref,
-            decision,
-        )
-        return (
-            f"{label}: protected write {record.request['request_id']} "
-            f"(fingerprint {record.request['operation_fingerprint'][:12]})."
-        )
 
     def _snapshot(self, record: _PendingRequest, *, consume: bool) -> dict:
         result = {
@@ -581,9 +530,7 @@ def create_runtime_bridge(runner, loop) -> ProtectedApprovalBridge:
         }
         return next(iter(unique.values())) if len(unique) == 1 else None
 
-    def notify(target: OperatorTarget, text: str) -> bool:
-        from gateway.wake import deliver_wake
-
+    def notify(target: OperatorTarget, notice: dict) -> bool:
         from gateway.config import Platform
 
         direct_adapter = runner._authorization_adapter(
@@ -592,38 +539,22 @@ def create_runtime_bridge(runner, loop) -> ProtectedApprovalBridge:
         adapter = direct_adapter or api_adapter_for_profile(target.profile)
         if adapter is None:
             return False
-        api_key = None
-        if direct_adapter is None:
-            key_resolver = getattr(adapter, "_api_key_for_profile", None)
-            if not callable(key_resolver):
-                return False
-            try:
-                resolved_key = key_resolver(target.profile)
-            except Exception:
-                logger.warning(
-                    "protected approval could not resolve scoped API key "
-                    "task=%s profile=%s",
-                    target.task_id,
-                    target.profile,
-                    exc_info=True,
-                )
-                return False
-            if not isinstance(resolved_key, str) or not resolved_key:
-                return False
-            api_key = resolved_key
+        present = getattr(adapter, "present_protected_approval", None)
+        if not callable(present):
+            return False
         future = __import__("asyncio").run_coroutine_threadsafe(
-            deliver_wake(
-                adapter,
-                text=text,
-                session_id=target.session_id,
+            present(
                 profile=target.profile,
-                api_key=api_key,
+                session_id=target.session_id,
+                approval_session_key=notice.get("approval_session_key"),
+                approval_data=notice,
             ),
             loop,
         )
         try:
-            future.result(timeout=30.0)
+            delivered = future.result(timeout=30.0)
         except Exception:
+            future.cancel()
             logger.warning(
                 "protected approval notification failed task=%s profile=%s",
                 target.task_id,
@@ -631,7 +562,7 @@ def create_runtime_bridge(runner, loop) -> ProtectedApprovalBridge:
                 exc_info=True,
             )
             return False
-        return True
+        return delivered is True
 
     return ProtectedApprovalBridge(
         resolve_target=resolve_target,
