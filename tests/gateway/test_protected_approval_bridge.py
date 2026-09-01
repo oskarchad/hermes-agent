@@ -849,7 +849,7 @@ def test_native_approval_waits_until_visible_protected_request_is_resolved(monke
         )
 
 
-def test_expired_protected_response_promotes_deferred_native_approval():
+def test_run_presentation_expires_and_denies_bridge_entry_once():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -857,14 +857,12 @@ def test_expired_protected_response_promotes_deferred_native_approval():
     from gateway.platforms.api_server import APIServerAdapter
 
     async def scenario():
-        adapter = APIServerAdapter(
-            PlatformConfig(enabled=True, extra={"key": "sk-secret"})
-        )
-        run_id = "run-expired-overlap"
-        session_id = "agent:main:webui:dm:user-expired-overlap"
-        protected_request_id = "req-protected-expired-overlap"
-        native_request_id = "approval-native-expired-overlap"
-        protected_session_key = f"protected-write:{protected_request_id}"
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "key"}))
+        session_id = "agent:main:webui:dm:user-7"
+        run_id = "run-expiring"
+        request_id = "req-expiring"
+        native_request_id = "approval-native-after-expiry"
+        approval_session_key = f"protected-write:{request_id}"
         native_session_key = f"run-approval:{run_id}"
         adapter._run_statuses[run_id] = {
             "run_id": run_id,
@@ -877,24 +875,19 @@ def test_expired_protected_response_promotes_deferred_native_approval():
         active_run = asyncio.create_task(asyncio.Event().wait())
         adapter._active_run_tasks[run_id] = active_run
         adapter._run_approval_sessions[run_id] = native_session_key
-
-        protected_entry = approval._ApprovalEntry(
-            {"request_id": protected_request_id}
-        )
+        entry = approval._ApprovalEntry({"request_id": request_id})
         native_event = {
             "event": "approval.request",
             "run_id": run_id,
             "request_id": native_request_id,
-            "command": "rm expired-overlap.txt",
-            "description": "Native approval queued behind expiring protected write",
+            "command": "rm after-expiry.txt",
             "choices": ["once", "deny"],
             "timestamp": time.time(),
         }
         native_entry = approval._ApprovalEntry(dict(native_event))
         with approval._lock:
-            approval._gateway_queues[protected_session_key] = [protected_entry]
+            approval._gateway_queues[approval_session_key] = [entry]
             approval._gateway_queues[native_session_key] = [native_entry]
-
         app = web.Application()
         app.router.add_post(
             "/v1/runs/{run_id}/approval", adapter._handle_run_approval
@@ -903,99 +896,43 @@ def test_expired_protected_response_promotes_deferred_native_approval():
             assert await adapter.present_protected_approval(
                 profile="default",
                 session_id=session_id,
-                approval_session_key=protected_session_key,
-                approval_data=_run_notice(
-                    request_id=protected_request_id,
-                    fingerprint="f" * 64,
-                    timeout=10.0,
-                ),
-            )
-            requested = await asyncio.wait_for(
-                adapter._run_streams[run_id].get(), timeout=1.0
-            )
-            assert requested["request_id"] == protected_request_id
-            record = adapter._run_protected_approvals[run_id][
-                protected_request_id
-            ]
-            record["expiry_handle"].cancel()
-            record["deadline_monotonic"] = time.monotonic() - 1.0
-            adapter._run_deferred_native_approvals[run_id] = [native_event]
-
-            async with TestClient(TestServer(app)) as client:
-                expired = await client.post(
-                    f"/v1/runs/{run_id}/approval",
-                    headers={"Authorization": "Bearer sk-secret"},
-                    json={
-                        "choice": "once",
-                        "request_id": protected_request_id,
-                        "operation_fingerprint": "f" * 12,
-                    },
-                )
-                assert expired.status == 409
-
-            expired_event = await asyncio.wait_for(
-                adapter._run_streams[run_id].get(), timeout=1.0
-            )
-            assert expired_event["event"] == "approval.expired"
-            promoted = await asyncio.wait_for(
-                adapter._run_streams[run_id].get(), timeout=1.0
-            )
-            assert promoted["request_id"] == native_request_id
-            assert protected_entry.result == "deny"
-            assert adapter._run_statuses[run_id]["approval"]["request_id"] == (
-                native_request_id
-            )
-        finally:
-            active_run.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await active_run
-
-    asyncio.run(scenario())
-
-
-def test_run_presentation_expires_and_denies_bridge_entry_once():
-    from gateway.config import PlatformConfig
-    from gateway.platforms.api_server import APIServerAdapter
-
-    async def scenario():
-        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "key"}))
-        session_id = "agent:main:webui:dm:user-7"
-        run_id = "run-expiring"
-        request_id = "req-expiring"
-        approval_session_key = f"protected-write:{request_id}"
-        adapter._run_statuses[run_id] = {
-            "run_id": run_id,
-            "status": "running",
-            "session_id": session_id,
-            "profile": "default",
-        }
-        adapter._run_operator_sessions[run_id] = frozenset({session_id})
-        adapter._run_streams[run_id] = asyncio.Queue()
-        active_run = asyncio.create_task(asyncio.Event().wait())
-        adapter._active_run_tasks[run_id] = active_run
-        entry = approval._ApprovalEntry({"request_id": request_id})
-        with approval._lock:
-            approval._gateway_queues[approval_session_key] = [entry]
-        try:
-            assert await adapter.present_protected_approval(
-                profile="default",
-                session_id=session_id,
                 approval_session_key=approval_session_key,
-                approval_data=_run_notice(request_id=request_id, timeout=0.1),
+                approval_data=_run_notice(request_id=request_id, timeout=10.0),
             )
             requested = await asyncio.wait_for(
                 adapter._run_streams[run_id].get(), timeout=1.0
             )
             assert requested["event"] == "approval.request"
+            record = adapter._run_protected_approvals[run_id][request_id]
+            record["expiry_handle"].cancel()
+            record["deadline_monotonic"] = time.monotonic() - 1.0
+            adapter._run_deferred_native_approvals[run_id] = [native_event]
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post(
+                    f"/v1/runs/{run_id}/approval",
+                    headers={"Authorization": "Bearer key"},
+                    json={
+                        "choice": "once",
+                        "request_id": request_id,
+                        "operation_fingerprint": "a" * 12,
+                    },
+                )
+                assert response.status == 409
             expired = await asyncio.wait_for(
                 adapter._run_streams[run_id].get(), timeout=1.0
             )
             assert expired["event"] == "approval.expired"
             assert expired["run_id"] == run_id
             assert expired["request_id"] == request_id
+            promoted = await asyncio.wait_for(
+                adapter._run_streams[run_id].get(), timeout=1.0
+            )
+            assert promoted["request_id"] == native_request_id
             assert entry.result == "deny"
             assert adapter._run_protected_approvals == {}
-            assert adapter._run_statuses[run_id]["status"] == "running"
+            assert adapter._run_statuses[run_id]["approval"]["request_id"] == (
+                native_request_id
+            )
         finally:
             active_run.cancel()
             with contextlib.suppress(asyncio.CancelledError):
