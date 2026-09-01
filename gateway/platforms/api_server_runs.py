@@ -84,6 +84,11 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # presented by one exact live API run. Keep their bridge-owned approval
     # session keys private and correlate only by run + exact request id.
     self._run_protected_approvals = {}
+    # A native approval can be raised by the API run while an independently
+    # owned protected-write prompt is visible. Keep the native event private
+    # until the protected request settles so status polling and SSE never
+    # advertise an approval that the response endpoint must reject.
+    self._run_deferred_native_approvals = {}
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -124,6 +129,7 @@ def _close_run_state(self) -> None:
             except Exception:
                 pass
     getattr(self, "_run_protected_approvals", {}).clear()
+    getattr(self, "_run_deferred_native_approvals", {}).clear()
     store = getattr(self, "_run_idempotency_store", None)
     if store is None:
         return
@@ -160,6 +166,7 @@ def _set_run_status(
         current.pop("approval", None)
     self._run_statuses[run_id] = current
     if status in {"completed", "failed", "cancelled", "interrupted"}:
+        self._run_deferred_native_approvals.pop(run_id, None)
         approvals = self._run_protected_approvals.pop(run_id, {})
         for record in approvals.values():
             handle = record.get("expiry_handle")
@@ -229,6 +236,81 @@ def _discard_protected_approval(
     return record
 
 
+def _publish_native_approval(
+    self,
+    run_id: str,
+    event: Dict[str, Any],
+) -> bool:
+    """Expose one native approval only while its owning run is live."""
+    status = self._run_statuses.get(run_id, {})
+    task = self._active_run_tasks.get(run_id)
+    if (
+        status.get("status")
+        in {"completed", "failed", "cancelled", "interrupted", "stopping"}
+        or task is None
+        or task.done()
+    ):
+        return False
+    self._set_run_status(
+        run_id,
+        "waiting_for_approval",
+        last_event="approval.request",
+        approval=event,
+    )
+    q = self._run_streams.get(run_id)
+    if q is not None:
+        q.put_nowait(event)
+    return True
+
+
+def _queue_or_publish_native_approval(
+    self,
+    run_id: str,
+    event: Dict[str, Any],
+) -> None:
+    """Serialize native prompts behind a visible protected-write prompt."""
+    if self._run_protected_approvals.get(run_id):
+        deferred = self._run_deferred_native_approvals.setdefault(run_id, [])
+        request_id = event.get("request_id")
+        if not any(item.get("request_id") == request_id for item in deferred):
+            deferred.append(event)
+        return
+    _publish_native_approval(self, run_id, event)
+
+
+def _promote_deferred_native_approval(self, run_id: str) -> bool:
+    """Publish the oldest still-pending native prompt after protected work."""
+    if self._run_protected_approvals.get(run_id):
+        return False
+    deferred = self._run_deferred_native_approvals.get(run_id, [])
+    approval_session_key = self._run_approval_sessions.get(run_id)
+    if not deferred or not approval_session_key:
+        self._run_deferred_native_approvals.pop(run_id, None)
+        return False
+    try:
+        from tools.approval import list_gateway_approvals
+
+        pending_ids = {
+            item.get("request_id")
+            for item in list_gateway_approvals(approval_session_key)
+        }
+    except Exception:
+        logger.exception(
+            "[api_server] failed to inspect deferred native approvals for run %s",
+            run_id,
+        )
+        return False
+    while deferred:
+        event = deferred.pop(0)
+        if event.get("request_id") not in pending_ids:
+            continue
+        if not deferred:
+            self._run_deferred_native_approvals.pop(run_id, None)
+        return _publish_native_approval(self, run_id, event)
+    self._run_deferred_native_approvals.pop(run_id, None)
+    return False
+
+
 def _expire_protected_approval(
     self,
     run_id: str,
@@ -263,6 +345,7 @@ def _expire_protected_approval(
                 "timestamp": time.time(),
             }
         )
+    _promote_deferred_native_approval(self, run_id)
 
 
 async def _present_protected_approval(
@@ -1031,14 +1114,13 @@ async def _handle_runs(
                         allow_permanent=event.get("allow_permanent") is not False,
                     ),
                 })
-                self._set_run_status(
-                    run_id,
-                    "waiting_for_approval",
-                    last_event="approval.request",
-                    approval=event,
-                )
                 try:
-                    loop.call_soon_threadsafe(q.put_nowait, event)
+                    loop.call_soon_threadsafe(
+                        _queue_or_publish_native_approval,
+                        self,
+                        run_id,
+                        event,
+                    )
                 except Exception:
                     pass
 
@@ -1271,6 +1353,7 @@ async def _handle_runs(
             self._active_run_agents.pop(run_id, None)
             self._active_run_tasks.pop(run_id, None)
             self._run_approval_sessions.pop(run_id, None)
+            self._run_deferred_native_approvals.pop(run_id, None)
             self._stopping_run_ids.discard(run_id)
 
     self._activate_admitted_request()
@@ -1544,7 +1627,15 @@ async def _handle_run_approval(
             or task.done()
         )
         if expired or zombie:
-            _discard_protected_approval(self, run_id, request_id, deny=True)
+            if expired:
+                _expire_protected_approval(
+                    self,
+                    run_id,
+                    request_id,
+                    protected_approval["approval_session_key"],
+                )
+            else:
+                _discard_protected_approval(self, run_id, request_id, deny=True)
             return web.json_response(
                 _openai_error(
                     "Protected approval is no longer active.",
@@ -1612,6 +1703,7 @@ async def _handle_run_approval(
             })
         except Exception:
             pass
+    _promote_deferred_native_approval(self, run_id)
 
     return web.json_response({
         "object": "hermes.run.approval_response",
@@ -1810,6 +1902,7 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
             self._active_run_agents.pop(run_id, None)
             self._active_run_tasks.pop(run_id, None)
             self._run_approval_sessions.pop(run_id, None)
+            self._run_deferred_native_approvals.pop(run_id, None)
             self._stopping_run_ids.discard(run_id)
 
     stale_statuses = [
@@ -1823,3 +1916,4 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         self._run_idempotency_ids.discard(run_id)
         self._run_owners.pop(run_id, None)
         self._run_operator_sessions.pop(run_id, None)
+        self._run_deferred_native_approvals.pop(run_id, None)
