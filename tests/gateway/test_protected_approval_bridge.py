@@ -849,7 +849,8 @@ def test_native_approval_waits_until_visible_protected_request_is_resolved(monke
         )
 
 
-def test_run_presentation_expires_and_denies_bridge_entry_once():
+@pytest.mark.parametrize("orphaned", [False, True])
+def test_unavailable_protected_request_promotes_deferred_native_approval(orphaned):
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -903,9 +904,12 @@ def test_run_presentation_expires_and_denies_bridge_entry_once():
                 adapter._run_streams[run_id].get(), timeout=1.0
             )
             assert requested["event"] == "approval.request"
-            record = adapter._run_protected_approvals[run_id][request_id]
-            record["expiry_handle"].cancel()
-            record["deadline_monotonic"] = time.monotonic() - 1.0
+            if orphaned:
+                approval.unregister_gateway_notify(approval_session_key)
+            else:
+                record = adapter._run_protected_approvals[run_id][request_id]
+                record["expiry_handle"].cancel()
+                record["deadline_monotonic"] = time.monotonic() - 1.0
             adapter._run_deferred_native_approvals[run_id] = [native_event]
             async with TestClient(TestServer(app)) as client:
                 response = await client.post(
@@ -928,7 +932,8 @@ def test_run_presentation_expires_and_denies_bridge_entry_once():
                 adapter._run_streams[run_id].get(), timeout=1.0
             )
             assert promoted["request_id"] == native_request_id
-            assert entry.result == "deny"
+            if not orphaned:
+                assert entry.result == "deny"
             assert adapter._run_protected_approvals == {}
             assert adapter._run_statuses[run_id]["approval"]["request_id"] == (
                 native_request_id

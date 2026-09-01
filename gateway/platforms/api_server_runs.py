@@ -316,12 +316,17 @@ def _expire_protected_approval(
     run_id: str,
     request_id: str,
     approval_session_key: str,
+    *,
+    force: bool = False,
 ) -> None:
     record = self._run_protected_approvals.get(run_id, {}).get(request_id)
     if (
         record is None
         or record.get("approval_session_key") != approval_session_key
-        or time.monotonic() < float(record.get("deadline_monotonic") or 0)
+        or (
+            not force
+            and time.monotonic() < float(record.get("deadline_monotonic") or 0)
+        )
     ):
         return
     _discard_protected_approval(self, run_id, request_id, deny=True)
@@ -1672,7 +1677,13 @@ async def _handle_run_approval(
 
     if resolved <= 0:
         if protected_approval:
-            _discard_protected_approval(self, run_id, request_id, deny=False)
+            _expire_protected_approval(
+                self,
+                run_id,
+                request_id,
+                protected_approval["approval_session_key"],
+                force=True,
+            )
         return web.json_response(
             _openai_error(
                 f"Run has no pending approval: {run_id}",
