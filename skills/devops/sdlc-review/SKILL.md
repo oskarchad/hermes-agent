@@ -68,13 +68,15 @@ the independent review from its one permitted closure.
 | Stage | Supporting lens | How to apply it |
 |---|---|---|
 | Independent review | Artifact | Use the Contract method to write invariants, then cold-read the exact SHA before the implementer's narrative or OCR report. Return one findings batch. |
-| Focused closure | Execution | On the new exact SHA, use `terminal` to verify prior findings, changed boundaries, and relevant regressions; do not repeat the full review without a documented concrete cause. |
-| Further HIGH class | Architecture stop | If two rounds reveal new classes of HIGH findings, stop the review loop and escalate the contract boundary instead of launching a third review. |
+| Focused closure | Execution | On the new exact SHA, use `terminal` to verify prior findings, changed boundaries, and relevant regressions. |
+| Further HIGH class | Architecture stop | If two permitted full-review rounds reveal new classes of HIGH findings, stop returning the same task and open a new architecture task or issue. |
 
 The contract, not a lens or helper, governs the verdict. Do not dispatch
 parallel reviewers with `delegate_task`; Gauge is the sole independent reviewer
 and may use a dependency map only as the optional navigation aid defined in the
-reference.
+reference. Repeat a full review only when the correction diff changes an
+operation contract and invalidates prior evidence; otherwise use focused
+closure.
 
 ## Procedure
 

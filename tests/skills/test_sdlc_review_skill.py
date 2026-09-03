@@ -83,7 +83,11 @@ def test_verdicts_route_through_distinct_terminal_actions(skill_text: str) -> No
 
 
 def test_review_stages_bound_full_review_to_one_closure(skill_text: str) -> None:
-    lenses = skill_text.split("## Review Lenses", 1)[1].split("## Procedure", 1)[0]
+    lenses = " ".join(
+        skill_text.split("## Review Lenses", 1)[1]
+        .split("## Procedure", 1)[0]
+        .split()
+    )
     assert "`changes_requested`" in lenses
     assert "Prior attempts on this task" in lenses
     for stage in ("Independent review", "Focused closure", "Architecture stop"):
@@ -91,6 +95,9 @@ def test_review_stages_bound_full_review_to_one_closure(skill_text: str) -> None
     assert "`terminal`" in lenses
     assert "`delegate_task`" in lenses
     assert "sole independent reviewer" in lenses
+    assert "changes an operation contract" in lenses
+    assert "two permitted full-review rounds" in lenses
+    assert "new architecture task or issue" in lenses
 
 
 def test_skill_routes_same_card_and_downstream_review_work(skill_text: str) -> None:
