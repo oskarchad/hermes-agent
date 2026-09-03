@@ -1695,3 +1695,110 @@ def test_stale_claim_race_stops_snapshotted_run_and_never_consumes_successor(
         assert task.current_run_id == successor.current_run_id
     finally:
         conn.close()
+
+
+@pytest.mark.linux_only
+def test_manual_reclaim_race_with_stop_failure_never_mutates_successor(monkeypatch, tmp_path):
+    """Review gap: when the old scope cannot be stopped after a successor took
+    the task-stable lock, the deferral must target the snapshotted run only."""
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    stopped = []
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda unit: stopped.append(unit) or False)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="reclaim race, stop fails", assignee="patch")
+        lock = kb._dispatcher_claim_lock(conn, task_id)
+        old_run = kb.claim_task(conn, task_id, claimer=lock)
+        assert old_run is not None
+        assert kb._set_worker_pid(conn, task_id, 4201)
+        state = _install_successor_between_snapshot_and_scope_lookup(
+            kb, monkeypatch, conn, task_id, lock, 4202
+        )
+        assert kb.reclaim_task(conn, task_id, signal_fn=lambda *_a: None) is False
+        assert stopped == [kb._kanban_worker_scope_unit(task_id, old_run.current_run_id)]
+        successor = state["successor"]
+        assert successor is not None
+        task_row = conn.execute(
+            "SELECT status, worker_pid, current_run_id, claim_expires FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert task_row["status"] == "running"
+        assert task_row["worker_pid"] == 4202
+        assert task_row["current_run_id"] == successor.current_run_id
+        assert task_row["claim_expires"] == successor.claim_expires
+        run_row = conn.execute(
+            "SELECT claim_expires, worker_pid FROM task_runs WHERE id = ?",
+            (successor.current_run_id,),
+        ).fetchone()
+        assert run_row["claim_expires"] == successor.claim_expires
+        assert run_row["worker_pid"] == 4202
+        successor_events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.run_id == successor.current_run_id
+        ]
+        assert not any(event.kind == "reclaim_deferred" for event in successor_events)
+    finally:
+        conn.close()
+
+
+@pytest.mark.linux_only
+def test_handoff_guard_probes_only_the_exact_source_run_scope(monkeypatch, tmp_path):
+    """A foreign persisted unit must never be the scope the handoff guard probes."""
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.config as config
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda *_args, **_kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    probed = []
+    monkeypatch.setattr(
+        kb,
+        "_systemd_worker_scope_unloaded",
+        lambda unit: probed.append(unit) or True,
+        raising=False,
+    )
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="foreign unit handoff",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        implementation = kb.claim_task(
+            conn, task_id, claimer=kb._dispatcher_claim_lock(conn, task_id)
+        )
+        assert implementation is not None
+        assert kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._SpawnedWorkerPid(
+                90202,
+                isolation_mode="systemd_scope",
+                scope_unit="hermes-worker-kanban-other-run-999.scope",
+            ),
+        )
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready for review",
+            reviewer="gauge",
+            expected_run_id=implementation.current_run_id,
+        )
+        exact = kb._kanban_worker_scope_unit(task_id, implementation.current_run_id)
+        assert kb._handoff_worker_teardown_pending(conn, task_id) is False
+        assert probed == [exact]
+        assert "other-run-999" not in "".join(probed)
+    finally:
+        conn.close()

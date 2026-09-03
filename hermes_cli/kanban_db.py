@@ -5723,9 +5723,10 @@ def release_stale_claims(
             continue
 
         snapshot_run = row["current_run_id"]
-        guard_sql, guard_params = _worker_identity_guard(
-            row["id"], (row["id"], snapshot_run, row["worker_pid"], row["claim_lock"]),
+        expected_identity: _WorkerIdentity = (
+            row["id"], snapshot_run, row["worker_pid"], row["claim_lock"],
         )
+        guard_sql, guard_params = _worker_identity_guard(row["id"], expected_identity)
         termination = _terminate_reclaimed_worker(
             row["worker_pid"],
             row["claim_lock"],
@@ -5739,6 +5740,7 @@ def release_stale_claims(
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
+                expected_identity=expected_identity,
             )
             continue
         with write_txn(conn):
@@ -5862,6 +5864,7 @@ def reclaim_task(
             int(time.time()),
             termination,
             reason="manual_reclaim_cleanup_incomplete",
+            expected_identity=expected_identity,
         )
         return False
     with write_txn(conn):
@@ -10031,9 +10034,8 @@ def enforce_max_runtime(
         tid = row["id"]
         run_id: Optional[int] = None
         snapshot_run = row["current_run_id"]
-        guard_sql, guard_params = _worker_identity_guard(
-            tid, (tid, snapshot_run, pid, row["claim_lock"]),
-        )
+        expected_identity: _WorkerIdentity = (tid, snapshot_run, pid, row["claim_lock"])
+        guard_sql, guard_params = _worker_identity_guard(tid, expected_identity)
         termination = _terminate_reclaimed_worker(
             pid,
             row["claim_lock"],
@@ -10052,6 +10054,7 @@ def enforce_max_runtime(
                 now,
                 termination,
                 reason="max_runtime_worker_alive",
+                expected_identity=expected_identity,
             )
             continue
 
@@ -10175,9 +10178,8 @@ def detect_stale_running(
 
         # Terminate the worker if it's still host-local.
         snapshot_run = row["current_run_id"]
-        guard_sql, guard_params = _worker_identity_guard(
-            tid, (tid, snapshot_run, pid, row["claim_lock"]),
-        )
+        expected_identity: _WorkerIdentity = (tid, snapshot_run, pid, row["claim_lock"])
+        guard_sql, guard_params = _worker_identity_guard(tid, expected_identity)
         termination = _terminate_reclaimed_worker(
             pid,
             lock,
@@ -10192,6 +10194,7 @@ def detect_stale_running(
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
+                expected_identity=expected_identity,
             )
             continue
 
@@ -11194,9 +11197,12 @@ def _handoff_worker_teardown_pending(
         payload = {}
 
     if _worker_scope_expected(conn, task_id, run_id=run_id):
-        scope_unit = payload.get("scope_unit")
-        if not (isinstance(scope_unit, str) and scope_unit.startswith("hermes-worker-")):
-            scope_unit = _kanban_worker_scope_unit(task_id, run_id)
+        # The exact source-run identity is the only unit worth probing; a
+        # persisted string is never trusted on its own (foreign or stale
+        # metadata would otherwise point the guard at an unrelated scope).
+        scope_unit = _worker_scope_unit(conn, task_id, run_id=run_id)
+        if scope_unit is None:
+            return True
         return not _systemd_worker_scope_unloaded(scope_unit)
 
     worker_pid = payload.get("pid")
