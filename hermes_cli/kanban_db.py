@@ -5656,7 +5656,7 @@ def release_stale_claims(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -5722,11 +5722,16 @@ def release_stale_claims(
                 )
             continue
 
+        snapshot_run = row["current_run_id"]
+        guard_sql, guard_params = _worker_identity_guard(
+            row["id"], (row["id"], snapshot_run, row["worker_pid"], row["claim_lock"]),
+        )
         termination = _terminate_reclaimed_worker(
             row["worker_pid"],
             row["claim_lock"],
             signal_fn=signal_fn,
-            scope_expected=_worker_scope_expected(conn, row["id"]), scope_unit=_worker_scope_unit(conn, row["id"]),
+            scope_expected=_worker_scope_expected(conn, row["id"], run_id=snapshot_run),
+            scope_unit=_worker_scope_unit(conn, row["id"], run_id=snapshot_run),
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -5742,8 +5747,8 @@ def release_stale_claims(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                "AND claim_expires IS NOT NULL AND claim_expires < ?" + guard_sql,
+                (retry_status, row["id"], row["claim_lock"], now, *guard_params),
             )
             if cur.rowcount != 1:
                 continue
@@ -5816,7 +5821,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -5834,11 +5839,20 @@ def reclaim_task(
         # in-flight spawn cannot be orphaned beside a replacement.
         return False
     prev_lock = row["claim_lock"]
+    # Pin cleanup and the ownership release to the exact run snapshotted here:
+    # the dispatcher claim lock is stable per task, so a successor run can
+    # carry the same lock and must never be stopped or consumed in its place.
+    snapshot_run = row["current_run_id"]
+    expected_identity: _WorkerIdentity = (
+        task_id, snapshot_run, row["worker_pid"], prev_lock,
+    )
+    guard_sql, guard_params = _worker_identity_guard(task_id, expected_identity)
     termination = _terminate_reclaimed_worker(
         row["worker_pid"],
         prev_lock,
         signal_fn=signal_fn,
-        scope_expected=_worker_scope_expected(conn, task_id), scope_unit=_worker_scope_unit(conn, task_id),
+        scope_expected=_worker_scope_expected(conn, task_id, run_id=snapshot_run),
+        scope_unit=_worker_scope_unit(conn, task_id, run_id=snapshot_run),
     )
     if _worker_survived_termination(termination):
         _defer_reclaim_for_live_worker(
@@ -5856,8 +5870,8 @@ def reclaim_task(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (retry_status, task_id, prev_lock),
+            "AND claim_lock IS ?" + guard_sql,
+            (retry_status, task_id, prev_lock, *guard_params),
         )
         if cur.rowcount != 1:
             return False
@@ -9594,10 +9608,10 @@ def _worker_scope_unit(
 ) -> Optional[str]:
     """Resolve the transient scope unit for one run, or None when no scope is expected.
 
-    Prefers the unit persisted by the spawn event; otherwise derives it from
-    task and run identity.  Units persisted under the pre-2026-09 naming
-    scheme are ignored, because that name never existed under the upstream
-    spawn path.
+    The unit is always the exact ``hermes-worker-kanban-<task>-run-<run>``
+    identity of that run.  The unit persisted by the spawn event is only
+    cross-checked, never trusted on its own, so stale or foreign metadata can
+    never direct cleanup at another worker's scope.
     """
     if not _worker_scope_expected(conn, task_id, run_id=run_id):
         return None
@@ -9626,11 +9640,19 @@ def _worker_scope_unit(
                 persisted = json.loads(row["payload"]).get("scope_unit")
             except (TypeError, ValueError, json.JSONDecodeError):
                 persisted = None
-    if isinstance(persisted, str) and persisted.startswith("hermes-worker-"):
-        return persisted
     if resolved_run is None:
+        # No run identity to derive from and nothing trustworthy persisted:
+        # callers treat None as "cannot verify" and fail closed.
         return None
-    return _kanban_worker_scope_unit(task_id, resolved_run)
+    expected = _kanban_worker_scope_unit(task_id, resolved_run)
+    if isinstance(persisted, str) and persisted and persisted != expected:
+        # Never let stale or foreign persisted metadata aim cleanup at another
+        # task/run's scope; the exact task+run identity is authoritative.
+        _log.debug(
+            "kanban: ignoring persisted scope unit %r for %s run %s (expected %r)",
+            persisted, task_id, resolved_run, expected,
+        )
+    return expected
 
 
 def _signal_owned_worker(
@@ -9985,7 +10007,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -10008,11 +10030,16 @@ def enforce_max_runtime(
         pid = int(row["worker_pid"])
         tid = row["id"]
         run_id: Optional[int] = None
+        snapshot_run = row["current_run_id"]
+        guard_sql, guard_params = _worker_identity_guard(
+            tid, (tid, snapshot_run, pid, row["claim_lock"]),
+        )
         termination = _terminate_reclaimed_worker(
             pid,
             row["claim_lock"],
             signal_fn=signal_fn,
-            scope_expected=_worker_scope_expected(conn, tid), scope_unit=_worker_scope_unit(conn, tid),
+            scope_expected=_worker_scope_expected(conn, tid, run_id=snapshot_run),
+            scope_unit=_worker_scope_unit(conn, tid, run_id=snapshot_run),
         )
         # A timeout is not permission to launch a duplicate beside a worker
         # that survived cleanup. Preserve the claim and retry termination on a
@@ -10035,8 +10062,8 @@ def enforce_max_runtime(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ?" + guard_sql,
+                (retry_status, tid, pid, row["claim_lock"], *guard_params),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -10121,7 +10148,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -10147,11 +10174,16 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         # Terminate the worker if it's still host-local.
+        snapshot_run = row["current_run_id"]
+        guard_sql, guard_params = _worker_identity_guard(
+            tid, (tid, snapshot_run, pid, row["claim_lock"]),
+        )
         termination = _terminate_reclaimed_worker(
             pid,
             lock,
             signal_fn=signal_fn,
-            scope_expected=_worker_scope_expected(conn, tid), scope_unit=_worker_scope_unit(conn, tid),
+            scope_expected=_worker_scope_expected(conn, tid, run_id=snapshot_run),
+            scope_unit=_worker_scope_unit(conn, tid, run_id=snapshot_run),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -10170,8 +10202,8 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                "  AND claim_lock IS ?" + guard_sql,
+                (retry_status, tid, row["claim_lock"], *guard_params),
             )
             if cur.rowcount != 1:
                 continue

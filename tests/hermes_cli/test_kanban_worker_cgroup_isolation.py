@@ -1559,9 +1559,9 @@ def test_handoff_guard_derives_shared_scope_when_spawn_payload_lacks_unit(monkey
         conn.close()
 
 
-def test_worker_scope_unit_ignores_pre_upstream_persisted_names(monkeypatch, tmp_path):
-    """Units persisted under the old ``hermes-kanban-worker-<sha>`` scheme never existed
-    under the upstream spawn path; cleanup must derive the real one instead."""
+def test_worker_scope_unit_is_always_the_exact_run_identity(monkeypatch, tmp_path):
+    """Persisted metadata is only cross-checked: stale pre-merge names and
+    foreign task/run units must never redirect cleanup."""
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1574,32 +1574,124 @@ def test_worker_scope_unit_ignores_pre_upstream_persisted_names(monkeypatch, tmp
             assert kb._set_worker_pid(conn, task_id, pid)
             return task_id, claimed
 
-        legacy_id, legacy = spawned(
-            "legacy unit name",
-            kb._SpawnedWorkerPid(
-                777,
-                isolation_mode="systemd_scope",
-                scope_unit="hermes-kanban-worker-0123456789abcdef.scope",
-            ),
-        )
-        assert kb._worker_scope_unit(conn, legacy_id) == kb._kanban_worker_scope_unit(
-            legacy_id, legacy.current_run_id
-        )
-
-        upstream_id, _ = spawned(
-            "upstream unit name",
-            kb._SpawnedWorkerPid(
-                778,
-                isolation_mode="systemd_scope",
-                scope_unit="hermes-worker-kanban-other-run-9.scope",
-            ),
-        )
-        assert kb._worker_scope_unit(conn, upstream_id) == "hermes-worker-kanban-other-run-9.scope"
+        for title, persisted in (
+            ("legacy unit name", "hermes-kanban-worker-0123456789abcdef.scope"),
+            ("foreign task unit", "hermes-worker-kanban-other-run-9.scope"),
+        ):
+            task_id, claimed = spawned(
+                title,
+                kb._SpawnedWorkerPid(777, isolation_mode="systemd_scope", scope_unit=persisted),
+            )
+            assert kb._worker_scope_unit(conn, task_id) == kb._kanban_worker_scope_unit(
+                task_id, claimed.current_run_id
+            )
+            assert kb._worker_scope_unit(conn, task_id) != persisted
 
         plain_id, _ = spawned(
             "no scope",
             kb._SpawnedWorkerPid(779, isolation_mode="process_session", scope_unit=None),
         )
         assert kb._worker_scope_unit(conn, plain_id) is None
+    finally:
+        conn.close()
+
+
+def _install_successor_between_snapshot_and_scope_lookup(kb, monkeypatch, conn, task_id, lock, new_pid):
+    """Race helper: the first scope lookup replaces the snapshotted run with a
+    successor that carries the same task-stable dispatcher lock."""
+    state = {"swapped": False, "successor": None}
+    real = kb._worker_scope_unit
+
+    def racing(conn_, tid, run_id=None):
+        if not state["swapped"]:
+            state["swapped"] = True
+            kb._end_run(conn_, tid, outcome="reclaimed", status="reclaimed", error="race")
+            conn_.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                (tid,),
+            )
+            conn_.commit()
+            successor = kb.claim_task(conn_, tid, claimer=lock)
+            assert successor is not None
+            assert kb._set_worker_pid(conn_, tid, new_pid)
+            state["successor"] = successor
+        return real(conn_, tid, run_id=run_id)
+
+    monkeypatch.setattr(kb, "_worker_scope_unit", racing)
+    return state
+
+
+@pytest.mark.linux_only
+def test_manual_reclaim_race_stops_snapshotted_run_and_never_consumes_successor(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    stopped = []
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda unit: stopped.append(unit) or True)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="reclaim race", assignee="patch")
+        lock = kb._dispatcher_claim_lock(conn, task_id)
+        old_run = kb.claim_task(conn, task_id, claimer=lock)
+        assert old_run is not None
+        assert kb._set_worker_pid(conn, task_id, 4001)
+        state = _install_successor_between_snapshot_and_scope_lookup(
+            kb, monkeypatch, conn, task_id, lock, 4002
+        )
+        assert kb.reclaim_task(conn, task_id, signal_fn=lambda *_a: None) is False
+        assert stopped == [kb._kanban_worker_scope_unit(task_id, old_run.current_run_id)]
+        successor = state["successor"]
+        assert successor is not None
+        assert successor.current_run_id != old_run.current_run_id
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.worker_pid == 4002
+        assert task.current_run_id == successor.current_run_id
+        assert task.claim_lock == lock
+    finally:
+        conn.close()
+
+
+@pytest.mark.linux_only
+def test_stale_claim_race_stops_snapshotted_run_and_never_consumes_successor(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    stopped = []
+    monkeypatch.setattr(kb, "_stop_kanban_worker_scope", lambda unit: stopped.append(unit) or True)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="stale race", assignee="patch")
+        lock = kb._dispatcher_claim_lock(conn, task_id)
+        old_run = kb.claim_task(conn, task_id, claimer=lock)
+        assert old_run is not None
+        assert kb._set_worker_pid(conn, task_id, 4101)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 600, task_id),
+        )
+        conn.commit()
+        state = _install_successor_between_snapshot_and_scope_lookup(
+            kb, monkeypatch, conn, task_id, lock, 4102
+        )
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_a: None) == 0
+        assert stopped == [kb._kanban_worker_scope_unit(task_id, old_run.current_run_id)]
+        successor = state["successor"]
+        assert successor is not None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.worker_pid == 4102
+        assert task.current_run_id == successor.current_run_id
     finally:
         conn.close()
