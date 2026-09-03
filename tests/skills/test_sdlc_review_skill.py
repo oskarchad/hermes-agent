@@ -14,6 +14,7 @@ SKILL_MD = (
     / "sdlc-review"
     / "SKILL.md"
 )
+CONTRACT_FIRST_REFERENCE = SKILL_MD.parent / "references" / "contract-first-review.md"
 REQUIRED_SECTIONS = [
     "## When to Use",
     "## Prerequisites",
@@ -81,15 +82,102 @@ def test_verdicts_route_through_distinct_terminal_actions(skill_text: str) -> No
     assert "Escalate" in quick_reference and "`kanban_block`" in quick_reference
 
 
-def test_review_lenses_vary_per_round(skill_text: str) -> None:
+def test_review_stages_bound_full_review_to_one_closure(skill_text: str) -> None:
     lenses = skill_text.split("## Review Lenses", 1)[1].split("## Procedure", 1)[0]
-    # Round derivation must key off history the reviewer actually sees.
     assert "`changes_requested`" in lenses
     assert "Prior attempts on this task" in lenses
-    # One distinct lens per round.
-    for lens in ("Artifact", "Execution", "Contract"):
-        assert lens in lenses
-    # Execution lens must direct empirical verification via the terminal.
+    for stage in ("Independent review", "Focused closure", "Architecture stop"):
+        assert stage in lenses
     assert "`terminal`" in lenses
-    # Fan-out note: parallel reviewers get different briefs.
     assert "`delegate_task`" in lenses
+    assert "sole independent reviewer" in lenses
+
+
+def test_skill_routes_same_card_and_downstream_review_work(skill_text: str) -> None:
+    when_to_use = skill_text.split("## When to Use", 1)[1].split(
+        "## Prerequisites", 1
+    )[0]
+    assert "task claimed from the `review` lane" in when_to_use
+    assert "downstream review card" in when_to_use
+    assert "Do not use it for a separate downstream review card" not in when_to_use
+
+
+def test_contract_first_reference_is_mandatory_and_routed(skill_text: str) -> None:
+    assert "**REQUIRED METHOD:**" in skill_text
+    assert "`references/contract-first-review.md`" in skill_text
+    assert CONTRACT_FIRST_REFERENCE.is_file()
+
+
+def test_contract_first_reference_covers_review_contract() -> None:
+    reference = " ".join(
+        CONTRACT_FIRST_REFERENCE.read_text(encoding="utf-8").split()
+    )
+
+    assert "3–7 operation invariants" in reference
+    assert (
+        "producer → validation → authoritative/stored state → consumer → "
+        "event/operator-visible outcome"
+    ) in reference
+    for failure_case in (
+        "success",
+        "transport exception",
+        "typed/returned error",
+        "malformed payload",
+        "empty result",
+        "partial result",
+        "timeout/rate limit",
+        "crash/reclaim",
+        "retry exhaustion",
+    ):
+        assert failure_case in reference
+
+    for ownership in (
+        "retry owner",
+        "terminal-state owner",
+        "checkpoint owner",
+        "exactly-once/external-write owner",
+        "operator-visible-outcome owner",
+    ):
+        assert ownership in reference
+
+    for required_rule in (
+        "negative probe",
+        "one batch",
+        "exact SHA",
+        "at most one focused closure",
+        "changes an operation contract",
+        "HIGH blocks",
+        "literal `APPROVED`",
+        "architecture stop",
+        "path and line",
+        "evidence gap",
+        "separately from an implementation defect",
+        "never produce approval",
+        "queue or dispatch",
+        "retry and recovery checkpoints",
+    ):
+        assert required_rule in reference
+
+
+def test_contract_first_reference_preserves_review_responsibilities() -> None:
+    reference = " ".join(
+        CONTRACT_FIRST_REFERENCE.read_text(encoding="utf-8").split()
+    )
+
+    for responsibility in (
+        "The author implements and tests",
+        "Open Code Review",
+        "at most once",
+        "never a verdict",
+        "Gauge performs one independent cold-read review",
+        "Gauge is the only verdict authority",
+        "CI and tests are technical evidence",
+        "optional navigation aid",
+        "Never treat a graph as a reviewer or verdict source",
+        "Never pass a large raw graph",
+        "deadline",
+        "author seniority",
+        "green CI or tests",
+        "new architecture task or issue",
+    ):
+        assert responsibility in reference

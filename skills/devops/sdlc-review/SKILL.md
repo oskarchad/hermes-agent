@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
 description: Review Kanban handoffs and route verified outcomes.
-version: 1.1.0
+version: 1.2.0
 author: Jakub Wolniewicz (@frizikk) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -20,13 +20,14 @@ Independently verify work handed from a Kanban implementation run to the review 
 
 ## When to Use
 
-Use this skill when all of the following are true:
+Use this skill when the dispatcher spawned you as the independent reviewer and
+the task needs a verdict before delivery can continue. Both supported routes
+use the same method:
 
-- the dispatcher spawned you for a task claimed from the `review` lane;
-- an implementer submitted a `review_requested` handoff;
-- the task needs an independent verdict before it can be completed.
-
-Do not use it for a separate downstream review card. A downstream card is ordinary implementation work with a review-oriented specification and completes through its own lifecycle.
+- a task claimed from the `review` lane uses its latest `review_requested`
+  handoff;
+- a downstream review card uses the completed parent handoff and the frozen
+  exact SHA named by its own specification.
 
 ## Prerequisites
 
@@ -40,15 +41,19 @@ Do not use it for a separate downstream review card. A downstream card is ordina
 This skill is loaded automatically by the review dispatcher. Start with `kanban_show` before inspecting files or choosing a verdict.
 
 1. Read the task specification and the latest `review_requested` handoff.
-2. Inspect the actual deliverable and run relevant verification.
-3. Choose exactly one verdict: approve, request changes, or escalate.
-4. Record concrete evidence in the terminal Kanban transition.
+2. **REQUIRED METHOD:** Before inspecting the detailed diff, read
+   `references/contract-first-review.md`, pin the exact SHA, and write the
+   operation invariants required there.
+3. Inspect the actual deliverable through those contracts and run relevant
+   verification.
+4. Choose exactly one verdict: approve, request changes, or escalate.
+5. Record concrete evidence in the terminal Kanban transition.
 
 ## Quick Reference
 
 | Verdict | When | Final action |
 |---|---|---|
-| Approve | Acceptance criteria and verification pass | `kanban_complete` |
+| Approve | Acceptance criteria and contract-first verification pass; record literal `APPROVED` | `kanban_complete` |
 | Request changes | Correctable implementation defects remain | `kanban_comment`, then `kanban_request_changes` |
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
@@ -56,21 +61,20 @@ A requested-changes transition returns the task to its original implementer. Whe
 
 ## Review Lenses
 
-Vary how you look at the work on each round instead of repeating the same inspection. Decorrelated lenses catch different defect classes: a cold read of the artifact surfaces design and correctness problems that the implementer's narrative would have framed away, execution surfaces claims that do not reproduce, and a strict contract audit surfaces quiet scope drift. Repeating the round-1 lens on round 3 mostly re-finds what round 1 already found.
+Contract-first is mandatory; lenses only change the supporting emphasis. Count
+the `changes_requested` entries in "Prior attempts on this task" to distinguish
+the independent review from its one permitted closure.
 
-Determine the current round from the history the task record already gives you: count the `changes_requested` entries in the "Prior attempts on this task" section of your worker context (also visible as prior runs in `kanban_show`). The current review round is that count plus one. Round 1 therefore shows zero `changes_requested` attempts; round 2 shows one; and so on.
-
-| Round | Lens | How to apply it |
+| Stage | Supporting lens | How to apply it |
 |---|---|---|
-| 1 | Artifact | Read the diff or deliverable cold, before the implementer's summary. Form an independent judgment, then compare it against the handoff narrative and investigate every mismatch. |
-| 2 | Execution | Check out the work and actually run it via `terminal`: build, test, and exercise the reported behavior yourself. Verify each handoff claim empirically instead of re-reading the artifact. |
-| 3+ | Contract | Re-read the ORIGINAL task body and acceptance criteria, then audit the deliverable strictly against them. Also verify that every item from every prior `kanban_request_changes` round actually landed. |
+| Independent review | Artifact | Use the Contract method to write invariants, then cold-read the exact SHA before the implementer's narrative or OCR report. Return one findings batch. |
+| Focused closure | Execution | On the new exact SHA, use `terminal` to verify prior findings, changed boundaries, and relevant regressions; do not repeat the full review without a documented concrete cause. |
+| Further HIGH class | Architecture stop | If two rounds reveal new classes of HIGH findings, stop the review loop and escalate the contract boundary instead of launching a third review. |
 
-The baseline duties in the Procedure section still apply on every round; the lens sets which inspection you lead with and weight most heavily.
-
-### Lens variation for ad-hoc review fan-outs
-
-The same principle applies outside the Kanban review lane. When spawning multiple parallel reviewers via `delegate_task`, give each reviewer a different lens — one diff-only brief, one full-context brief, one checkout-and-run brief — rather than identical briefs. Identical briefs produce correlated verdicts and duplicate findings; varied briefs cover more defect classes for the same review spend.
+The contract, not a lens or helper, governs the verdict. Do not dispatch
+parallel reviewers with `delegate_task`; Gauge is the sole independent reviewer
+and may use a dependency map only as the optional navigation aid defined in the
+reference.
 
 ## Procedure
 
@@ -92,11 +96,13 @@ Map every acceptance criterion to concrete implementation or output evidence. No
 
 For code work:
 
-1. Use `read_file` and `search_files` to inspect the changed paths and their callers.
-2. Use `terminal` to inspect the diff and run the project's existing focused tests, lint, type checks, or build commands.
-3. Exercise the reported failure path and at least one ordinary control path when practical.
-4. Check error handling, edge cases, concurrency boundaries, data preservation, security boundaries, and cross-platform behavior relevant to the change.
-5. Confirm that tests assert behavior rather than merely snapshotting source text or constants.
+1. Apply every step in `references/contract-first-review.md` to the frozen exact
+   SHA before reading helper findings.
+2. Use `read_file` and `search_files` to inspect the changed paths and their callers.
+3. Use `terminal` to inspect the diff and run the project's existing focused tests, lint, type checks, or build commands.
+4. Exercise the reported failure path and at least one ordinary control path when practical.
+5. Check error handling, edge cases, concurrency boundaries, data preservation, security boundaries, and cross-platform behavior relevant to the change.
+6. Confirm that tests assert behavior rather than merely snapshotting source text or constants.
 
 For non-code work:
 
@@ -108,11 +114,13 @@ For non-code work:
 
 #### Approve
 
-Approve only when the acceptance criteria are satisfied and the evidence is sufficient. Call:
+Approve only when the acceptance criteria are satisfied, the contract-first
+review has no HIGH finding, and the evidence is sufficient. The transition
+summary must contain the literal verdict `APPROVED`. Call:
 
 ```text
 kanban_complete(
-    summary="Reviewed and approved. <what was verified>",
+    summary="APPROVED — <what was verified>",
     metadata={"review_outcome": "approved", "reviewer_checks": [...]}
 )
 ```
