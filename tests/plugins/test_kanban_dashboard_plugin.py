@@ -654,7 +654,7 @@ def test_direct_status_rejects_unverified_running_scope_cleanup(
             kb._SpawnedWorkerPid(
                 85678,
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+                scope_unit=kb._kanban_worker_scope_unit(claimed.id, claimed.current_run_id),
             ),
         )
 
@@ -711,7 +711,7 @@ def test_dashboard_force_transition_rejects_unverified_running_scope_cleanup(
             kb._SpawnedWorkerPid(
                 86000 + len(target_status),
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+                scope_unit=kb._kanban_worker_scope_unit(claimed.id, claimed.current_run_id),
             ),
         )
 
@@ -962,7 +962,7 @@ def test_bulk_force_transition_rejects_unverified_running_scope_cleanup(
             kb._SpawnedWorkerPid(
                 86555,
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+                scope_unit=kb._kanban_worker_scope_unit(claimed.id, claimed.current_run_id),
             ),
         )
 
@@ -1011,7 +1011,7 @@ def test_parent_reopen_rejects_unverified_descendant_scope_cleanup(
             kb._SpawnedWorkerPid(
                 86789,
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+                scope_unit=kb._kanban_worker_scope_unit(claimed.id, claimed.current_run_id),
             ),
         )
 
@@ -1069,7 +1069,7 @@ def test_delete_running_task_reports_cleanup_conflict(client, monkeypatch):
             kb._SpawnedWorkerPid(
                 87991,
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+                scope_unit=kb._kanban_worker_scope_unit(claimed.id, claimed.current_run_id),
             ),
         )
 

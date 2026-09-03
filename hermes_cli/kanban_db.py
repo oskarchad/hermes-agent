@@ -5726,7 +5726,7 @@ def release_stale_claims(
             row["worker_pid"],
             row["claim_lock"],
             signal_fn=signal_fn,
-            scope_expected=_worker_scope_expected(conn, row["id"]),
+            scope_expected=_worker_scope_expected(conn, row["id"]), scope_unit=_worker_scope_unit(conn, row["id"]),
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -5838,7 +5838,7 @@ def reclaim_task(
         row["worker_pid"],
         prev_lock,
         signal_fn=signal_fn,
-        scope_expected=_worker_scope_expected(conn, task_id),
+        scope_expected=_worker_scope_expected(conn, task_id), scope_unit=_worker_scope_unit(conn, task_id),
     )
     if _worker_survived_termination(termination):
         _defer_reclaim_for_live_worker(
@@ -9450,18 +9450,12 @@ def _systemd_worker_scope_required() -> bool:
     """
     if _IS_WINDOWS or sys.platform != "linux" or not os.environ.get("INVOCATION_ID"):
         return False
-    try:
-        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
-    except OSError:
-        # INVOCATION_ID is systemd's explicit process provenance. Fail closed
-        # when procfs is unavailable rather than launching into a service that
-        # may reap the worker on restart.
-        return True
-    return any(
-        line.partition("::")[2].rstrip().endswith(".service")
-        for line in cgroup.splitlines()
-        if "::" in line
-    )
+    # Mirror the exact topology test used by
+    # tools.process_registry.restart_safe_gateway_child_argv, so the cleanup
+    # expectation matches what the spawn actually did.
+    from tools.process_registry import _is_supervised_gateway_process
+
+    return bool(_is_supervised_gateway_process())
 
 
 def _systemd_run_user_scope_available() -> bool:
@@ -9471,40 +9465,22 @@ def _systemd_run_user_scope_available() -> bool:
     return bool(_probe())
 
 
-def _kanban_worker_scope_unit(claim_lock: str) -> str:
-    """Return a deterministic, sanitized transient scope name for one claim."""
-    digest = hashlib.sha256(str(claim_lock).encode("utf-8")).hexdigest()[:16]
-    return f"hermes-kanban-worker-{digest}.scope"
+def _kanban_worker_scope_unit(task_id: str, run_id: Optional[int]) -> str:
+    """Name of the transient scope a managed worker runs in.
+
+    Must match ``tools.process_registry._build_systemd_scope_argv`` fed with
+    the ``unit_suffix`` chosen by ``_restart_safe_worker_argv``; systemd adds
+    the ``.scope`` suffix.  Derived from task and run identity only, so the
+    cleanup side can recompute it without any persisted secret.
+    """
+    return f"hermes-worker-kanban-{task_id}-run-{run_id}.scope"
 
 
-def _build_kanban_worker_scope_argv(cmd: list[str], claim_lock: str) -> list[str]:
-    """Wrap a worker command in its task-owned transient user scope."""
-    binary = shutil.which("systemd-run")
-    if binary is None:
-        raise RuntimeError(
-            "kanban worker transient scope is unavailable: systemd-run not found"
-        )
-    return [
-        binary,
-        "--user",
-        "--scope",
-        "--quiet",
-        "--unit",
-        _kanban_worker_scope_unit(claim_lock),
-        "--collect",
-        "--property",
-        "KillMode=control-group",
-        "--",
-        *cmd,
-    ]
-
-
-def _stop_kanban_worker_scope(claim_lock: str) -> bool:
-    """Stop and verify the exact transient scope for an owned worker claim."""
+def _stop_kanban_worker_scope(unit_name: str) -> bool:
+    """Stop and verify the exact transient scope an owned worker runs in."""
     from tools.process_registry import _stop_systemd_unit
 
-    unit = _kanban_worker_scope_unit(claim_lock)
-    return bool(_stop_systemd_unit(unit) and _systemd_worker_scope_inactive(unit))
+    return bool(_stop_systemd_unit(unit_name) and _systemd_worker_scope_inactive(unit_name))
 
 
 def _systemd_worker_scope_state(unit_name: str) -> Optional[dict[str, str]]:
@@ -9611,6 +9587,52 @@ def _worker_scope_expected(
     return _systemd_worker_scope_required()
 
 
+def _worker_scope_unit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int] = None,
+) -> Optional[str]:
+    """Resolve the transient scope unit for one run, or None when no scope is expected.
+
+    Prefers the unit persisted by the spawn event; otherwise derives it from
+    task and run identity.  Units persisted under the pre-2026-09 naming
+    scheme are ignored, because that name never existed under the upstream
+    spawn path.
+    """
+    if not _worker_scope_expected(conn, task_id, run_id=run_id):
+        return None
+    if run_id is None:
+        row = conn.execute(
+            "SELECT e.payload AS payload, t.current_run_id AS run_id FROM tasks t "
+            "LEFT JOIN task_events e ON e.task_id = t.id "
+            "  AND e.run_id = t.current_run_id AND e.kind = 'spawned' "
+            "WHERE t.id = ? ORDER BY e.id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT payload, run_id FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'spawned' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+    persisted = None
+    resolved_run = run_id
+    if row is not None:
+        if row["run_id"] is not None:
+            resolved_run = int(row["run_id"])
+        if row["payload"]:
+            try:
+                persisted = json.loads(row["payload"]).get("scope_unit")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                persisted = None
+    if isinstance(persisted, str) and persisted.startswith("hermes-worker-"):
+        return persisted
+    if resolved_run is None:
+        return None
+    return _kanban_worker_scope_unit(task_id, resolved_run)
+
+
 def _signal_owned_worker(
     pid: int,
     sig: int,
@@ -9641,6 +9663,7 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
     scope_expected: Optional[bool] = None,
+    scope_unit: Optional[str] = None,
 ) -> dict[str, Any]:
     """Stop a host-local worker and verify its exact ownership boundary."""
     import signal
@@ -9654,6 +9677,7 @@ def _terminate_reclaimed_worker(
         "termination_target": None,
         "scope_stop_attempted": False,
         "scope_stopped": False,
+        "scope_unit": scope_unit,
         "scope_expected": bool(
             _systemd_worker_scope_required()
             if scope_expected is None
@@ -9672,7 +9696,8 @@ def _terminate_reclaimed_worker(
     info["termination_attempted"] = True
     if info["scope_expected"]:
         info["scope_stop_attempted"] = True
-        info["scope_stopped"] = _stop_kanban_worker_scope(str(claim_lock))
+        # Without a resolvable unit the scope cannot be verified: fail closed.
+        info["scope_stopped"] = bool(scope_unit) and _stop_kanban_worker_scope(str(scope_unit))
         if info["scope_stopped"]:
             info["termination_target"] = "systemd_scope"
             # The exact cgroup is authoritative. Once systemd confirms it is
@@ -9821,7 +9846,7 @@ def _prepare_running_worker_cleanup(
     termination = _terminate_reclaimed_worker(
         worker_pid,
         claim_lock,
-        scope_expected=_worker_scope_expected(conn, task_id, run_id),
+        scope_expected=_worker_scope_expected(conn, task_id, run_id), scope_unit=_worker_scope_unit(conn, task_id, run_id),
     )
     if _worker_cleanup_verified(termination):
         return True, identity
@@ -9987,7 +10012,7 @@ def enforce_max_runtime(
             pid,
             row["claim_lock"],
             signal_fn=signal_fn,
-            scope_expected=_worker_scope_expected(conn, tid),
+            scope_expected=_worker_scope_expected(conn, tid), scope_unit=_worker_scope_unit(conn, tid),
         )
         # A timeout is not permission to launch a duplicate beside a worker
         # that survived cleanup. Preserve the claim and retry termination on a
@@ -10126,7 +10151,7 @@ def detect_stale_running(
             pid,
             lock,
             signal_fn=signal_fn,
-            scope_expected=_worker_scope_expected(conn, tid),
+            scope_expected=_worker_scope_expected(conn, tid), scope_unit=_worker_scope_unit(conn, tid),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -10418,6 +10443,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             scope_expected=_worker_scope_expected(
                 conn, row["id"], identity[1],
             ),
+            scope_unit=_worker_scope_unit(conn, row["id"], identity[1]),
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -11038,6 +11064,7 @@ def _stop_spawn_after_pid_persistence_loss(
         )
         termination = _terminate_reclaimed_worker(
             int(pid), task.claim_lock, scope_expected=scope_expected,
+            scope_unit=getattr(pid, "scope_unit", None),
         )
         if _worker_cleanup_verified(termination):
             return True
@@ -11136,29 +11163,8 @@ def _handoff_worker_teardown_pending(
 
     if _worker_scope_expected(conn, task_id, run_id=run_id):
         scope_unit = payload.get("scope_unit")
-        if not isinstance(scope_unit, str) or not scope_unit:
-            claimed = conn.execute(
-                "SELECT payload FROM task_events "
-                "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id, run_id),
-            ).fetchone()
-            try:
-                claimed_payload = (
-                    json.loads(claimed["payload"])
-                    if claimed is not None and claimed["payload"]
-                    else {}
-                )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                claimed_payload = {}
-            claim_lock = (
-                claimed_payload.get("lock")
-                if isinstance(claimed_payload, dict)
-                else None
-            )
-            if not isinstance(claim_lock, str) or not claim_lock:
-                return True
-            scope_unit = _kanban_worker_scope_unit(claim_lock)
+        if not (isinstance(scope_unit, str) and scope_unit.startswith("hermes-worker-")):
+            scope_unit = _kanban_worker_scope_unit(task_id, run_id)
         return not _systemd_worker_scope_unloaded(scope_unit)
 
     worker_pid = payload.get("pid")
@@ -12940,7 +12946,9 @@ def _default_spawn(
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    scoped_cmd = _restart_safe_worker_argv(task, cmd)
+    worker_scoped = scoped_cmd is not cmd
+    cmd = scoped_cmd
 
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
@@ -12954,20 +12962,11 @@ def _default_spawn(
 
     isolation_mode = "process_session"
     scope_unit: Optional[str] = None
-    if _systemd_worker_scope_required():
-        if not _systemd_run_user_scope_available():
-            raise RuntimeError(
-                "kanban worker transient scope is unavailable under a "
-                "systemd-owned dispatcher; refusing to spawn inside the "
-                "external controller's service cgroup"
-            )
-        if not task.claim_lock:
-            raise RuntimeError(
-                "kanban worker transient scope is unavailable: claimed task "
-                "has no claim identity"
-            )
-        scope_unit = _kanban_worker_scope_unit(task.claim_lock)
-        cmd = _build_kanban_worker_scope_argv(cmd, task.claim_lock)
+    if worker_scoped:
+        # The worker runs in the shared restart-safe scope minted by
+        # process_registry; persist its exact name so cleanup, ownership
+        # release and same-card handoff can stop and verify that cgroup.
+        scope_unit = _kanban_worker_scope_unit(task.id, task.current_run_id)
         isolation_mode = "systemd_scope"
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.

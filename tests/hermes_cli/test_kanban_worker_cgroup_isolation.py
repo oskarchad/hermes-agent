@@ -51,10 +51,11 @@ def _prepare_spawn(monkeypatch, tmp_path):
 @pytest.mark.linux_only
 def test_systemd_owned_dispatcher_spawns_worker_in_sibling_scope(monkeypatch, tmp_path):
     kb, workspace = _prepare_spawn(monkeypatch, tmp_path)
-    monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True, raising=False)
-    monkeypatch.setattr(
-        kb, "_systemd_run_user_scope_available", lambda: True, raising=False
-    )
+    from tools import process_registry
+    monkeypatch.setenv("INVOCATION_ID", "test-invocation")
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True, raising=False)
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: True)
 
     captured = {}
 
@@ -81,7 +82,7 @@ def test_systemd_owned_dispatcher_spawns_worker_in_sibling_scope(monkeypatch, tm
     assert "--collect" in captured["cmd"]
     unit_index = captured["cmd"].index("--unit")
     unit_name = captured["cmd"][unit_index + 1]
-    assert unit_name.startswith("hermes-kanban-worker-")
+    assert unit_name.startswith("hermes-worker-kanban-")
     assert "claim-token" not in unit_name
     assert captured["cmd"][captured["cmd"].index("--") + 1] == "hermes"
     assert captured["start_new_session"] is True
@@ -92,17 +93,18 @@ def test_systemd_owned_dispatcher_fails_closed_when_scope_is_unavailable(
     monkeypatch, tmp_path
 ):
     kb, workspace = _prepare_spawn(monkeypatch, tmp_path)
-    monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True, raising=False)
-    monkeypatch.setattr(
-        kb, "_systemd_run_user_scope_available", lambda: False, raising=False
-    )
+    from tools import process_registry
+    monkeypatch.setenv("INVOCATION_ID", "test-invocation")
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True, raising=False)
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
 
     def forbidden_popen(*_args, **_kwargs):
         raise AssertionError("worker must not spawn in the gateway service cgroup")
 
     monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
 
-    with pytest.raises(RuntimeError, match="transient scope.*unavailable"):
+    with pytest.raises(RuntimeError, match="systemd scope.*unavailable"):
         kb._default_spawn(_make_task(kb), str(workspace))
 
 
@@ -125,13 +127,15 @@ def test_reclaim_stops_exact_worker_scope_before_pid_fallback(monkeypatch):
     monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True)
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: state["alive"])
 
+    unit = kb._kanban_worker_scope_unit("t_owned", 3)
     result = kb._terminate_reclaimed_worker(
         12345,
         claim_lock,
         signal_fn=lambda pid, sig: signalled.append((pid, sig)),
+        scope_unit=unit,
     )
 
-    assert stopped == [claim_lock]
+    assert stopped == [unit]
     assert signalled == []
     assert result["terminated"] is True
     assert result["termination_target"] == "systemd_scope"
@@ -155,8 +159,9 @@ def test_scope_stop_requires_inactive_verification(monkeypatch):
         raising=False,
     )
 
-    assert kb._stop_kanban_worker_scope("host:pid:scope-token") is False
-    assert stopped == [kb._kanban_worker_scope_unit("host:pid:scope-token")]
+    unit = kb._kanban_worker_scope_unit("t_probe", 7)
+    assert kb._stop_kanban_worker_scope(unit) is False
+    assert stopped == [unit]
 
 
 @pytest.mark.linux_only
@@ -376,7 +381,7 @@ def test_spawn_event_identifies_scope_without_exposing_claim(monkeypatch, tmp_pa
         task_id = kb.create_task(conn, title="audited spawn", assignee="patch")
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
-        scope_unit = kb._kanban_worker_scope_unit(claimed.claim_lock)
+        scope_unit = kb._kanban_worker_scope_unit(claimed.id, claimed.current_run_id)
         pid = kb._SpawnedWorkerPid(
             67890,
             isolation_mode="systemd_scope",
@@ -459,8 +464,11 @@ def test_timeout_defers_release_when_exact_worker_scope_survives(
 @pytest.mark.linux_only
 def test_scope_unavailable_is_spawn_failure_not_worker_crash(monkeypatch, tmp_path):
     kb, workspace = _prepare_spawn(monkeypatch, tmp_path)
-    monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True)
-    monkeypatch.setattr(kb, "_systemd_run_user_scope_available", lambda: False)
+    from tools import process_registry
+    monkeypatch.setenv("INVOCATION_ID", "test-invocation")
+    monkeypatch.setattr(process_registry, "_IS_LINUX", True, raising=False)
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(process_registry, "_systemd_run_user_scope_available", lambda: False)
     monkeypatch.setattr(kb, "resolve_workspace", lambda _task, board=None: workspace)
 
     conn = kb.connect()
@@ -475,7 +483,7 @@ def test_scope_unavailable_is_spawn_failure_not_worker_crash(monkeypatch, tmp_pa
         assert "spawn_failed" in kinds
         assert "crashed" not in kinds
         failure = next(event for event in events if event.kind == "spawn_failed")
-        assert "external controller's service cgroup" in failure.payload["error"]
+        assert "systemd scope" in failure.payload["error"]
         serialized = json.dumps(failure.payload)
         task = kb.get_task(conn, task_id)
         assert task is not None
@@ -503,7 +511,7 @@ def test_dispatcher_claims_concurrent_tasks_with_distinct_scope_identities(
         assert len(locks) == 2
         assert locks[0] != locks[1]
         assert all(lock.startswith(f"{kb._claimer_id()}:") for lock in locks)
-        assert len({kb._kanban_worker_scope_unit(lock) for lock in locks}) == 2
+        assert kb._kanban_worker_scope_unit(first, 1) != kb._kanban_worker_scope_unit(second, 1)
     finally:
         conn.close()
 
@@ -539,7 +547,7 @@ def test_crash_reclaim_stops_surviving_worker_scope_descendants(
         )
 
         assert kb.detect_crashed_workers(conn) == [task_id]
-        assert stopped == [lock]
+        assert stopped == [kb._kanban_worker_scope_unit(task_id, claimed.current_run_id)]
 
         events = kb.list_events(conn, task_id)
         crash = next(event for event in events if event.kind == "crashed")
@@ -567,7 +575,7 @@ def test_crash_cleanup_failure_preserves_run_and_suppresses_retry_until_verified
             kb._SpawnedWorkerPid(
                 82345,
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(lock),
+                scope_unit=kb._kanban_worker_scope_unit(task_id, claimed.current_run_id),
             ),
         )
         conn.execute(
@@ -637,7 +645,7 @@ def test_manual_reclaim_scope_failure_preserves_ownership(monkeypatch, tmp_path)
             kb._SpawnedWorkerPid(
                 83456,
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(lock),
+                scope_unit=kb._kanban_worker_scope_unit(task_id, claimed.current_run_id),
             ),
         )
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
@@ -723,7 +731,7 @@ def test_delete_rejects_unverified_running_scope_cleanup(monkeypatch, tmp_path):
             kb._SpawnedWorkerPid(
                 87890,
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(claim_lock),
+                scope_unit=kb._kanban_worker_scope_unit(claimed.id, claimed.current_run_id),
             ),
         )
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
@@ -775,7 +783,7 @@ def test_crash_cleanup_identity_swap_defers_replacement_run(monkeypatch, tmp_pat
             kb._SpawnedWorkerPid(
                 88901,
                 isolation_mode="systemd_scope",
-                scope_unit=kb._kanban_worker_scope_unit(old_lock),
+                scope_unit=kb._kanban_worker_scope_unit(task_id, old_run.current_run_id),
             ),
         )
         conn.execute(
@@ -811,7 +819,7 @@ def test_crash_cleanup_identity_swap_defers_replacement_run(monkeypatch, tmp_pat
                     kb._SpawnedWorkerPid(
                         88902,
                         isolation_mode="systemd_scope",
-                        scope_unit=kb._kanban_worker_scope_unit(new_lock),
+                        scope_unit=kb._kanban_worker_scope_unit(task_id, new_run.current_run_id),
                     ),
                 )
                 replacement.update(lock=new_lock, run_id=new_run.current_run_id)
@@ -1249,7 +1257,7 @@ def test_worker_scope_is_reusable_only_after_systemd_unloads_it(
         ),
     )
 
-    assert kb._systemd_worker_scope_unloaded("hermes-kanban-worker-test.scope") is expected
+    assert kb._systemd_worker_scope_unloaded("hermes-worker-kanban-test-run-1.scope") is expected
 
 
 def test_implementation_to_review_waits_for_loaded_source_scope_then_claims(
@@ -1294,7 +1302,7 @@ def test_implementation_to_review_waits_for_loaded_source_scope_then_claims(
         )
         assert implementation is not None
         assert implementation.claim_lock is not None
-        scope_unit = kb._kanban_worker_scope_unit(implementation.claim_lock)
+        scope_unit = kb._kanban_worker_scope_unit(implementation.id, implementation.current_run_id)
         assert kb._set_worker_pid(
             conn,
             task_id,
@@ -1471,5 +1479,127 @@ def test_genuine_spawn_failure_still_trips_failure_budget(monkeypatch, tmp_path)
             and event.payload.get("reason") == "prior_worker_teardown"
             for event in events
         )
+    finally:
+        conn.close()
+
+
+@pytest.mark.linux_only
+def test_shared_scope_stop_failure_blocks_cleanup_even_when_wrapper_pid_is_dead(monkeypatch):
+    """Review gap: a dead wrapper PID must not certify a scope that still holds descendants."""
+    from hermes_cli import kanban_db as kb
+
+    host = kb._claimer_id().split(":", 1)[0]
+    unit = kb._kanban_worker_scope_unit("t_shared", 5)
+    stopped = []
+    monkeypatch.setattr(
+        kb, "_stop_kanban_worker_scope", lambda name: stopped.append(name) or False
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    result = kb._terminate_reclaimed_worker(
+        4321, f"{host}:owned-shared", scope_expected=True, scope_unit=unit
+    )
+    assert stopped == [unit]
+    assert unit.startswith("hermes-worker-kanban-t_shared-run-5")
+    assert result["scope_stop_attempted"] is True
+    assert result["scope_stopped"] is False
+    assert result["cleanup_verified"] is False
+    assert kb._worker_cleanup_verified(result) is False
+
+
+@pytest.mark.linux_only
+def test_handoff_guard_derives_shared_scope_when_spawn_payload_lacks_unit(monkeypatch, tmp_path):
+    """Review gap: the same-card handoff guard must wait for the shared scope, not the wrapper PID."""
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.config as config
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda *_args, **_kwargs: {"kanban": {"review_dispatch": True}},
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True)
+    probed = []
+    monkeypatch.setattr(
+        kb,
+        "_systemd_worker_scope_unloaded",
+        lambda unit: probed.append(unit) or False,
+        raising=False,
+    )
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="derived scope handoff",
+            assignee="patch",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        implementation = kb.claim_task(
+            conn, task_id, claimer=kb._dispatcher_claim_lock(conn, task_id)
+        )
+        assert implementation is not None
+        # Legacy payload shape: bare pid, no persisted unit, wrapper already gone.
+        assert kb._set_worker_pid(conn, task_id, 55555)
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready for review",
+            reviewer="gauge",
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kb._handoff_worker_teardown_pending(conn, task_id) is True
+        assert probed == [
+            kb._kanban_worker_scope_unit(task_id, implementation.current_run_id)
+        ]
+    finally:
+        conn.close()
+
+
+def test_worker_scope_unit_ignores_pre_upstream_persisted_names(monkeypatch, tmp_path):
+    """Units persisted under the old ``hermes-kanban-worker-<sha>`` scheme never existed
+    under the upstream spawn path; cleanup must derive the real one instead."""
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    conn = kb.connect()
+    try:
+        def spawned(title, pid):
+            task_id = kb.create_task(conn, title=title, assignee="patch")
+            claimed = kb.claim_task(conn, task_id)
+            assert claimed is not None
+            assert kb._set_worker_pid(conn, task_id, pid)
+            return task_id, claimed
+
+        legacy_id, legacy = spawned(
+            "legacy unit name",
+            kb._SpawnedWorkerPid(
+                777,
+                isolation_mode="systemd_scope",
+                scope_unit="hermes-kanban-worker-0123456789abcdef.scope",
+            ),
+        )
+        assert kb._worker_scope_unit(conn, legacy_id) == kb._kanban_worker_scope_unit(
+            legacy_id, legacy.current_run_id
+        )
+
+        upstream_id, _ = spawned(
+            "upstream unit name",
+            kb._SpawnedWorkerPid(
+                778,
+                isolation_mode="systemd_scope",
+                scope_unit="hermes-worker-kanban-other-run-9.scope",
+            ),
+        )
+        assert kb._worker_scope_unit(conn, upstream_id) == "hermes-worker-kanban-other-run-9.scope"
+
+        plain_id, _ = spawned(
+            "no scope",
+            kb._SpawnedWorkerPid(779, isolation_mode="process_session", scope_unit=None),
+        )
+        assert kb._worker_scope_unit(conn, plain_id) is None
     finally:
         conn.close()
