@@ -2381,18 +2381,27 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Return a rejection reason when goal-mode completion is premature."""
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
+    """Apply the goal judge to terminal worker handoffs (completion).
+
+    Review handoffs are intermediate and are deliberately NOT judged here
+    (fix: allow goal-mode review handoffs, 9d5895e8b0). Only the reviewer's
+    own completion is judged.
+
+    Returns ``(verdict, reason_or_None)`` — ``"done"`` allows the handoff;
+    ``"blocked"`` means the judge ruled the goal unachievable (#100954);
+    ``"continue"``/``"wait"`` reject with the judge's reason.
+    """
     if task is None or not task.goal_mode:
-        return None
+        return ("done", None)
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
 
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception:
-        return None
+        return ("done", None)
     if client is None or not model:
-        return None
+        return ("done", None)
 
     from hermes_cli.goals import judge_goal
 
@@ -2411,7 +2420,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+    return (verdict, None if verdict == "done" else reason)
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -2448,10 +2457,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # Goal-mode judge gate (mirrors tools/kanban_tools.py). Completion
             # is terminal, so it must satisfy the card's acceptance contract.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            gate_verdict, rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
             )
+            if gate_verdict == "blocked":
+                print(
+                    f"kanban: goal completion of {tid} rejected: judge ruled "
+                    f"the goal unachievable — {rejection}. Re-scope with "
+                    f"kanban edit, or record the block with kanban block "
+                    f"instead of completing.",
+                    file=sys.stderr,
+                )
+                failed.append(tid)
+                continue
             if rejection is not None:
                 print(
                     f"kanban: goal completion of {tid} rejected by judge: {rejection}. "
@@ -3502,8 +3521,10 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         print(f"  corrupt copy quarantined at: {report.backup_path}",
               file=sys.stderr)
     print(
-        "  Recover manually (e.g. `sqlite3 kanban.db \".recover\"` into a "
-        "fresh file) or move the file aside to start a new board.",
+        "  Recover manually (copy kanban.db aside FIRST, then run "
+        "`sqlite3 <copy> \".recover\"` into a fresh file — never against "
+        "the live path, a WAL-reset-vulnerable sqlite3 CLI can corrupt it "
+        "further) or move the file aside to start a new board.",
         file=sys.stderr,
     )
     return 1
