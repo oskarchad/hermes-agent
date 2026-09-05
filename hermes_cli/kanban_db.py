@@ -26,9 +26,133 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from toolsets import get_toolset_names
+from toolsets import (
+    KANBAN_TASK_TOOLSETS_BOUNDED_ENV,
+    MANDATORY_KANBAN_TASK_TOOLSETS,
+    get_toolset_names,
+)
 
 _log = logging.getLogger(__name__)
+
+MAX_TASK_ENABLED_TOOLSETS = 32
+MAX_TASK_TOOLSET_NAME_CHARS = 128
+MANDATORY_TASK_TOOLSETS = MANDATORY_KANBAN_TASK_TOOLSETS
+
+
+def _profile_home_for_task(assignee: Optional[str]) -> Optional[str]:
+    """Best-effort profile home used to validate task-scoped toolsets."""
+    if assignee:
+        try:
+            from hermes_cli.profiles import resolve_profile_env
+
+            return resolve_profile_env(assignee)
+        except (FileNotFoundError, ValueError):
+            pass
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
+    except Exception:
+        return None
+
+
+def _available_task_toolset_names(hermes_home: Optional[str] = None) -> set[str]:
+    """Return built-in/plugin names plus only the target profile's MCP aliases."""
+    names = set(get_toolset_names())
+    try:
+        from tools.registry import registry
+
+        aliases = registry.get_registered_toolset_aliases()
+        live_mcp_names = {
+            alias
+            for alias, target in aliases.items()
+            if str(target).startswith("mcp-")
+        }
+        live_mcp_names.update(
+            str(target)
+            for target in aliases.values()
+            if str(target).startswith("mcp-")
+        )
+        names.difference_update(live_mcp_names)
+        names = {name for name in names if not str(name).startswith("mcp-")}
+    except Exception as exc:
+        _log.debug("kanban task toolsets: live MCP inventory unavailable (%s)", exc)
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import enabled_mcp_server_names
+
+        token = set_hermes_home_override(hermes_home) if hermes_home else None
+        try:
+            names.update(enabled_mcp_server_names(load_config()))
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+    except Exception as exc:
+        _log.debug("kanban task toolsets: profile inventory unavailable (%s)", exc)
+    return names
+
+
+def normalize_enabled_toolsets(
+    value: Any,
+    *,
+    hermes_home: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Validate and normalize a bounded task-level toolset allowlist."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("enabled_toolsets must be a list of toolset names")
+    if len(value) > MAX_TASK_ENABLED_TOOLSETS:
+        raise ValueError(
+            f"enabled_toolsets may contain at most {MAX_TASK_ENABLED_TOOLSETS} entries"
+        )
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise ValueError("enabled_toolsets must contain only strings")
+        name = raw.strip()
+        if not name:
+            raise ValueError("enabled_toolsets entries must not be empty")
+        if len(name) > MAX_TASK_TOOLSET_NAME_CHARS:
+            raise ValueError(
+                "enabled_toolsets names may contain at most "
+                f"{MAX_TASK_TOOLSET_NAME_CHARS} characters"
+            )
+        if any(ord(char) < 32 or char == "," for char in name):
+            raise ValueError("enabled_toolsets names contain an invalid character")
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+
+    available = _available_task_toolset_names(hermes_home)
+    unknown = [name for name in cleaned if name not in available]
+    if unknown:
+        raise ValueError(
+            "unknown toolset name(s) in enabled_toolsets: "
+            + ", ".join(repr(name) for name in unknown)
+        )
+    missing_required = [name for name in MANDATORY_TASK_TOOLSETS if name not in available]
+    if missing_required:
+        raise ValueError(
+            "required task toolset(s) unavailable in assignee profile: "
+            + ", ".join(missing_required)
+        )
+    return cleaned
+
+
+def effective_task_toolsets(requested: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Return exact requested order plus stable mandatory worker minimums."""
+    if requested is None:
+        return None
+    effective = list(requested)
+    for name in MANDATORY_TASK_TOOLSETS:
+        if name not in effective:
+            effective.append(name)
+    return effective
 
 
 # --- Shared micro-helpers (row access, JSON, env, git) ---
@@ -701,6 +825,8 @@ class Task:
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     skills: Optional[list] = None            # None = defaults only; [] = explicitly none
+    enabled_toolsets: Optional[list[str]] = None
+    effective_toolsets: Optional[list[str]] = None
     model_override: Optional[str] = None
     provider_override: Optional[str] = None  # provider ``model_override`` belongs to
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
@@ -720,15 +846,19 @@ class Task:
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        parsed_toolsets = _json_or(g("enabled_toolsets"))
+        enabled_toolsets_value = [str(s) for s in parsed_toolsets if s] if isinstance(parsed_toolsets, list) else None
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
-            **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
+            **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS if col != "enabled_toolsets"},
             **{col: g(col) or None for col in _TASK_EMPTY_IS_NULL_COLUMNS},
             # Pre-migration fallbacks (spawn_failures / last_spawn_error) are only
             # reachable on a DB never opened since the rename migration landed.
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            enabled_toolsets=enabled_toolsets_value,
+            effective_toolsets=effective_task_toolsets(enabled_toolsets_value),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -743,7 +873,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id",
+    "current_step_key", "max_retries", "session_id", "enabled_toolsets",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -892,6 +1022,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    -- Optional bounded toolset allowlist requested for this task. ``None``
+    -- preserves legacy profile inheritance.
+    enabled_toolsets     TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -1223,6 +1356,7 @@ def create_task(
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+    enabled_toolsets: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
@@ -1270,7 +1404,6 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
@@ -1281,6 +1414,11 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    enabled_toolsets_list = normalize_enabled_toolsets(
+        enabled_toolsets,
+        hermes_home=_profile_home_for_task(assignee),
+    )
 
     now = int(time.time())
 
@@ -1314,10 +1452,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, enabled_toolsets, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1325,6 +1463,7 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(enabled_toolsets_list) if enabled_toolsets_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
                     ),
@@ -1345,6 +1484,8 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "enabled_toolsets": enabled_toolsets_list,
+                        "effective_toolsets": effective_task_toolsets(enabled_toolsets_list),
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -1575,6 +1716,50 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
         "reasoning_effort_set", {"reasoning_effort": effort},
         ("reasoning_effort",), archived_msg="cannot set reasoning effort",
     )
+
+
+def set_enabled_toolsets(
+    conn: sqlite3.Connection,
+    task_id: str,
+    enabled_toolsets: Optional[Iterable[str]],
+) -> bool:
+    """Set or clear a bounded task-level worker toolset allowlist."""
+    existing = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not existing:
+        return False
+    normalized = normalize_enabled_toolsets(
+        enabled_toolsets,
+        hermes_home=_profile_home_for_task(existing["assignee"]),
+    )
+    effective = effective_task_toolsets(normalized)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(
+                f"cannot set enabled toolsets on archived task {task_id}"
+            )
+        conn.execute(
+            "UPDATE tasks SET enabled_toolsets = ? WHERE id = ?",
+            (json.dumps(normalized) if normalized is not None else None, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "enabled_toolsets_set",
+            {
+                "inherit_profile": normalized is None,
+                "requested_count": len(normalized or ()),
+                "effective_count": len(effective or ()),
+            },
+        )
+    notify_task_updated(conn, task_id, ("enabled_toolsets",))
+    return True
 
 
 # --- Links ---
@@ -4268,6 +4453,7 @@ _PLUGIN_COMPAT_LAZY = {
     'set_workspace_path': ('hermes_cli.kanban_db_workspace', 'set_workspace_path'),
     'unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'unseen_events_for_sub'),
     'worker_log_rotation_config': ('hermes_cli.kanban_db_dispatch', 'worker_log_rotation_config'),
+    '_default_spawn': ('hermes_cli.kanban_db_dispatch', '_default_spawn'),
 }
 
 

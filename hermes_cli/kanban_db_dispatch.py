@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -23,6 +24,8 @@ from typing import Callable
 from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
+
+from toolsets import KANBAN_TASK_TOOLSETS_BOUNDED_ENV
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -1097,7 +1100,14 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
     """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
     with _kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
@@ -1105,6 +1115,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1515,6 +1526,23 @@ def _dispatch_lane_task(
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
+    _effective_toolsets, _toolsets_error = _validate_task_toolsets_for_spawn(
+        row["enabled_toolsets"], assignee=assignee
+    )
+    if _toolsets_error is not None:
+        blocked = dry_run or _audit_and_block_invalid_task_toolsets(
+            conn,
+            task_id,
+            expected_status=row["status"],
+            expected_assignee=assignee,
+            expected_enabled_toolsets=row["enabled_toolsets"],
+            expected_claim_lock=row["claim_lock"],
+            expected_run_id=row["current_run_id"],
+            expected_worker_pid=row["worker_pid"],
+        )
+        if blocked:
+            result.auto_blocked.append(task_id)
+        return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
@@ -1711,7 +1739,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, status, assignee, enabled_toolsets, claim_lock, current_run_id, worker_pid FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2057,6 +2085,117 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _validate_task_toolsets_for_spawn(
+    raw_value: Any,
+    *,
+    assignee: Optional[str],
+) -> tuple[Optional[list[str]], Optional[str]]:
+    """Validate one persisted allowlist without leaking raw values to events."""
+    if raw_value is None:
+        return None, None
+    try:
+        parsed = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+    except Exception:
+        return None, "malformed_json"
+    try:
+        requested = _kb.normalize_enabled_toolsets(
+            parsed,
+            hermes_home=_kb._profile_home_for_task(assignee),
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "unknown toolset" in message:
+            return None, "unknown_toolset"
+        if "required task toolset" in message:
+            return None, "required_toolset_unavailable"
+        return None, "malformed_value"
+    return _kb.effective_task_toolsets(requested), None
+
+
+def _audit_and_block_invalid_task_toolsets(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_status: str,
+    expected_assignee: Optional[str],
+    expected_enabled_toolsets: Optional[str],
+    expected_claim_lock: Optional[str],
+    expected_run_id: Optional[int],
+    expected_worker_pid: Optional[int],
+) -> bool:
+    """CAS-block an unchanged invalid task before any process is spawned."""
+    reason = (
+        "Invalid enabled_toolsets configuration; edit or clear the task-level "
+        "toolset override before retrying."
+    )
+    with _kb.write_txn(conn):
+        current = conn.execute(
+            "SELECT status, assignee, enabled_toolsets, claim_lock, "
+            "current_run_id, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None or any(
+            (
+                current["status"] != expected_status,
+                current["assignee"] != expected_assignee,
+                current["enabled_toolsets"] != expected_enabled_toolsets,
+                current["claim_lock"] != expected_claim_lock,
+                current["current_run_id"] != expected_run_id,
+                current["worker_pid"] != expected_worker_pid,
+            )
+        ):
+            return False
+        if any(
+            value is not None
+            for value in (
+                expected_claim_lock,
+                expected_run_id,
+                expected_worker_pid,
+            )
+        ):
+            return False
+        _effective, reason_code = _validate_task_toolsets_for_spawn(
+            current["enabled_toolsets"], assignee=current["assignee"]
+        )
+        if reason_code is None:
+            return False
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL, "
+            "block_kind = 'capability', "
+            "block_recurrences = CASE "
+            "WHEN block_kind = 'capability' THEN block_recurrences + 1 ELSE 1 END "
+            "WHERE id = ? AND status = ? AND assignee IS ? "
+            "AND enabled_toolsets IS ? AND claim_lock IS ? "
+            "AND current_run_id IS ? AND worker_pid IS ?",
+            (
+                task_id,
+                expected_status,
+                expected_assignee,
+                expected_enabled_toolsets,
+                expected_claim_lock,
+                expected_run_id,
+                expected_worker_pid,
+            ),
+        )
+        if updated.rowcount != 1:
+            return False
+        _kb._append_event(
+            conn,
+            task_id,
+            "toolsets_validation_failed",
+            {"field": "enabled_toolsets", "reason_code": reason_code},
+        )
+        _kb._append_event(
+            conn,
+            task_id,
+            "blocked",
+            {"reason": reason, "kind": "capability"},
+        )
+    _kb.notify_task_updated(conn, task_id, ("status", "block_kind"))
+    return True
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -2111,7 +2250,14 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     # model at a different depth.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
+    if getattr(task, "enabled_toolsets", None) is not None:
+        requested_toolsets = _kb.normalize_enabled_toolsets(
+            task.enabled_toolsets,
+            hermes_home=hermes_home,
+        )
+        worker_toolsets = _kb.effective_task_toolsets(requested_toolsets)
+    else:
+        worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
@@ -2203,6 +2349,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env.pop(KANBAN_TASK_TOOLSETS_BOUNDED_ENV, None)
+    if getattr(task, "enabled_toolsets", None) is not None:
+        env[KANBAN_TASK_TOOLSETS_BOUNDED_ENV] = "1"
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"

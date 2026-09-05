@@ -269,10 +269,13 @@ def _tool_defs_cache_key(
         cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
+    from toolsets import KANBAN_TASK_TOOLSETS_BOUNDED_ENV
     return (
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
-        bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
+        bool(os.environ.get("HERMES_KANBAN_TASK")),
+        os.environ.get(KANBAN_TASK_TOOLSETS_BOUNDED_ENV) == "1",
+        bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
     )
 
@@ -312,17 +315,44 @@ def _apply_toolset_selection(tools: set, names: List[str], quiet_mode: bool, *, 
 
 def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], quiet_mode: bool) -> set:
     """Tool names requested by the toolset selection (before check_fn filtering)."""
+    from toolsets import (
+        KANBAN_TASK_TOOLSETS_BOUNDED_ENV,
+        MANDATORY_KANBAN_TASK_TOOLSETS,
+        bundle_non_core_tools,
+        get_all_toolsets,
+        get_toolset,
+    )
+
     tools: set = set()
+    dispatcher_worker = bool(
+        os.environ.get("HERMES_KANBAN_TASK")
+        and not _is_delegated_child_context()
+        and _is_dispatcher_owned_worker()
+    )
+    dispatcher_bounded_worker = bool(
+        dispatcher_worker
+        and os.environ.get(KANBAN_TASK_TOOLSETS_BOUNDED_ENV) == "1"
+    )
+    irreducible_worker_toolsets = {"kanban"} if dispatcher_worker else set()
+    if dispatcher_bounded_worker:
+        irreducible_worker_toolsets.update(MANDATORY_KANBAN_TASK_TOOLSETS)
+
     if enabled_toolsets is not None:
         enabled = list(enabled_toolsets)
-        # Dispatcher-spawned kanban workers always get the lifecycle handoff
-        # tools, even when the assignee profile restricts its chat toolsets.
-        if (os.environ.get("HERMES_KANBAN_TASK") and not _is_delegated_child_context()
-                and _is_dispatcher_owned_worker() and "kanban" not in enabled):
-            enabled.append("kanban")
+        if dispatcher_worker:
+            # Every worker retains board lifecycle. Explicitly bounded tasks
+            # additionally retain the ordered Context7 + Kanban minimum shown
+            # in task readback. Legacy NULL tasks keep profile inheritance.
+            ordered_minimum = (
+                MANDATORY_KANBAN_TASK_TOOLSETS
+                if dispatcher_bounded_worker
+                else ("kanban",)
+            )
+            for mandatory_toolset in ordered_minimum:
+                if mandatory_toolset not in enabled:
+                    enabled.append(mandatory_toolset)
         _apply_toolset_selection(tools, enabled, quiet_mode, disable=False)
     else:
-        from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools.update(resolve_toolset(ts_name))
     # Disabled toolsets are always subtracted LAST, so a tool in a disabled
@@ -330,7 +360,23 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
     # This ensures that even if a composite toolset (like hermes-cli) is enabled, any tools belonging to a
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
-        _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
+        disables_to_apply = list(disabled_toolsets)
+        if irreducible_worker_toolsets:
+            # Resolve aliases so "mcp-context7" cannot disable "context7"
+            # on a worker whose bounded task requires context7.
+            filtered_disables = []
+            for name in disables_to_apply:
+                alias_target = registry.get_toolset_alias_target(name)
+                canonical = alias_target or name
+                if name in irreducible_worker_toolsets or canonical in irreducible_worker_toolsets:
+                    continue
+                # Also check reverse: if canonical is an irreducible toolset name
+                if any(registry.get_toolset_alias_target(irr) == canonical for irr in irreducible_worker_toolsets):
+                    continue
+                filtered_disables.append(name)
+            disables_to_apply = filtered_disables
+        if disables_to_apply:
+            _apply_toolset_selection(tools, disables_to_apply, quiet_mode, disable=True)
     return tools
 
 
