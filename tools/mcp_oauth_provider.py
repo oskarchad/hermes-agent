@@ -54,6 +54,16 @@ class HermesProviderMixin:
         if HermesTokenStorage._coerce_secret_auth_method(data):
             self.context.client_info = OAuthClientInformationFull.model_validate(data)
 
+    async def _perform_authorization(self):
+        """Redact callback state before the SDK logs a mismatch failure."""
+        from mcp.client.auth import OAuthFlowError
+        try:
+            return await super()._perform_authorization()
+        except OAuthFlowError as exc:
+            if str(exc).startswith("State parameter mismatch:"):
+                raise OAuthFlowError("OAuth state parameter mismatch") from None
+            raise
+
     async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
         self._coerce_client_secret_post()
         return self._prepare_token_request(await super()._exchange_token_authorization_code(*args, **kwargs))
