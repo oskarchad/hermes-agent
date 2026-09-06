@@ -447,6 +447,17 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "assignee's profile."
             ),
         },
+        "enabled_toolsets": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {"type": "string", "maxLength": 128},
+            "description": (
+                "Optional bounded task-level toolset allowlist. The "
+                "dispatcher adds mandatory lifecycle toolsets and passes "
+                "only the effective list to the worker. Omit to inherit "
+                "the assignee profile's normal CLI toolsets."
+            ),
+        },
         "goal_mode": _prop("boolean", (
                 "Run the dispatched worker in a goal loop. When true, "
                 "after each turn an auxiliary judge checks the worker's "

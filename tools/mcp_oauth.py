@@ -24,7 +24,7 @@ import threading
 import time
 import webbrowser
 from functools import partialmethod
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
@@ -65,6 +65,11 @@ def _sdk_class(name: str) -> Any:
     return _SDK_CLASSES.get(name)
 
 
+def _wait_for_callback():
+    """Await the per-flow waiter on the legacy module-level port (test compatibility shim)."""
+    return _make_callback_waiter(_oauth_port or 0)()
+
+
 try:
     from pydantic import AnyUrl
 except ImportError:
@@ -99,6 +104,13 @@ def _get_token_dir(hermes_home: str | Path | None = None) -> Path:
     from hermes_constants import get_hermes_home
 
     return Path(hermes_home if hermes_home is not None else get_hermes_home()) / "mcp-tokens"
+
+
+def _find_free_port() -> int:
+    """Find an available TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _safe_filename(name: str) -> str:
@@ -167,6 +179,16 @@ def _cached_redirect(storage: "HermesTokenStorage | None") -> "tuple[str | None,
         if port is None and is_loopback_callback and parsed.port is not None:
             port = int(parsed.port)
     return uri, port
+
+
+def _paste_callback_available() -> bool:
+    """Return True only when stdin itself can accept paste-back input."""
+    if not _oauth_interactive_enabled.get():
+        return False
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
 
 
 def _is_interactive() -> bool:
@@ -453,18 +475,71 @@ def _parse_redirect_query(query: str) -> dict[str, Any]:
     return {k: params.get(k, [None])[0] for k in ("code", "state", "error", "iss")}
 
 
+_CALLBACK_REQUEST_TIMEOUT_SECONDS = 0.5
+_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
+_PASTE_READER_POLL_INTERVAL_SECONDS = 0.05
+_PASTE_READER_JOIN_TIMEOUT_SECONDS = 1.0
+
+
+def _try_set_callback_result(
+    result: dict[str, Any],
+    *,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    iss: str | None = None,
+) -> bool:
+    """Atomically latch the first terminal callback result."""
+    if code is None and error is None:
+        return False
+
+    lock = result.get("_lock")
+    if lock is None:
+        if result.get("auth_code") is not None or result.get("error") is not None:
+            return False
+        result.update(auth_code=code, state=state, error=error, iss=iss)
+        return True
+
+    with lock:
+        if result.get("auth_code") is not None or result.get("error") is not None:
+            return False
+        result.update(auth_code=code, state=state, error=error, iss=iss)
+        return True
+
+
+def _callback_result_is_terminal(result: dict[str, Any]) -> bool:
+    lock = result.get("_lock")
+    if lock is None:
+        return result.get("auth_code") is not None or result.get("error") is not None
+    with lock:
+        return result.get("auth_code") is not None or result.get("error") is not None
+
+
 def _result_taken(result: dict) -> bool:
-    return result.get("auth_code") is not None or result.get("error") is not None
+    return _callback_result_is_terminal(result)
 
 
 def _make_callback_handler() -> tuple[type, dict]:
     """Fresh ``(HandlerClass, result_dict)`` per flow so concurrent flows don't stomp on each other."""
-    result: dict[str, Any] = {"auth_code": None, "state": None, "error": None, "iss": None}
+    result: dict[str, Any] = {
+        "auth_code": None, "state": None, "error": None, "iss": None,
+        "_lock": threading.Lock(),
+    }
 
     class _Handler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            self.request.settimeout(_CALLBACK_REQUEST_TIMEOUT_SECONDS)
+            super().setup()
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = _parse_redirect_query(urlparse(self.path).query)
-            result.update(auth_code=parsed["code"], state=parsed["state"], error=parsed["error"], iss=parsed["iss"])
+            _try_set_callback_result(
+                result,
+                code=parsed["code"],
+                state=parsed["state"],
+                error=parsed["error"],
+                iss=parsed["iss"],
+            )
             body = ("<h2>Authorization Successful</h2><p>You can close this tab and return to Hermes.</p>" if parsed["code"]
                     else f"<h2>Authorization Failed</h2><p>Error: {parsed['error'] or 'unknown'}</p>")
             self.send_response(200)
@@ -473,24 +548,95 @@ def _make_callback_handler() -> tuple[type, dict]:
             self.wfile.write(f"<html><body>{body}</body></html>".encode())
 
         def log_message(self, fmt: str, *args: Any) -> None:
-            logger.debug("OAuth callback: %s", fmt % args)
+            logger.debug("OAuth callback HTTP request handled")
 
     return _Handler, result
 
 
-def _paste_callback_reader(result: dict) -> None:
+def _read_windows_paste_line(stop_event: threading.Event) -> str | None:
+    """Poll a Windows console for one line without an uncancellable read."""
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:
+        return None
+    msvcrt: Any = _msvcrt
+
+    chars: list[str] = []
+    while not stop_event.wait(_PASTE_READER_POLL_INTERVAL_SECONDS):
+        while msvcrt.kbhit():
+            if stop_event.is_set():
+                return None
+            char = msvcrt.getwch()
+            if char in {"\r", "\n"}:
+                return "".join(chars) + "\n"
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == "\x1a":
+                return ""
+            if char in {"\x00", "\xe0"}:
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
+            if char == "\b":
+                if chars:
+                    chars.pop()
+                continue
+            chars.append(char)
+    return None
+
+
+def _read_paste_line(stop_event: threading.Event) -> str | None:
+    """Wait for one TTY line while remaining responsive to cancellation."""
+    if os.name == "nt":
+        return _read_windows_paste_line(stop_event)
+
+    try:
+        import select
+
+        stdin_fd = sys.stdin.fileno()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+    line = bytearray()
+    while not stop_event.is_set():
+        try:
+            readable, _, _ = select.select(
+                [stdin_fd], [], [], _PASTE_READER_POLL_INTERVAL_SECONDS
+            )
+        except (OSError, TypeError, ValueError):
+            return None
+        if stop_event.is_set():
+            return None
+        if readable:
+            try:
+                char = os.read(stdin_fd, 1)
+            except OSError:
+                return None
+            if not char:
+                return ""
+            line.extend(char)
+            if char in {b"\r", b"\n"}:
+                return line.decode(
+                    getattr(sys.stdin, "encoding", None) or "utf-8",
+                    errors="replace",
+                )
+    return None
+
+
+def _paste_callback_reader(result: dict, stop_event: threading.Event | None = None) -> None:
     """Read one stdin line as an OAuth redirect (full URL, bare query, or a ``_SKIP_TOKENS`` word that
     exits without auth) into *result*. Parse failures, EOF and interrupts are swallowed — best-effort
     fallback racing the HTTP listener, which stays primary."""
     try:
-        line = sys.stdin.readline()
+        line = sys.stdin.readline() if stop_event is None else _read_paste_line(stop_event)
     except (KeyboardInterrupt, OSError, ValueError):
         return
     line = (line or "").strip()
     if not line or _result_taken(result):
         return  # EOF / blank, or the HTTP listener already won
     if line.lower() in _SKIP_TOKENS:
-        result["error"] = _USER_SKIPPED_SENTINEL
+        if not _try_set_callback_result(result, error=_USER_SKIPPED_SENTINEL):
+            return
         print(
             "  OAuth skipped. Run `hermes mcp login <server>` later to authenticate, "
             "or set ``enabled: false`` on that server in config.yaml to disable persistently.",
@@ -506,9 +652,8 @@ def _paste_callback_reader(result: dict) -> None:
     if not parsed["code"] and not parsed["error"]:
         print("  Pasted input did not contain ``code=`` or ``error=`` — ignoring.", file=sys.stderr)
         return
-    if _result_taken(result):  # one more race-check before writing
+    if not _try_set_callback_result(result, code=parsed["code"], state=parsed["state"], error=parsed["error"], iss=parsed["iss"]):
         return
-    result.update(auth_code=parsed["code"], state=parsed["state"], error=parsed["error"], iss=parsed["iss"])
     if parsed["code"]:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 
@@ -582,12 +727,12 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     return _redirect_handler
 
 
-def _start_callback_server(port: int, handler_cls: type) -> HTTPServer:
+def _start_callback_server(port: int, handler_cls: type) -> ThreadingHTTPServer:
     """Bind the callback listener on *port*, adopting a parked reserved socket (closes the select→bind
     TOCTOU window). ``allow_reuse_address`` is set BEFORE binding (a no-op afterwards) so a lingering
     TIME_WAIT socket from a previous flow cannot block the next."""
     try:
-        server = HTTPServer(("127.0.0.1", port), handler_cls, bind_and_activate=False)
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls, bind_and_activate=False)
         reserved = _reserved_sockets.pop(port, None)
         if reserved is not None:
             server.socket.close()
@@ -653,21 +798,43 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
             "context); skipping browser authorization without binding a callback listener.")
         handler_cls, result = _make_callback_handler()
         server = _start_callback_server(port, handler_cls)
-        threading.Thread(target=server.handle_request, daemon=True).start()
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+        )
+        server_thread.start()
         # Paste fallback races the HTTP listener; whichever fills result first wins.
-        if _is_interactive():
+        paste_thread: threading.Thread | None = None
+        paste_stop = threading.Event()
+        if _paste_callback_available():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` portion) and press Enter. "
                 "Type ``skip`` + Enter to continue without this server:",
                 file=sys.stderr, flush=True)
-            threading.Thread(target=_paste_callback_reader, args=(result,), daemon=True).start()
+            paste_thread = threading.Thread(
+                target=_paste_callback_reader,
+                args=(result, paste_stop),
+                name=f"mcp-oauth-paste-{port}",
+                daemon=True,
+            )
+            paste_thread.start()
         elapsed = 0.0
         try:
             while elapsed < timeout and not _result_taken(result):
                 await asyncio.sleep(0.5)
                 elapsed += 0.5
         finally:
+            paste_stop.set()
+            if paste_thread is not None:
+                paste_thread.join(timeout=_PASTE_READER_JOIN_TIMEOUT_SECONDS)
+                if paste_thread.is_alive():
+                    logger.warning("OAuth paste reader did not stop promptly")
+            server.shutdown()
             server.server_close()
+            server_thread.join(timeout=_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS)
+            if server_thread.is_alive():
+                logger.warning("OAuth callback listener did not stop promptly")
         return _callback_outcome(result, cimd_url)
 
     return _wait

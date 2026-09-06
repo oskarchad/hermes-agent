@@ -173,6 +173,9 @@ _SPECS = [
              help="Skill to force-load into the worker (repeatable). The kanban "
                   "lifecycle is already injected automatically. Example: --skill "
                   "translation --skill github-code-review"),
+        _arg("--toolset", action="append", default=[], dest="enabled_toolsets",
+             help="Bound this task's worker tools to a named toolset "
+                  "(repeatable). Required lifecycle toolsets are added automatically."),
         _arg("--max-retries", type=int, metavar="N",
              help="Per-task override for the consecutive-failure "
                   f"circuit breaker. Trip on the Nth failure — e.g. --max-retries 1 blocks on the "
@@ -238,6 +241,12 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-toolsets", [
+        _TASK_ID,
+        _arg("toolsets", nargs="*", help="Named toolsets to allow for the worker"),
+        _arg("--clear", action="store_true", help="Clear the override and inherit the assignee profile toolsets"),
+        _json_flag(),
+    ], help="Set or clear a task's bounded worker toolset allowlist"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
