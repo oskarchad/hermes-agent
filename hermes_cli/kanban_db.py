@@ -210,6 +210,23 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
+
+CAPTAIN_STATS_PROFILE_CAP = 20
+
+CAPTAIN_REPORT_KINDS: frozenset[str] = frozenset({
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "captain_signal",
+})
+
+CAPTAIN_SIGNAL_HEADERS: tuple[tuple[str, str], ...] = (
+    ("METHOD DELTA", "method_delta"),
+    ("DECISION REQUIRED", "decision_required"),
+    ("CAPTAIN NOTE", "captain_note"),
+)
+CAPTAIN_SIGNAL_CLASSES: frozenset[str] = frozenset(
+    cls for _, cls in CAPTAIN_SIGNAL_HEADERS
+)
+
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
@@ -1402,6 +1419,67 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def resolve_captain_profile() -> str:
+    """Resolve the configured logical Captain for a newly rooted task tree."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli import profiles as profiles_mod
+
+        cfg = load_config() or {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        explicit = str(kanban_cfg.get("orchestrator_profile") or "").strip()
+        if explicit and profiles_mod.profile_exists(explicit):
+            return _normalize_captain_profile(explicit)
+    except Exception:
+        pass
+    return "default"
+
+
+def _resolve_captain_ownership(
+    conn: sqlite3.Connection,
+    parents: tuple[str, ...],
+    *,
+    requested_profile: Optional[str],
+    requested_origin: Optional[str],
+    tenant: Optional[str],
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Resolve one immutable Captain owner for a root or descendant task."""
+    parent_rows: list[sqlite3.Row] = []
+    if parents:
+        placeholders = ",".join("?" * len(parents))
+        parent_rows = conn.execute(
+            "SELECT task_id, profile, origin_session_key, tenant "
+            "FROM kanban_captain_registry "
+            f"WHERE task_id IN ({placeholders}) ORDER BY task_id",
+            parents,
+        ).fetchall()
+    if parent_rows:
+        profiles = {str(row["profile"]) for row in parent_rows}
+        origins = {
+            str(row["origin_session_key"])
+            for row in parent_rows
+            if row["origin_session_key"]
+        }
+        tenants = {str(row["tenant"]) for row in parent_rows if row["tenant"]}
+        if len(profiles) != 1:
+            raise ValueError("parent tasks have conflicting Captain profiles")
+        if len(origins) > 1:
+            raise ValueError("parent tasks have conflicting Captain origins")
+        if len(tenants) > 1:
+            raise ValueError("parent tasks have conflicting Captain tenants")
+        inherited_tenant = next(iter(tenants), None)
+        if tenant and inherited_tenant and str(tenant) != inherited_tenant:
+            raise ValueError("child tenant conflicts with parent Captain tenant")
+        return (
+            next(iter(profiles)),
+            next(iter(origins), None),
+            str(tenant) if tenant else inherited_tenant,
+        )
+
+    profile = requested_profile or resolve_captain_profile()
+    return _normalize_captain_profile(profile), requested_origin, tenant
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1415,6 +1493,8 @@ def create_task(
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    captain_profile: Optional[str] = None,
+    captain_origin_session_key: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1456,6 +1536,13 @@ def create_task(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
+    captain_profile, captain_origin_session_key, tenant = _resolve_captain_ownership(
+        conn,
+        parents,
+        requested_profile=captain_profile,
+        requested_origin=captain_origin_session_key,
+        tenant=tenant,
+    )
     skills_list = _normalize_task_skills(skills)
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1546,6 +1633,13 @@ def create_task(
                 )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            register_captain_owner(
+                conn,
+                task_id,
+                profile=captain_profile,
+                origin_session_key=captain_origin_session_key,
+                tenant=tenant,
+            )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -1916,22 +2010,105 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+def add_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    _materialize_captain_signal: bool = True,
+) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     now = int(time.time())
-    # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
-    # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         _require_task(conn, task_id)
+        normalized_author = author.strip()
+        normalized_body = body.strip()
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
+            "VALUES (?, ?, ?, ?)", (task_id, normalized_author, normalized_body, now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        signal_class = (
+            _classify_captain_signal(normalized_body)
+            if _materialize_captain_signal
+            else None
+        )
+        if signal_class is not None:
+            materialize_captain_signal(
+                conn,
+                task_id=task_id,
+                comment_id=comment_id,
+                author=normalized_author,
+                signal_class=signal_class,
+            )
+        return comment_id
+
+
+def _classify_captain_signal(body: str) -> Optional[str]:
+    """Recognize a strategic Captain signal header at the start of a comment."""
+    stripped = body.strip()
+    for header, signal_class in CAPTAIN_SIGNAL_HEADERS:
+        if stripped.startswith(header):
+            tail = stripped[len(header):]
+            if not tail or tail[0] in (":", "-", "—", " ", "\n", "\t"):
+                return signal_class
+    return None
+
+
+def materialize_captain_signal(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    comment_id: int,
+    author: str,
+    signal_class: str,
+) -> Optional[int]:
+    """Materialize one durable Captain report for an immutable comment source."""
+    if signal_class not in CAPTAIN_SIGNAL_CLASSES:
+        raise ValueError(f"unknown Captain signal class {signal_class!r}")
+    with write_txn(conn, allow_nested=True):
+        comment = conn.execute(
+            "SELECT 1 FROM task_comments WHERE id = ? AND task_id = ?",
+            (int(comment_id), task_id),
+        ).fetchone()
+        if comment is None:
+            raise ValueError(f"unknown comment {comment_id} for task {task_id}")
+        if conn.execute(
+            "SELECT 1 FROM kanban_captain_registry WHERE task_id = ?",
+            (task_id,),
+        ).fetchone() is None:
+            return None
+        existing = conn.execute(
+            "SELECT event_id FROM kanban_captain_inbox WHERE source_comment_id = ?",
+            (int(comment_id),),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["event_id"])
+        return _append_event(
+            conn,
+            task_id,
+            "captain_signal",
+            {
+                "author": author.strip(),
+                "comment_id": int(comment_id),
+                "signal_class": signal_class,
+            },
+            source_comment_id=int(comment_id),
+        )
+
+
+def get_comment(conn: sqlite3.Connection, comment_id: int) -> Optional[Comment]:
+    """Return one immutable comment source by its board-local id."""
+    row = conn.execute(
+        "SELECT id, task_id, author, body, created_at FROM task_comments WHERE id = ?",
+        (int(comment_id),),
+    ).fetchone()
+    return Comment.from_row(row) if row else None
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -2089,12 +2266,38 @@ def _insert_comment(
 def _append_event(
     conn: sqlite3.Connection, task_id: str, kind: str, payload: Optional[dict] = None, *,
     run_id: Optional[int] = None,
-) -> None:
+    source_comment_id: Optional[int] = None,
+) -> int:
     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
-    conn.execute(
+    now = int(time.time())
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
+        "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), now),
     )
+    event_id = int(cur.lastrowid)
+    if kind in CAPTAIN_REPORT_KINDS:
+        reg = conn.execute(
+            "SELECT profile, tenant FROM kanban_captain_registry WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if reg is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO kanban_captain_inbox "
+                "(event_id, profile, task_id, kind, source_comment_id, tenant, "
+                "state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    event_id,
+                    reg["profile"],
+                    task_id,
+                    kind,
+                    source_comment_id,
+                    reg["tenant"],
+                    now,
+                    now,
+                ),
+            )
+    return event_id
 
 
 def _end_run(
@@ -3953,6 +4156,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
+    captain_gc_task_if_settled(conn, task_id)
     return True
 
 
@@ -4340,10 +4544,42 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    cap_row = conn.execute(
+        "SELECT COUNT(*) AS n, MIN(created_at) AS oldest "
+        "FROM kanban_captain_inbox WHERE state != 'acked'"
+    ).fetchone()
+    cap_count = int(cap_row["n"]) if cap_row and cap_row["n"] is not None else 0
+    cap_oldest = (
+        (now - int(cap_row["oldest"]))
+        if cap_row and cap_row["oldest"] is not None else None
+    )
+
+    per_profile: list[dict] = []
+    for row in conn.execute(
+        "SELECT profile, COUNT(*) AS n, MIN(created_at) AS oldest "
+        "FROM kanban_captain_inbox WHERE state != 'acked' "
+        "GROUP BY profile ORDER BY n DESC, oldest ASC, profile ASC"
+    ):
+        per_profile.append({
+            "profile": row["profile"],
+            "count": int(row["n"]),
+            "oldest_age_seconds": (
+                now - int(row["oldest"]) if row["oldest"] is not None else None
+            ),
+        })
+    profiles_truncated = max(0, len(per_profile) - CAPTAIN_STATS_PROFILE_CAP)
+    by_profile = per_profile[:CAPTAIN_STATS_PROFILE_CAP]
+
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "captain_unreported": {
+            "count": cap_count,
+            "oldest_age_seconds": cap_oldest,
+            "by_profile": by_profile,
+            "profiles_truncated": profiles_truncated,
+        },
         "now": now,
     }
 
@@ -4401,9 +4637,21 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     """Delete events older than the cutoff on done/archived tasks only; returns the count."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
+        conn.execute(
+            "DELETE FROM kanban_captain_inbox "
+            "WHERE state = 'acked' AND updated_at < ?",
+            (cutoff,),
+        )
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND id NOT IN (SELECT event_id FROM kanban_captain_inbox "
+            "               WHERE state != 'acked')",
+            (cutoff,),
+        )
+        conn.execute(
+            "DELETE FROM kanban_captain_receivers WHERE last_seen < ?",
+            (cutoff,),
         )
     return int(cur.rowcount or 0)
 
