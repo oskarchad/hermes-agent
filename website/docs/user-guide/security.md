@@ -141,6 +141,35 @@ Like the rest of the approval config, changes take effect immediately (the confi
 Deny rules are a guardrail against an honest-but-wrong agent, the same threat model as the dangerous-pattern detector. They are not a sandbox against a deliberately adversarial process — for that, use an isolated backend (Docker, Modal) or an egress-restricted environment.
 :::
 
+### Command-Aware Deny (`approvals.deny_commands`)
+
+To block a command without blocking PR descriptions that mention it, opt in to
+`approvals.deny_commands` (default `[]`). Currently the only supported selector
+is exactly `gh pr merge`:
+
+```yaml
+approvals:
+  deny_commands:
+    - 'gh pr merge'
+```
+
+This selector recognizes executable command positions, including binary paths,
+repository flags, compound commands, shell `-c` strings, `eval`, and active
+command substitutions (including inside double quotes). Single-quoted data and
+ordinary PR body text such as `Do not execute gh pr merge 6; release needs
+approval.` do not match. The same backend scope and unconditional precedence
+as `approvals.deny` apply: yolo, mode off, and permanent approvals cannot
+override it. Invalid types or unsupported selectors return an explicit blocked
+configuration error; malformed or over-limit command inspection fails closed.
+
+Legacy `approvals.deny` glob semantics are unchanged. To migrate a broad merge
+glob, replace only that rule with the selector and retain unrelated deny entries;
+keeping the broad glob still blocks prose. The mtime-keyed config loader picks
+up the setting without a session restart on a runtime supporting this key.
+Before rolling back to a runtime without this key, restore the old merge glob
+first. This is a guardrail, not a shell interpreter: arbitrary variables,
+aliases, scripts on disk, and programs using other GitHub APIs are not resolved.
+
 ### Approval Timeout
 
 When a dangerous command prompt appears, the user has a configurable amount of time to respond. If no response is given within the timeout, the command is **denied** by default (fail-closed).
