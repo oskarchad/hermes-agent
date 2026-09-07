@@ -1061,14 +1061,14 @@ def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool) -> None:
 
 
 def _resolve_target_transport(
-    job: dict, platform, platform_name: str, target: dict, adapters, config):
+    job: dict, platform, platform_name: str, target: dict, adapters, config, *, routes=None):
     """Resolve ``(transport, pconfig, runtime_adapter, target_adapters)`` for one target, or
     ``(None, error)`` when it cannot be served (relay-fronted with no live transport, or not
     configured/enabled)."""
     from gateway.delivery import DeliveryTransport, resolve_delivery_transport
     from cron.delivery_routes import ExplicitRouteAdapters, configured_routes, route_for
     try:
-        route = route_for(target, configured_routes())
+        route = route_for(target, configured_routes() if routes is None else routes)
     except Exception:
         return None, "explicit cron delivery route configuration unavailable or invalid"
     expected = route_for(target, job.get("_cron_delivery_route_bindings", []))
@@ -1076,7 +1076,7 @@ def _resolve_target_transport(
             route is None or route["adapter_profile"] != expected["adapter_profile"]):
         return None, "explicit cron delivery route changed since dispatch"
     if route is not None:
-        adapter = (adapters.get(platform, target)
+        adapter = (adapters.get_explicit(platform, route)
                    if isinstance(adapters, ExplicitRouteAdapters) else None)
         if adapter is None:
             return None, "explicit cron delivery route has no active allowed adapter"
@@ -1526,9 +1526,11 @@ def _prepare_target_delivery(
         mirror_this_target and _inchannel_seed_allowed(is_dm=is_dm_target, user_id=origin_user_id))
     from cron.delivery_routes import configured_routes, route_for
     try:
-        explicit_route = route_for(target, configured_routes()) is not None
+        routes = configured_routes()
     except Exception:
-        explicit_route = True
+        _note_target_error(job, "explicit cron delivery route configuration unavailable or invalid", delivery_errors)
+        return None
+    explicit_route = route_for(target, routes) is not None
     if explicit_route:
         # Cross-profile transport does not transfer conversation ownership or open new threads.
         mirror_this_target = inchannel_continuable = False
@@ -1541,11 +1543,17 @@ def _prepare_target_delivery(
         return None
 
     resolved, resolve_err = _resolve_target_transport(
-        job, platform, platform_name, target, adapters, config)
+        job, platform, platform_name, target, adapters, config, routes=routes)
     if resolved is None:
         _note_target_error(job, resolve_err, delivery_errors)
         return None
     transport, pconfig, runtime_adapter, target_adapters = resolved
+    if explicit_route:
+        # Only this validated platform block travels with the live transport. All other
+        # delivery settings remain the owner's; no target-profile config is loaded.
+        import copy
+        config = copy.copy(config)
+        config.platforms = {**config.platforms, platform: pconfig}
 
     # Live send needs a RUNNING loop, not just an adapter. Computed ONCE so the in_channel
     # thread_id clear below stays in lockstep with the seed (standalone cannot seed flat).

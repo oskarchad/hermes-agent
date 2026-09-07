@@ -60,17 +60,22 @@ class ExplicitRouteAdapters:
             return default
         route = route_for(target, configured_routes())
         if route is not None:
-            name = route["adapter_profile"]
-            if name not in self.allowed_profiles():
-                return default
-            adapter = self.profiles.get(name, {}).get(platform)
-            if (adapter is None or getattr(adapter, "is_connected", False) is not True
-                    or not getattr(getattr(adapter, "config", None), "enabled", False)):
-                return default
-            return adapter
+            return self.get_explicit(platform, route, default)
         if isinstance(self.legacy, SharedRouteAdapters):
             return self.legacy.get(platform, target, default)
         return (self.legacy or {}).get(platform, default)
+
+
+    def get_explicit(self, platform, route, default=None):
+        """Resolve exactly the caller-validated route; never reread config or use legacy."""
+        name = route["adapter_profile"]
+        if name not in self.allowed_profiles():
+            return default
+        adapter = self.profiles.get(name, {}).get(platform)
+        if (adapter is None or getattr(adapter, "is_connected", False) is not True
+                or not getattr(getattr(adapter, "config", None), "enabled", False)):
+            return default
+        return adapter
 
 
 def adapters_for_profile(profile_name, *, primary, profiles, default_profile="default",
@@ -101,7 +106,7 @@ def preflight_snapshot(adapters):
     from gateway.config import Platform
     records = []
     for route in configured_routes():
-        adapter = (adapters.get(Platform(route["platform"]), route)
+        adapter = (adapters.get_explicit(Platform(route["platform"]), route)
                    if isinstance(adapters, ExplicitRouteAdapters) else None)
         records.append({**route, "available": adapter is not None})
     return records

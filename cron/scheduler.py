@@ -1452,11 +1452,12 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
     try:
         if _cron_preflight_enabled(cfg):
             _pf_reason = _preflight_job_config(job, cfg)
-            if not _pf_reason and job.get("preflight_alerted"):
-                # Config healthy again: clear alert-once marker so a future break re-alerts.
-                with contextlib.suppress(Exception):
-                    from cron.jobs import clear_preflight_alerted
-                    clear_preflight_alerted(job_id)
+        if not _pf_reason and job.get("preflight_alerted"):
+            # The mandatory route gate has also passed; disabled optional preflight
+            # must not leave its previous alert bit stuck after recovery.
+            with contextlib.suppress(Exception):
+                from cron.jobs import clear_preflight_alerted
+                clear_preflight_alerted(job_id)
     except Exception:
         # Fail open: the validator must never take down a runnable job.
         logger.debug("Job '%s': preflight validation errored — failing open", job_id, exc_info=True)
@@ -1464,29 +1465,8 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
     if not _pf_reason:
         return None
 
-    logger.warning(
-        "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
-        job_name, job_id, _pf_reason)
-    already_alerted = False
-    try:
-        from cron.jobs import mark_preflight_alerted
-        already_alerted = mark_preflight_alerted(job_id)
-    except Exception:
-        logger.debug("Job '%s': could not persist preflight alert marker", job_id, exc_info=True)
-    marker = BLOCKED_CONFIG_SILENT_MARKER if already_alerted else BLOCKED_CONFIG_MARKER
-    blocked_doc = (
-        f"# Cron Job: {job_name}\n\n"
-        f"**Job ID:** {job_id}\n"
-        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"**Status:** BLOCKED (configuration)\n\n"
-        "Pre-dispatch validation found a configuration problem and "
-        "the agent was NOT run (no tokens spent).\n\n"
-        f"**Reason:** {_pf_reason}\n\n"
-        "The job will stay blocked (without re-alerting) until the "
-        "configuration is fixed; the next healthy run clears this "
-        "state. Set `cron.preflight: false` in config.yaml to disable this validation."
-    )
-    return False, blocked_doc, "", f"{marker} {_pf_reason}"
+    from cron.scheduler_preflight import _blocked_config_result
+    return _blocked_config_result(job_id, job_name, _pf_reason)
 
 
 def _resolve_job_runtime(
@@ -2312,7 +2292,11 @@ def run_job(
     from cron.delivery_routes import check_explicit_delivery
     route_error, _ = check_explicit_delivery(job)
     if route_error:
-        return False, "", "", f"{BLOCKED_CONFIG_MARKER} {route_error}"
+        from cron.scheduler_preflight import _blocked_config_result
+        return _blocked_config_result(job_id, job_name, route_error, mandatory=True)
+    if job.get("preflight_alerted") and (job.get("no_agent") or job.get("kind") == "monitor"):
+        from cron.jobs import clear_preflight_alerted
+        clear_preflight_alerted(job_id)
 
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:

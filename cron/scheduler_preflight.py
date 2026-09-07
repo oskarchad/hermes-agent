@@ -214,6 +214,35 @@ class SharedRouteAdapters:
         return default
 
 
+def _blocked_config_result(job_id, job_name, reason, *, mandatory=False):
+    """Shared persisted alert-once result for both optional preflight and mandatory route checks."""
+    logger.warning(
+        "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
+        job_name, job_id, reason)
+    already_alerted = False
+    try:
+        from cron.jobs import mark_preflight_alerted
+        already_alerted = mark_preflight_alerted(job_id)
+    except Exception:
+        logger.debug("Job '%s': could not persist preflight alert marker", job_id, exc_info=True)
+    marker = BLOCKED_CONFIG_SILENT_MARKER if already_alerted else BLOCKED_CONFIG_MARKER
+    blocked_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_sched._hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"**Status:** BLOCKED (configuration)\n\n"
+        "Pre-dispatch validation found a configuration problem and "
+        "the agent was NOT run (no tokens spent).\n\n"
+        f"**Reason:** {reason}\n\n"
+        "The job will stay blocked (without re-alerting) until the "
+        "configuration is fixed; the next healthy run clears this "
+        "state."
+        + (" This route safety check cannot be disabled by cron.preflight." if mandatory else
+           " Set `cron.preflight: false` in config.yaml to disable this validation.")
+    )
+    return False, blocked_doc, "", f"{marker} {reason}"
+
+
 def _preflight_check_delivery(job: dict) -> Optional[str]:
     """Check delivery targets resolve to configured platforms. ``local``/``origin``/``all`` are
     never checked (no gateway-config load). Unknown platform always blocks; known platform blocks

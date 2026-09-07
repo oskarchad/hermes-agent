@@ -99,6 +99,23 @@ def test_multiplex_explicit_target_uses_only_selected_active_adapter(route_env, 
         with delivery_preflight_scope(view):
             assert _preflight_check_delivery(job)
     (home / 'config.yaml').write_text(yaml.safe_dump(cfg))
+    # A config edit after the one route read must not trigger a second lookup's
+    # legacy fallback or select a different profile inside the same attempt.
+    import cron.delivery_routes as routing
+    real_routes = routing.configured_routes
+    other = SimpleNamespace(config=PlatformConfig(enabled=True), is_connected=True)
+    view.profiles['other'] = {Platform.DISCORD: other}
+    for changed_routes in [[], [dict(route, adapter_profile='other')]]:
+        def edit_after_read():
+            current = real_routes()
+            (home / 'config.yaml').write_text(yaml.safe_dump(
+                {'cron': {'delivery_routes': changed_routes}}))
+            return current
+        with monkeypatch.context() as scoped:
+            scoped.setattr(routing, 'configured_routes', edit_after_read)
+            resolved, error = resolve()
+            assert error is None and resolved[2] is adapter
+        (home / 'config.yaml').write_text(yaml.safe_dump(cfg))
     view.profiles['otto'].clear()
     assert resolve()[0] is None
     assert job == before_job and dict(os.environ) == before_env
@@ -123,6 +140,8 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
     # Fixture-only secret: no real token is loaded or needed by this network-free test.
     (otto / '.env').write_text('DISCORD_BOT_TOKEN=fixture-otto-not-for-worker\n')
     (otto / 'config.yaml').write_text('{}\n')
+    cfg['platforms'] = {'discord': {'enabled': False}}
+    (home / 'config.yaml').write_text(yaml.safe_dump(cfg))
     script_dir = home / 'scripts'
     script_dir.mkdir()
     ran = tmp_path / 'ran'
@@ -203,3 +222,27 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
         set_multiplex_active(previous_multiplex)
     assert all(os.environ.get(key) == value for key, value in original_env.items())
     assert "DISCORD_BOT_TOKEN" not in os.environ
+
+
+def test_mandatory_route_block_alerts_once_then_rearms_after_recovery(route_env, monkeypatch):
+    from cron import scheduler
+    from cron.delivery_routes import delivery_preflight_scope
+    from cron.jobs import create_job, get_job, use_cron_store
+    from cron.scheduler_preflight import BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER
+
+    home, otto, cfg, adapter = route_env
+    cfg['cron']['preflight'] = False
+    (home / 'config.yaml').write_text(yaml.safe_dump(cfg))
+    scripts = home / 'scripts'
+    scripts.mkdir()
+    (scripts / 'probe.py').write_text('print("recovered")\n')
+    view = multiplex_view(home, otto, adapter, monkeypatch)
+    with use_cron_store(home):
+        job = create_job(prompt=None, schedule='every 1h', script='probe.py', no_agent=True,
+                         deliver='discord:123456789', failure_deliver='local')
+        assert scheduler.run_job(job)[3].startswith(BLOCKED_CONFIG_MARKER)
+        assert scheduler.run_job(get_job(job['id']))[3].startswith(BLOCKED_CONFIG_SILENT_MARKER)
+        with delivery_preflight_scope(view):
+            assert scheduler.run_job(get_job(job['id']))[0] is True
+        assert not get_job(job['id']).get('preflight_alerted')
+        assert scheduler.run_job(get_job(job['id']))[3].startswith(BLOCKED_CONFIG_MARKER)
