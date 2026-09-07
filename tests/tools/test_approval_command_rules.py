@@ -91,6 +91,43 @@ from tools.approval_context import _get_approval_config
     ('gh pr create --body-file - <<BODY\n$(gh pr merge 6)\nBODY', True),
     ("bash <<'BODY'\ngh pr merge 6\nBODY", True),
     ("gh pr create --body-file - <<'BODY'\nplain text\nBODY\ngh pr merge 6", True),
+    pytest.param('case x in x) gh pr merge 6;; esac', True, id="gauge-case-arm"),
+    ('case x in x) echo "gh pr merge 6";; esac', False),
+    ('gh pr create --body "case x in x) gh pr merge 6;; esac"', False),
+    pytest.param('command -- gh pr merge 6', True, id="gauge-command-terminator"),
+    ('command -- gh pr create --body "gh pr merge 6"', False),
+    ('command -v gh pr merge', False),
+    pytest.param('env ' * 13 + 'gh pr merge 6', True, id="gauge-wrapper-limit"),
+    ('echo "' + 'env ' * 13 + 'gh pr merge 6"', False),
+    pytest.param("bash <<< 'gh pr merge 6'", True, id="gauge-shell-here-string"),
+    ("<<< 'gh pr merge 6' bash", True),
+    ("bash -s -- arg <<< 'gh pr merge 6'", True),
+    ("bash -- <<< 'gh pr merge 6'", True),
+    ("bash 0<<< 'gh pr merge 6'", True),
+    ("cat <<< 'gh pr merge 6'", False),
+    ("bash -c 'cat' <<< 'gh pr merge 6'", False),
+    ("bash <<< 'gh pr merge 6' -c 'cat'", False),
+    ("bash script.sh <<< 'gh pr merge 6'", False),
+    ("bash 3<<< 'gh pr merge 6'", False),
+    pytest.param("bash -c 'gh pr create --body-file -' <<'BODY'\ngh pr merge 6\nBODY", False,
+                 id="gauge-shell-c-heredoc-data"),
+    ("bash -c 'gh pr create --body-file -' <<'BODY'\nDo not execute gh pr merge 6; release needs approval.\nBODY", False),
+    ("bash script.sh <<'BODY'\ngh pr merge 6\nBODY", False),
+    ("bash <<'BODY' -c 'cat'\ngh pr merge 6\nBODY", False),
+    ("bash -s -- arg <<'BODY'\ngh pr merge 6\nBODY", True),
+    ("bash <<'BODY'; cat\ngh pr merge 6\nBODY", True),
+    ("cat <<'BODY'; bash\ngh pr merge 6\nBODY", False),
+    ("bash -c 'cat' <<BODY\n'$(gh pr merge 6)'\nBODY", True),
+    ("cat <<< \"$(gh pr merge 6)\"", True),
+    pytest.param("eval -- 'gh pr merge 6'", True, id="gauge-eval-terminator"),
+    ("eval -- 'echo \"gh pr merge 6\"'", False),
+    ('gh pr create --body "eval -- gh pr merge 6"', False),
+    pytest.param("gh $'pr' $'merge' 6", True, id="gauge-ansi-literal"),
+    ("$'gh' p$'r' m$'erge' 6", True),
+    (r"gh $'p\x72' merge 6", True),  # Unsupported executable quoting fails closed.
+    ("gh pr create --body $'gh pr merge 6'", False),
+    ("echo $'gh pr merge 6'", False),
+    ("gh pr create --body $'$(gh pr merge 6)'", False),
 ])
 @pytest.mark.parametrize("bypass", ["off", "yolo", "allowlist"])
 def test_execution_not_data_is_denied(tmp_path, monkeypatch, command, denied, bypass):
@@ -131,7 +168,7 @@ import json, os
 from pathlib import Path
 import yaml
 from hermes_cli.config import get_config_path, load_config_readonly
-from tools.approval import check_dangerous_command
+from tools.approval import check_dangerous_command, check_all_command_guards
 path = Path(os.environ['HERMES_HOME']) / 'config.yaml'
 assert get_config_path() == path
 raw = yaml.safe_load(path.read_text())
@@ -148,6 +185,18 @@ assert load_config_readonly()['approvals']['deny_commands'] == ['gh pr merge']
 assert not check_dangerous_command('gh pr merge 6', 'local')['approved']
 assert check_dangerous_command('echo "gh pr merge 6"', 'local')['approved']
 assert not check_dangerous_command('echo retained-protection', 'local')['approved']
+for command, denied in [
+    ('case x in x) gh pr merge 6;; esac', True),
+    ('command -- gh pr merge 6', True),
+    ('env ' * 13 + 'gh pr merge 6', True),
+    ("bash <<< 'gh pr merge 6'", True),
+    ("bash -c 'gh pr create --body-file -' <<'BODY'\ngh pr merge 6\nBODY", False),
+    ("eval -- 'gh pr merge 6'", True),
+    ("gh $'pr' $'merge' 6", True),
+    ("gh pr create --body $'gh pr merge 6'", False),
+]:
+    result = check_all_command_guards(command, 'local')
+    assert result['approved'] is not denied, (command, result)
 print(json.dumps({'first': first, 'merge': merge}))
 '''
     env = {**os.environ, "HERMES_HOME": str(tmp_path)}
