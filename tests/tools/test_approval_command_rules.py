@@ -244,8 +244,8 @@ print(json.dumps({'first': first, 'merge': merge}))
     ('case x in x) git push origin main;; esac', True),
     ("bash -c 'git push origin HEAD:main'", True),
     ('echo "$(git push origin main)"', True),
-    ('git push --repo origin main', True),
-    ('git push --repo=origin +HEAD:main', True),
+    ('git push --repo origin main', False),  # Positional repository, no explicit ref.
+    ('git push --repo=origin +HEAD:main', False),
     ('git push origin -- main', True),
     ('git push origin main:feature && gh pr create --base main', False),
     ('git push origin feature && gh pr create --body "git push origin main --tags"', False),
@@ -280,3 +280,65 @@ def test_git_destination_not_other_command_or_data(tmp_path, monkeypatch, comman
     assert result["approved"] is not denied, result
     if denied:
         assert result.get("user_deny") or result.get("hardline"), result
+
+
+@pytest.mark.parametrize("operands,denied", [
+    ("tag release:main", True),
+    ("tag release:refs/heads/main", True),
+    ("tag main", True),  # `tag` is the repository here.
+    ("origin tag release:main", True),
+    ("origin tag release:refs/heads/main", True),
+    ("origin tag main", False),
+    ("main feature", False),
+    ("origin main", True),
+    ("origin HEAD:main", True),
+    ("--delete origin main", True),
+    ("--delete origin tag main", False),
+])
+def test_git_positional_repository_overrides_repo_option(tmp_path, operands, denied):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({
+        "approvals": {"mode": "off", "deny_commands": ["git push main"]},
+        "security": {"tirith_enabled": False},
+    }), encoding="utf-8")
+    # A fresh import exercises the actual config loader and public guard. The
+    # strings are data only: subprocess runs Python, never the sampled commands.
+    probe = r'''
+import json, os, sys
+from pathlib import Path
+from hermes_cli.config import get_config_path, load_config_readonly
+from tools.approval import check_all_command_guards
+assert get_config_path() == Path(os.environ['HERMES_HOME']) / 'config.yaml'
+assert load_config_readonly()['approvals']['deny_commands'] == ['git push main']
+operands, denied = json.loads(sys.argv[1])
+for repo_option in ('', '--repo=origin ', '--repo origin '):
+    command = 'git push ' + repo_option + operands
+    result = check_all_command_guards(command, 'local')
+    assert result['approved'] is not denied, (command, result)
+    if denied:
+        assert result.get('user_deny'), (command, result)
+'''
+    subprocess.run([sys.executable, "-c", probe, json.dumps([operands, denied])],
+                   env={**os.environ, "HERMES_HOME": str(tmp_path)},
+                   cwd=Path(__file__).resolve().parents[2], check=True, timeout=30)
+
+
+@pytest.mark.parametrize("shorthand,normalized,denied", [
+    ("tag release:main", "refs/tags/release:main", True),
+    ("tag release:refs/heads/main", "refs/tags/release:refs/heads/main", True),
+    ("tag main", "refs/tags/main", False),
+    ("--delete tag main", ":refs/tags/main", False),
+    ("--delete main", ":main", True),
+    ("--delete refs/heads/main", ":refs/heads/main", True),
+])
+def test_git_tag_shorthand_matches_normalized_destination(tmp_path, monkeypatch, shorthand, normalized, denied):
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "approvals": {"mode": "off", "deny_commands": ["git push main"]},
+        "security": {"tirith_enabled": False},
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for refspec in (shorthand, normalized):
+        result = approval.check_all_command_guards("git push origin " + refspec, "local")
+        assert result["approved"] is not denied, result
+        if denied:
+            assert result.get("user_deny"), result

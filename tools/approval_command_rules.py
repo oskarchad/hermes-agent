@@ -327,7 +327,7 @@ def _is_git_push_main(raw_args: list[str]) -> bool:
                 "prune", "verify", "follow-tags", "atomic", "ipv4", "ipv6"}
     optional_values = {"force-with-lease", "signed"}
     refs = []
-    index, options, repository, delete = 0, True, False, False
+    index, options, delete = 0, True, False
     while index < len(args):
         token = _literal_word(args[index])
         index += 1
@@ -339,7 +339,6 @@ def _is_git_push_main(raw_args: list[str]) -> bool:
         if options and token.startswith("--"):
             option, equals, _ = token.partition("=")
             if option in value_options:
-                repository |= option == "--repo"
                 index += int(not equals)
             else:
                 name = option[2:].removeprefix("no-")
@@ -359,16 +358,19 @@ def _is_git_push_main(raw_args: list[str]) -> bool:
             refs.append(token)
         if index > len(args):
             raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
-    if not repository:
-        refs = refs[1:]  # Positional repository is not a destination ref.
+    # Git's cmd_push consumes the first positional as repository even with --repo.
+    refs = refs[1:]
     index = 0
     while index < len(refs):
         ref = refs[index]
-        if ref == "tag" and not delete:
-            index += 2  # `tag main` means refs/tags/main, not a branch.
-            if index > len(refs):
+        if ref == "tag":
+            index += 1
+            if index >= len(refs):
                 raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
-            continue
+            # Like set_refspecs: expand shorthand before interpreting its target.
+            ref = "refs/tags/" + refs[index]
+        if delete:
+            ref = ":" + ref
         if ref.removeprefix("+").rsplit(":", 1)[-1] in {"main", "refs/heads/main"}:
             return True
         index += 1
