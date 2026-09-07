@@ -1035,6 +1035,7 @@ class _TargetDelivery:
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
+    explicit_route: bool = False
 
     @property
     def is_relay(self) -> bool:
@@ -1064,7 +1065,26 @@ def _resolve_target_transport(
     """Resolve ``(transport, pconfig, runtime_adapter, target_adapters)`` for one target, or
     ``(None, error)`` when it cannot be served (relay-fronted with no live transport, or not
     configured/enabled)."""
-    from gateway.delivery import resolve_delivery_transport
+    from gateway.delivery import DeliveryTransport, resolve_delivery_transport
+    from cron.delivery_routes import ExplicitRouteAdapters, configured_routes, route_for
+    try:
+        route = route_for(target, configured_routes())
+    except Exception:
+        return None, "explicit cron delivery route configuration unavailable or invalid"
+    expected = route_for(target, job.get("_cron_delivery_route_bindings", []))
+    if expected is not None and (
+            route is None or route["adapter_profile"] != expected["adapter_profile"]):
+        return None, "explicit cron delivery route changed since dispatch"
+    if route is not None:
+        adapter = (adapters.get(platform, target)
+                   if isinstance(adapters, ExplicitRouteAdapters) else None)
+        if adapter is None:
+            return None, "explicit cron delivery route has no active allowed adapter"
+        # Only the already connected adapter's config; never hydrate the target profile here.
+        transport = DeliveryTransport(adapter, adapter.config, platform)
+        return (transport, adapter.config, adapter, {platform: adapter}), None
+    if isinstance(adapters, ExplicitRouteAdapters):
+        adapters = adapters.legacy
     target_adapters = adapters
     if isinstance(adapters, _preflight.SharedRouteAdapters):
         # Credentialless satellite: the primary adapter serves THIS target only when an exact
@@ -1433,6 +1453,9 @@ def _deliver_standalone(
 ) -> None:
     """Standalone fallback for a target the live lane did not deliver."""
     job = t.job
+    if t.explicit_route:
+        delivery_errors.extend(target_errors or [f"explicit cron delivery to {t.where} failed"])
+        return
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
@@ -1501,6 +1524,14 @@ def _prepare_target_delivery(
     # seed can create a resolvable session (_inchannel_seed_allowed).
     inchannel_continuable = origin_target or (
         mirror_this_target and _inchannel_seed_allowed(is_dm=is_dm_target, user_id=origin_user_id))
+    from cron.delivery_routes import configured_routes, route_for
+    try:
+        explicit_route = route_for(target, configured_routes()) is not None
+    except Exception:
+        explicit_route = True
+    if explicit_route:
+        # Cross-profile transport does not transfer conversation ownership or open new threads.
+        mirror_this_target = inchannel_continuable = False
 
     # Plugin platform names create dynamic members via Platform._missing_().
     try:
@@ -1565,7 +1596,8 @@ def _prepare_target_delivery(
         origin=origin, origin_target=origin_target, origin_user_id=origin_user_id,
         is_dm_target=is_dm_target, mirror_text=mirror_text, mirror_this_target=mirror_this_target,
         in_channel_surface=in_channel_surface, inchannel_continuable=inchannel_continuable,
-        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
+        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready,
+        explicit_route=explicit_route)
 
 
 def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
@@ -1598,6 +1630,9 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    from cron.delivery_routes import bind_delivery_routes
+    if "_cron_delivery_route_bindings" not in job:
+        job = bind_delivery_routes(job)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         return _unresolved_delivery_outcome(job, for_failure)

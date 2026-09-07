@@ -220,6 +220,10 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     only if the gateway config loads AND reports it unconnected; config load failures fail OPEN.
     ``failure_deliver`` gets the same rules — a typo'd failure platform would otherwise only
     surface when a failure occurs (NS-788)."""
+    from cron.delivery_routes import check_explicit_delivery
+    route_error, covered = check_explicit_delivery(job)
+    if route_error:
+        return route_error
     deliver_value = _delivery._normalize_deliver_value(job.get("deliver", "local"))
     failure_deliver_value = _delivery._normalize_deliver_value(
         _delivery._delivery_lane_value(job, for_failure=True))
@@ -247,6 +251,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+        if platform_name.lower() in covered:
+            continue
         if connected is None:
             try:
                 from gateway.config import load_gateway_config

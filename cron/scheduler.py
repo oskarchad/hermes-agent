@@ -2309,6 +2309,11 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    from cron.delivery_routes import check_explicit_delivery
+    route_error, _ = check_explicit_delivery(job)
+    if route_error:
+        return False, "", "", f"{BLOCKED_CONFIG_MARKER} {route_error}"
+
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
@@ -2508,7 +2513,7 @@ def run_one_job(
     if not external_owner:
         try:
             from cron.scheduler_worker import _launch_external_cron_worker
-            if _launch_external_cron_worker(job):
+            if _launch_external_cron_worker(job, adapters=adapters):
                 return True
         except Exception as handoff_error:
             error = f"Restart-safe cron worker dispatch failed: {handoff_error}"
@@ -2539,20 +2544,22 @@ def run_one_job(
         _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
             fire_owner or None, profile_home)
     try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
+        from cron.delivery_routes import delivery_preflight_scope
+        with delivery_preflight_scope(adapters):
+            return _run_with_fire_claim_heartbeat(
                 job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
-                ),
-                execution_token=execution_token))
+                lambda lost_ownership: _run_one_job_body(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    extra_prompt=extra_prompt,
+                    fire_claim_lost=(
+                        _CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None
+                        else lost_ownership
+                    ),
+                    execution_token=execution_token))
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])

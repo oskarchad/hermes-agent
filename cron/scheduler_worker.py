@@ -10,7 +10,7 @@ import time
 
 logger = logging.getLogger("cron.scheduler")
 
-def _launch_external_cron_worker(job: dict) -> bool:
+def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
     """Launch *job* outside a managed gateway cgroup when required.
 
     Returns ``False`` when the caller is not a managed systemd gateway and the
@@ -51,6 +51,12 @@ def _launch_external_cron_worker(job: dict) -> bool:
             "cron execution claim changed before external worker handoff"
         )
 
+    from cron.delivery_routes import preflight_snapshot
+    try:
+        route_snapshot = preflight_snapshot(adapters)
+    except Exception:
+        route_snapshot = []  # worker independently validates config and blocks before running
+
     _ensure_cron_dir(handoff_dir)
     try:
         handoff_dir.chmod(0o700)
@@ -64,6 +70,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     "job": job,
                     "profile_home": str(_get_hermes_home().resolve()),
                     "multiplex_active": multiplex_active,
+                    "delivery_route_preflight": route_snapshot,
                 },
                 payload_file,
             )
@@ -236,7 +243,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                return run_one_job(job, adapters=None, loop=None, verbose=False)
+                from cron.delivery_routes import delivery_preflight_scope
+                with delivery_preflight_scope(snapshot=payload.get("delivery_route_preflight", [])):
+                    return run_one_job(job, adapters=None, loop=None, verbose=False)
             finally:
                 if old_external_execution is None:
                     os.environ.pop("_HERMES_CRON_EXTERNAL_WORKER", None)

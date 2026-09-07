@@ -1596,6 +1596,8 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Exact target -> already-active multiplex profile adapter. No credential inheritance.
+        "delivery_routes": [],
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
         # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
         # created this way are user-owned in the same flat jobs table. Interactive toolsets
