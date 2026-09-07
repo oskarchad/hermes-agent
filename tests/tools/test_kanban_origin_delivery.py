@@ -25,11 +25,18 @@ def board(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("platform", ["webui", "tui"])
 @pytest.mark.parametrize("terminal", ["done", "blocked"])
-def test_create_routes_terminal_event_to_bound_origin(board, platform, terminal):
+def test_create_routes_terminal_event_to_bound_origin(board, platform, terminal, tmp_path, monkeypatch):
     from tools.registry import registry
 
-    tokens = set_session_vars(platform=platform, chat_id="origin", session_key="origin",
-                              session_id="durable-id", profile="captain")
+    if platform == "tui":
+        from tui_gateway import server
+        monkeypatch.setenv("HERMES_PROFILE", "launch-profile")
+        monkeypatch.setattr(server, "_session_for_key", lambda key: {
+            "profile_home": str(tmp_path / "profiles" / "captain"), "source": "tui"})
+        tokens = server._set_session_context("origin")
+    else:
+        tokens = set_session_vars(platform=platform, chat_id="origin", session_key="origin",
+                                  session_id="durable-id", profile="captain")
     try:
         result = json.loads(registry.get_entry("kanban_create").handler(
             {"title": "origin delivery", "assignee": "worker"}))

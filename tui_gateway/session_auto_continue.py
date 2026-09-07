@@ -327,6 +327,8 @@ def _inflight_snapshot(session: dict) -> dict | None:
     if not isinstance(turn, dict):
         return None
     user, assistant = str(turn.get("user") or "").strip(), str(turn.get("assistant") or "")
+    if turn.get("display_kind") == "hidden":
+        user = ""
     streaming, error = bool(turn.get("streaming")), str(turn.get("error") or "").strip()
     if not (user or assistant or streaming or error):
         return None

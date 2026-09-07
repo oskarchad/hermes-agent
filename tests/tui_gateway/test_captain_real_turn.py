@@ -10,12 +10,12 @@ from hermes_state import SessionDB
 from tui_gateway import server
 
 
-@pytest.mark.parametrize("outcome", ["complete", "blocked", "failed", "missing_persistence"])
+@pytest.mark.parametrize("outcome", ["complete", "blocked", "receipt_loss", "failed", "missing_persistence"])
 def test_captain_terminal_is_bound_to_durable_visible_reply(tmp_path, monkeypatch, outcome):
-    successful = outcome in {"complete", "blocked"}
+    successful = outcome in {"complete", "blocked", "receipt_loss"}
     db = SessionDB(tmp_path / "state.db")
     db.create_session("origin", source="tui")
-    if outcome in {"complete", "blocked"}:
+    if successful:
         db.create_session("ancestor", source="tui")
         for parent, child in (("ancestor", "middle"), ("middle", "current")):
             db.publish_compression_child(
@@ -37,10 +37,15 @@ def test_captain_terminal_is_bound_to_durable_visible_reply(tmp_path, monkeypatc
 
     def run(message, *, conversation_history, stream_callback, persist_user_message,
             persist_user_display_kind=None, persist_user_display_metadata=None):
+        snapshot = server._inflight_snapshot(session)
+        assert snapshot["user"] == ""
         user = {"role": "user", "content": persist_user_message,
                 "display_kind": persist_user_display_kind,
                 "display_metadata": persist_user_display_metadata}
         target = agent.session_id
+        from pathlib import Path
+        from tui_gateway.turn_marker import read_turn_marker
+        assert read_turn_marker(Path(session.get("profile_home") or tmp_path), session["session_key"]) is None
         db.append_message(target, **user)
         stream_callback("draft must not escape")
         reply = {"role": "assistant", "content": "Worker result explained"}
@@ -77,18 +82,33 @@ def test_captain_terminal_is_bound_to_durable_visible_reply(tmp_path, monkeypatc
         conn = connect(board="default")
         tid = kb.create_task(conn, title="real Desktop boundary", assignee="worker",
                              captain_profile="otto", captain_origin_session_key="ancestor")
-        if outcome == "complete":
+        if outcome in {"complete", "receipt_loss"}:
             kb.complete_task(conn, tid, summary="worker completed")
         else:
             kb.block_task(conn, tid, reason="needs input", kind="needs_input")
         event = conn.execute("SELECT event_id FROM kanban_captain_inbox WHERE task_id=?", (tid,)).fetchone()[0]
         expected_id = server._captain_completion_id(
             [{"board": "default", "deliveries": [{"id": f"kanban:default:{event}"}]}], [])
+        if outcome == "receipt_loss":
+            real_ack = kb.ack_captain_reports
+            attempts = []
+            def ack_once_lost(*args, **kwargs):
+                attempts.append(True)
+                if len(attempts) == 1:
+                    raise OSError("injected lost receipt")
+                return real_ack(*args, **kwargs)
+            monkeypatch.setattr(kb, "ack_captain_reports", ack_once_lost)
         stop = threading.Event()
         poller = threading.Thread(target=server._notification_poller_loop, args=(stop, "ui-origin", session))
         poller.start()
         try:
             assert finished.wait(10), emitted
+            if outcome == "receipt_loss":
+                import time
+                deadline = time.monotonic() + 10
+                while kb.captain_unreported_for_task(conn, tid) and time.monotonic() < deadline:
+                    stop.wait(0.01)
+                assert len(attempts) == 2
         finally:
             stop.set()
             poller.join(5)
@@ -116,4 +136,6 @@ def test_captain_terminal_is_bound_to_durable_visible_reply(tmp_path, monkeypatc
         assert projected[-1]["id"] == expected_id
     else:
         assert complete == []
+        snapshot = server._inflight_snapshot(session)
+        assert snapshot["user"] == ""
     db.close()

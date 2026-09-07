@@ -81,7 +81,7 @@ def _plan_goal_compression_recovery(
 
 def _admit_prompt_turn(
     sid: str, session: dict, text: Any, image_paths: list[str] | None,
-    queued_prompt_generation: int | None) -> tuple[list[str], Any] | None:
+    queued_prompt_generation: int | None, display_kind: str | None = None) -> tuple[list[str], Any] | None:
     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
     bypass that once let a second backend run a duplicate turn."""
@@ -109,6 +109,7 @@ def _admit_prompt_turn(
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
+        session["inflight_turn"]["display_kind"] = display_kind
         agent = session["agent"]
         with contextlib.suppress(Exception):
             agent.clear_interrupt()
@@ -765,7 +766,7 @@ def _run_prompt_submit(
     if completion_id:
         display_kind = "hidden"
         display_metadata = {"authorship": "system", "captain_completion_id": completion_id}
-    admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
+    admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation, display_kind)
     if admitted is None:
         return False
     images, agent = admitted
@@ -793,7 +794,10 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None, completion_id=completion_id)
-        st.marker_key = _record_turn_marker(session, text)
+        # Captain already owns a durable retry ledger. Generic crash recovery
+        # would replay this machine input as an untyped, unreceipted user turn.
+        if not completion_id:
+            st.marker_key = _record_turn_marker(session, text)
         goal_followup = None
         try:
             prepared = _prepare_turn_input(sid, session, st, text, images)

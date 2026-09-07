@@ -1006,8 +1006,9 @@ def _reconcile_persisted_captain_report(
         return False
     report = receipt["report"]
     pending = session.setdefault("_captain_pending_projection_ids", set())
-    if receipt.get("moved"):
-        pending.add(completion_id)
+    # The ack may have failed before the original final frame was emitted,
+    # even when persistence already belongs to this exact conversation.
+    pending.add(completion_id)
 
     _settle_kanban_notification_claims(
         claim_records,
