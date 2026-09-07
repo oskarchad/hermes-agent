@@ -63,7 +63,8 @@ def _command_tokens(command: str, start: int) -> list[str]:
     tokens = _shell_tokens_with_spans(command[start:end], 0)
     if tokens is None:
         raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
-    return [_literal_word(command[start + a:start + b]) for _, a, b, _ in tokens]
+    # Keep raw operands: only the consumer knows which words affect execution.
+    return [command[start + a:start + b] for _, a, b, _ in tokens]
 
 
 def _command_words(source: str):
@@ -119,7 +120,7 @@ def _shell_stdin_source(header: str) -> bool:
     start, _, raw = words[-1]
     if os.path.basename(_literal_word(raw)) not in _SHELLS:
         return False
-    args = _command_tokens(header, start)[1:]
+    args = [_literal_word(arg) for arg in _command_tokens(header, start)[1:]]
     if _bash_exec_payload(args)[0]:
         return False
     index, stdin = 0, False
@@ -168,6 +169,7 @@ def _command_source(source: str, pending: list[str]) -> str:
     cursor = segment_start = 0
     heredocs = []
     herestrings = []
+    unresolved_stdin = set()
     while cursor < len(source):
         skip = cursor
         for kind, i, j, quote in _scan_shell(source, cursor, subst="uq", stop_unterminated=True):
@@ -210,10 +212,14 @@ def _command_source(source: str, pending: list[str]) -> str:
                 if fd_start and not (source[fd_start - 1].isspace() or source[fd_start - 1] in ";&|()"):
                     fd_start = i
                 stdin = source[fd_start:i] in {"", "0"}
+                if (stdin and op in {"<&", "<", "<>"}) or (source[fd_start:i] == "0" and op == ">&"):
+                    # Do not emulate descriptor wiring or read scripts on disk.
+                    # A shell consuming this stdin has unresolved program source.
+                    unresolved_stdin.add(segment_start)
                 if op in {"<<", "<<-"}:
                     heredocs.append((words[0][0], raw != words[0][0], op == "<<-", segment_start, stdin))
                 elif op == "<<<" and stdin:
-                    herestrings.append((_literal_word(raw), segment_start))
+                    herestrings.append((raw, segment_start))
                 chars[fd_start:end] = " " * (end - fd_start)
                 skip = end
             elif source[i] == "\n" and heredocs:
@@ -247,7 +253,7 @@ def _command_source(source: str, pending: list[str]) -> str:
                 raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
             break
     cleaned = "".join(chars)
-    for body, header_start in herestrings:
+    for body, header_start in herestrings + [(None, start) for start in unresolved_stdin]:
         # Redirections may precede the executable or its -c/script arguments.
         header_end = len(cleaned)
         for kind, i, _, quote in _scan_shell(cleaned, header_start, subst="uq"):
@@ -255,7 +261,9 @@ def _command_source(source: str, pending: list[str]) -> str:
                 header_end = i
                 break
         if _shell_stdin_source(cleaned[header_start:header_end]):
-            pending.append(body)
+            if body is None:
+                raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+            pending.append(_literal_word(body))
     return cleaned
 
 
@@ -266,7 +274,7 @@ def _is_gh_pr_merge(args: list[str]) -> bool:
     word = next(expected)
     index = 0
     while index < len(args):
-        token = args[index]
+        token = _literal_word(args[index])
         if token in {"--help", "-h", "--version"}:
             return False
         if token in {"--repo", "-R"}:
@@ -284,7 +292,96 @@ def _is_gh_pr_merge(args: list[str]) -> bool:
     return False
 
 
-def matches_gh_pr_merge(command: str) -> bool:
+def _git_push_args(args: list[str]) -> list[str] | None:
+    """Consume global Git options before the subcommand, not their values."""
+    value_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
+    switches = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects", "--bare",
+                "--no-optional-locks", "--no-lazy-fetch", "--literal-pathspecs", "--glob-pathspecs",
+                "--noglob-pathspecs", "--icase-pathspecs", "--no-advice"}
+    index = 0
+    while index < len(args):
+        token = _literal_word(args[index])
+        if token in {"--help", "-h", "--version", "-v", "--exec-path", "--html-path", "--man-path", "--info-path"}:
+            return None
+        if not token.startswith("-"):
+            return args[index + 1:] if token == "push" else None
+        option, equals, _ = token.partition("=")
+        if option in value_options:
+            index += 1 if equals else 2
+        elif token in switches or token.startswith(("-C", "-c", "--exec-path=")):
+            index += 1
+        else:
+            raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+        if index > len(args):
+            raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+    return None
+
+
+def _is_git_push_main(raw_args: list[str]) -> bool:
+    args = _git_push_args(raw_args)
+    if args is None:
+        return False
+    value_options = {"--repo", "--receive-pack", "--exec", "--push-option", "--recurse-submodules"}
+    switches = {"verbose", "quiet", "all", "branches", "mirror", "delete", "tags", "dry-run",
+                "porcelain", "force", "force-if-includes", "thin", "set-upstream", "progress",
+                "prune", "verify", "follow-tags", "atomic", "ipv4", "ipv6"}
+    optional_values = {"force-with-lease", "signed"}
+    refs = []
+    index, options, repository, delete = 0, True, False, False
+    while index < len(args):
+        token = _literal_word(args[index])
+        index += 1
+        if options and token == "--":
+            options = False
+            continue
+        if options and token in {"--help", "-h"}:
+            return False
+        if options and token.startswith("--"):
+            option, equals, _ = token.partition("=")
+            if option in value_options:
+                repository |= option == "--repo"
+                index += int(not equals)
+            else:
+                name = option[2:].removeprefix("no-")
+                if name not in switches | optional_values or (equals and name not in optional_values):
+                    raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+                if name == "delete":
+                    delete = not option.startswith("--no-")
+        elif options and token.startswith("-") and token != "-":
+            for position, flag in enumerate(token[1:], 1):
+                if flag == "o":
+                    index += int(position == len(token) - 1)
+                    break  # The rest of this bundle is the push-option value.
+                if flag not in "vqdnfu46":
+                    raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+                delete |= flag == "d"
+        else:
+            refs.append(token)
+        if index > len(args):
+            raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+    if not repository:
+        refs = refs[1:]  # Positional repository is not a destination ref.
+    index = 0
+    while index < len(refs):
+        ref = refs[index]
+        if ref == "tag" and not delete:
+            index += 2  # `tag main` means refs/tags/main, not a branch.
+            if index > len(refs):
+                raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+            continue
+        if ref.removeprefix("+").rsplit(":", 1)[-1] in {"main", "refs/heads/main"}:
+            return True
+        index += 1
+    return False
+
+
+COMMAND_DENY_SELECTORS = {
+    "gh pr merge": ({"gh", "gh.exe"}, _is_gh_pr_merge),
+    "git push main": ({"git", "git.exe"}, _is_git_push_main),
+}
+
+
+def match_command_deny(command: str, selectors: list[str]) -> str | None:
     """Inspect executable positions and shell-carried payloads, never prose.
 
     Use raw quote state: global deobfuscation can turn escaped data into live
@@ -307,20 +404,24 @@ def matches_gh_pr_merge(command: str) -> bool:
             payload = _command_source(payload, pending)
             for start, _, raw_word in _command_words(payload):
                 name = os.path.basename(_literal_word(raw_word))
-                tokens = _command_tokens(payload, start)
-                if not tokens:
+                selected = [(selector, matcher) for selector in selectors
+                            for names, matcher in [COMMAND_DENY_SELECTORS[selector]] if name in names]
+                if not selected and name not in {"eval"} | _SHELLS:
                     continue
-                if name in {"gh", "gh.exe"} and _is_gh_pr_merge(tokens[1:]):
-                    return True
+                tokens = _command_tokens(payload, start)
+                for selector, matcher in selected:
+                    if matcher(tokens[1:]):
+                        return selector
                 if name in _SHELLS:
-                    found, nested = _bash_exec_payload(tokens[1:])
+                    found, nested = _bash_exec_payload([_literal_word(arg) for arg in tokens[1:]])
                     if found:
                         if nested is None:
                             raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
                         pending.append(nested)
                 elif name == "eval":
-                    args = tokens[2:] if tokens[1:2] == ["--"] else tokens[1:]
+                    args = [_literal_word(arg) for arg in tokens[1:]]
+                    args = args[1:] if args[:1] == ["--"] else args
                     pending.append(" ".join(args))
         except RecursionError:
             raise CommandDenyParseError(_PARSER_LIMIT_DESCRIPTION) from None
-    return False
+    return None

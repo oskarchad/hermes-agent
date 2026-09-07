@@ -53,25 +53,26 @@ def _user_deny_block_result(pattern: str) -> dict:
 
 def _user_command_deny_block(command: str) -> dict | None:
     """Validate and apply opt-in command selectors before any approval bypass."""
-    from tools.approval_command_rules import CommandDenyParseError, matches_gh_pr_merge
+    from tools.approval_command_rules import (
+        COMMAND_DENY_SELECTORS, CommandDenyParseError, match_command_deny)
 
     selectors = _ctx._get_approval_config().get("deny_commands", [])
     if not isinstance(selectors, list) or any(
-        not isinstance(selector, str) or selector != "gh pr merge" for selector in selectors
+        not isinstance(selector, str) or selector not in COMMAND_DENY_SELECTORS for selector in selectors
     ):
         return {"approved": False, "user_deny": True, "config_error": True, "message": (
             "BLOCKED: invalid approvals.deny_commands in config.yaml; expected a list "
-            "containing only the supported selector 'gh pr merge'. Ask the operator "
+            "containing only 'gh pr merge' or 'git push main'. Ask the operator "
             "to correct the configuration; do not retry or rephrase the command.")}
     if not selectors:
         return None
     try:
-        matched = matches_gh_pr_merge(command)
+        matched = match_command_deny(command, selectors)
     except CommandDenyParseError as exc:
         return _hardline_block_result(str(exc), command)
     if matched:
         return {"approved": False, "user_deny": True, "message": (
-            "BLOCKED: this command matches 'gh pr merge' (approvals.deny_commands "
+            f"BLOCKED: this command matches '{matched}' (approvals.deny_commands "
             "in config.yaml). It cannot be executed via the agent, even under "
             "--yolo or approvals.mode=off. Do NOT retry or rephrase this command.")}
     return None

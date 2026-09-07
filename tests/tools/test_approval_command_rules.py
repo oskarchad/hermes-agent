@@ -128,6 +128,12 @@ from tools.approval_context import _get_approval_config
     ("gh pr create --body $'gh pr merge 6'", False),
     ("echo $'gh pr merge 6'", False),
     ("gh pr create --body $'$(gh pr merge 6)'", False),
+    pytest.param("bash 3<<'BODY' <&3\ngh pr merge 6\nBODY", True, id="closure-fd-heredoc"),
+    pytest.param("bash 3<<< 'gh pr merge 6' <&3", True, id="closure-fd-herestring"),
+    pytest.param("bash 3<<'BODY'\ngh pr merge 6\nBODY", False, id="closure-unused-fd"),
+    pytest.param("bash -c 'gh pr create --body-file -' 3<<'BODY' <&3\ngh pr merge 6\nBODY", False, id="closure-fd-pr-data"),
+    pytest.param(r"gh pr create --body $'Summary\nDo not execute gh pr merge 6.'", False, id="closure-ansi-body"),
+    pytest.param(r"cat <<< $'Summary\ngh pr merge 6'", False, id="closure-ansi-input-data"),
 ])
 @pytest.mark.parametrize("bypass", ["off", "yolo", "allowlist"])
 def test_execution_not_data_is_denied(tmp_path, monkeypatch, command, denied, bypass):
@@ -145,19 +151,20 @@ def test_execution_not_data_is_denied(tmp_path, monkeypatch, command, denied, by
     # The selector floor is independent of ordinary manual approvals. Exercise
     # both public entry points for denied operations and off/yolo allowed data.
     from tools.approval_floors import _user_command_deny_block
-    assert bool(_user_command_deny_block(command)) is denied
     if denied or bypass != "allowlist":
         for guard in (approval.check_dangerous_command, approval.check_all_command_guards):
             result = guard(command, "local")
             assert result["approved"] is not denied, result
             if denied:
                 assert result.get("user_deny") or result.get("hardline"), result
+    assert bool(_user_command_deny_block(command)) is denied
 
 
 @pytest.mark.parametrize("selectors,invalid", [
     ([], False), (["gh pr merge"], False), (None, True), ("gh pr merge", True),
     ({"gh pr merge": True}, True), ([123], True), (["gh pr *"], True),
     (["gh pr merge", "unknown"], True), ([" gh pr merge "], True),
+    (["git push main"], False), (["gh pr merge", "git push main"], False),
 ])
 def test_fresh_loader_reload_and_fail_closed_config(tmp_path, selectors, invalid):
     path = tmp_path / "config.yaml"
@@ -197,6 +204,21 @@ for command, denied in [
 ]:
     result = check_all_command_guards(command, 'local')
     assert result['approved'] is not denied, (command, result)
+raw['approvals']['deny_commands'] = ['gh pr merge', 'git push main']
+path.write_text(yaml.safe_dump(raw))
+os.utime(path, ns=(old + 4_000_000_000, old + 4_000_000_000))
+assert load_config_readonly()['approvals']['deny_commands'] == raw['approvals']['deny_commands']
+for command, denied in [
+    ("bash 3<<'BODY' <&3\ngh pr merge 6\nBODY", True),
+    ("bash 3<<< 'gh pr merge 6' <&3", True),
+    ("bash 3<<'BODY'\ngh pr merge 6\nBODY", False),
+    ("bash -c 'gh pr create --body-file -' 3<<'BODY' <&3\ngh pr merge 6\nBODY", False),
+    (r"gh pr create --body $'Summary\nDo not execute gh pr merge 6.'", False),
+    ('git push origin HEAD:refs/heads/main --tags && git status', True),
+    ('git push origin main:feature && gh pr create --base main', False),
+]:
+    result = check_all_command_guards(command, 'local')
+    assert result['approved'] is not denied, (command, result)
 print(json.dumps({'first': first, 'merge': merge}))
 '''
     env = {**os.environ, "HERMES_HOME": str(tmp_path)}
@@ -206,4 +228,55 @@ print(json.dumps({'first': first, 'merge': merge}))
     data = json.loads(result.stdout)
     assert bool(data["first"].get("config_error")) is invalid
     assert data["first"]["approved"] is not invalid
-    assert data["merge"]["approved"] is (not invalid and not selectors)
+    assert data["merge"]["approved"] is (not invalid and "gh pr merge" not in selectors)
+
+
+@pytest.mark.parametrize("command,denied", [
+    ('git push origin main --tags && git status', True),
+    ('git push origin HEAD:refs/heads/main', True),
+    ('git push origin +main', True),
+    ('git push origin :main', True),
+    ('git push --delete origin refs/heads/main', True),
+    ('git push -d origin main', True),
+    ('/usr/bin/git -C /workspace -c advice.pushUpdateRejected=false push origin main', True),
+    ('git --git-dir /tmp/repo --work-tree=/tmp/tree push origin main', True),
+    ('env X=1 command -- git push origin feature HEAD:main --porcelain', True),
+    ('case x in x) git push origin main;; esac', True),
+    ("bash -c 'git push origin HEAD:main'", True),
+    ('echo "$(git push origin main)"', True),
+    ('git push --repo origin main', True),
+    ('git push --repo=origin +HEAD:main', True),
+    ('git push origin -- main', True),
+    ('git push origin main:feature && gh pr create --base main', False),
+    ('git push origin feature && gh pr create --body "git push origin main --tags"', False),
+    (r"git push origin feature && gh pr create --body $'Summary\ngit push origin main'", False),
+    ('git push origin main-feature', False),
+    ('git push main feature', False),
+    ('git push --push-option main origin feature', False),
+    ('git push -vo main origin feature', False),
+    ('git push --receive-pack main --repo origin feature', False),
+    ('git push --force-with-lease=main origin feature', False),
+    ('git push origin tag main', False),
+    ('git -c alias.example="push origin main" status', False),
+    ('git --version', False),
+    ('git push --help', False),
+    ("echo 'git push origin main'", False),
+    ('gh pr merge 6', False),  # The git selector does not enable the gh selector.
+    ('git push --push-option', True),  # Malformed inspection fails closed.
+    (r"git push origin $'m\x61in'", True),
+])
+@pytest.mark.parametrize("bypass", ["off", "yolo", "allowlist"])
+def test_git_destination_not_other_command_or_data(tmp_path, monkeypatch, command, denied, bypass):
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({
+        "approvals": {"mode": "off" if bypass == "off" else "manual",
+                      "deny_commands": ["git push main"]},
+        "security": {"tirith_enabled": False},
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", bypass == "yolo")
+    monkeypatch.setattr(approval, "_permanent_approved", {command} if bypass == "allowlist" else set())
+    result = approval.check_all_command_guards(command, "local")
+    assert result["approved"] is not denied, result
+    if denied:
+        assert result.get("user_deny") or result.get("hardline"), result
