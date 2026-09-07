@@ -871,6 +871,11 @@ def _floor_block(command: str, *, sudo_guard: bool = False) -> dict | None:
         if is_sudo_guess:
             logger.warning("Sudo stdin guard block: %s (command: %s)", sudo_guess_desc, command[:200])
             return _sudo_stdin_block_result(sudo_guess_desc)
+    from tools.approval_floors import _user_command_deny_block
+
+    command_deny = _user_command_deny_block(command)
+    if command_deny is not None:
+        return command_deny
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
         logger.warning("User deny rule %r blocked command: %s", deny_pattern, command[:200])
