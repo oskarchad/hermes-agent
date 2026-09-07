@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import cron.scheduler_worker as worker
 
 
 @pytest.fixture
@@ -149,7 +150,7 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
     monkeypatch.setattr("cron.executions.adopt_claimed_execution", adopted)
     monkeypatch.setattr(scheduler, "run_one_job", run)
 
-    assert scheduler._run_external_worker_payload(payload, ack) is True
+    assert worker._run_external_worker_payload(payload, ack) is True
 
     adopted.assert_called_once_with("exec-1")
     run.assert_called_once()
@@ -178,7 +179,7 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
     run = Mock()
     monkeypatch.setattr(scheduler, "run_one_job", run)
 
-    assert scheduler._run_external_worker_payload(payload, ack) is False
+    assert worker._run_external_worker_payload(payload, ack) is False
 
     run.assert_not_called()
     assert not ack.exists()
@@ -243,7 +244,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
 
     set_multiplex_active(True)
     try:
-        assert scheduler._launch_external_cron_worker(job) is True
+        assert worker._launch_external_cron_worker(job) is True
     finally:
         set_multiplex_active(False)
     assert wrapped_commands[0][1] == "cron-job-1-exec-exec-1"
@@ -321,7 +322,7 @@ def test_launch_external_worker_stays_in_process_outside_managed_gateway(
     popen = Mock()
     monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
 
-    assert scheduler._launch_external_cron_worker(
+    assert worker._launch_external_cron_worker(
         {"id": "job-1", "execution_id": "exec-1"}
     ) is False
     assert command_calls
@@ -333,7 +334,7 @@ def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
 
     launch = Mock(return_value=True)
     run = Mock(side_effect=AssertionError("agent ran inside gateway"))
-    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
+    monkeypatch.setattr(worker, "_launch_external_cron_worker", launch)
     monkeypatch.setattr(scheduler, "run_job", run)
     job = {"id": "job-1", "execution_id": "exec-1"}
 
@@ -420,7 +421,7 @@ def test_gateway_tool_run_without_adapter_objects_hands_off(monkeypatch):
     launch = Mock(return_value=True)
     run = Mock(side_effect=AssertionError("agent ran inside gateway"))
     monkeypatch.setattr(scheduler, "create_execution", created)
-    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
+    monkeypatch.setattr(worker, "_launch_external_cron_worker", launch)
     monkeypatch.setattr(scheduler, "run_job", run)
     job = {"id": "tool-job"}
 
@@ -438,7 +439,7 @@ def test_shared_run_path_creates_execution_before_managed_handoff(monkeypatch):
     created = Mock(return_value={"id": "exec-new"})
     launch = Mock(return_value=True)
     monkeypatch.setattr(scheduler, "create_execution", created)
-    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
+    monkeypatch.setattr(worker, "_launch_external_cron_worker", launch)
     job = {"id": "manual-job"}
 
     assert scheduler.run_one_job(job, adapters={"discord": object()}) is True
