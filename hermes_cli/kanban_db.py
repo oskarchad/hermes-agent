@@ -4949,39 +4949,21 @@ def read_captain_candidates(
 ) -> list[dict]:
     """Return claimable Captain rows for ``profile`` (pending or lease-expired).
 
-    Each row carries the registered ``origin_session_key`` for formatting and
-    diagnostics. Cross-process liveness is read from the durable receiver
-    table here and rechecked inside ``lease_captain_reports`` so a stale
-    candidate read cannot steal from an origin that refreshed meanwhile.
+    Each row carries its exact destination, resolving legacy missing origins
+    only from an unambiguous subscription. Offline is not permission to steal.
     """
+    from hermes_cli.kanban_origin import CAPTAIN_ORIGIN_SQL
+
     prof = _normalize_captain_profile(profile)
     now = int(time.time()) if now is None else int(now)
     eligibility_sql = ""
     eligibility_params: tuple = ()
     if receiver_session_key is not None:
-        session_key = str(receiver_session_key)
-        eligibility_sql = (
-            " AND ("
-            "   r.origin_session_key = ? "
-            "   OR (i.tenant IS NULL AND ("
-            "       r.origin_session_key IS NULL OR r.origin_session_key = '' "
-            "       OR (r.origin_session_key != ? AND NOT EXISTS ("
-            "           SELECT 1 FROM kanban_captain_receivers cr "
-            "           WHERE cr.profile = i.profile "
-            "             AND cr.session_key = r.origin_session_key "
-            "             AND cr.last_seen >= ?"
-            "       )))"
-            "   )"
-            " )"
-        )
-        eligibility_params = (
-            session_key,
-            session_key,
-            now - max(1, int(receiver_max_age_seconds)),
-        )
+        eligibility_sql = f" AND {CAPTAIN_ORIGIN_SQL} = ?"
+        eligibility_params = (str(receiver_session_key),)
     rows = conn.execute(
         "SELECT i.event_id, i.task_id, i.kind, i.state, i.lease_expires, "
-        "       r.origin_session_key, i.tenant "
+        f"       {CAPTAIN_ORIGIN_SQL} AS origin_session_key, i.tenant "
         "FROM kanban_captain_inbox i "
         "LEFT JOIN kanban_captain_registry r ON r.task_id = i.task_id "
         "WHERE i.profile = ? AND ("
@@ -5014,10 +4996,12 @@ def lease_captain_reports(
     Returns ``(token, events)``. Only rows currently ``pending`` or holding an
     expired lease flip to ``leased`` under a freshly minted opaque token, so
     concurrent same-profile pollers never both win the same row. When a
-    receiver key is supplied, origin liveness and tenant fail-closed rules are
+    receiver key is supplied, exact destination rules are
     rechecked in the same write transaction as the lease. The returned events
     are joined against ``task_events`` so the caller can format them.
     """
+    from hermes_cli.kanban_origin import CAPTAIN_ORIGIN_SQL
+
     prof = _normalize_captain_profile(profile)
     # Defensive cap keeps the dynamic IN clause comfortably below every
     # supported SQLite variable limit even if a caller regresses.
@@ -5031,30 +5015,14 @@ def lease_captain_reports(
     eligibility_sql = ""
     eligibility_params: tuple = ()
     if receiver_session_key is not None:
-        receiver = str(receiver_session_key)
         eligibility_sql = (
             " AND EXISTS ("
             "   SELECT 1 FROM kanban_captain_registry r "
-            "   WHERE r.task_id = kanban_captain_inbox.task_id AND ("
-            "     r.origin_session_key = ? "
-            "     OR (kanban_captain_inbox.tenant IS NULL AND ("
-            "       r.origin_session_key IS NULL OR r.origin_session_key = '' OR ("
-            "         r.origin_session_key != ? AND NOT EXISTS ("
-            "           SELECT 1 FROM kanban_captain_receivers cr "
-            "           WHERE cr.profile = kanban_captain_inbox.profile "
-            "             AND cr.session_key = r.origin_session_key "
-            "             AND cr.last_seen >= ?"
-            "         )"
-            "       )"
-            "     ))"
-            "   )"
+            "   WHERE r.task_id = kanban_captain_inbox.task_id "
+            f"   AND {CAPTAIN_ORIGIN_SQL} = ?"
             " )"
         )
-        eligibility_params = (
-            receiver,
-            receiver,
-            now - max(1, int(receiver_max_age_seconds)),
-        )
+        eligibility_params = (str(receiver_session_key),)
     with write_txn(conn):
         conn.execute(
             "UPDATE kanban_captain_inbox "

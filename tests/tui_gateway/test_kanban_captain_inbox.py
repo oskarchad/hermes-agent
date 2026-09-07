@@ -2,10 +2,9 @@
 
 The existing ``kanban_notify_subs`` route delivers a terminal task event to the
 *exact* origin TUI/Desktop session (``platform="tui"`` / ``chat_id=session_key``).
-When that session is gone, the event is stranded. The Captain inbox is a durable,
-profile-scoped ledger that guarantees *exactly one* Captain report across a
-profile's TUI/Desktop sessions: the live origin session owns delivery, and if it
-is absent/finalized the next active same-profile session may claim.
+The Captain inbox retains a report until its exact source can receive it.
+An absent source never authorizes a different same-profile conversation to
+claim the report. Lease, retry, settlement and GC remain independently fenced.
 
 These tests drive the real DB (temp SQLite from the autouse hermetic HERMES_HOME)
 and the real poller collector path in ``tui_gateway/server.py``.
@@ -168,8 +167,8 @@ def test_live_origin_owns_report_sibling_gets_none():
     assert _inbox_states() == {"acked": 1}
 
 
-# ── requirement 2: origin gone → another same-profile session claims once ──
-def test_origin_gone_sibling_claims_exactly_once():
+# ── requirement 2: absent origin remains pending until it returns ──
+def test_origin_gone_siblings_cannot_steal_report():
     profile = _profile_for(_session(ORIGIN_KEY))
     conn = kb.connect()
     try:
@@ -195,12 +194,13 @@ def test_origin_gone_sibling_claims_exactly_once():
     c1, c2 = [], []
     t1 = _collect_kanban_notifications(s1, claim_records=c1)
     t2 = _collect_kanban_notifications(s2, claim_records=c2)
-    total = t1 + t2
-    assert len(total) == 1
-    assert tid in total[0]
-
-    server._settle_kanban_notification_claims(c1, accepted=True)
-    server._settle_kanban_notification_claims(c2, accepted=True)
+    assert t1 + t2 == []
+    assert c1 + c2 == []
+    assert _inbox_states() == {"pending": 1}
+    origin = _session(ORIGIN_KEY)
+    claims = []
+    assert tid in _collect_kanban_notifications(origin, claim_records=claims)[0]
+    server._settle_kanban_notification_claims(claims, accepted=True)
     assert _collect_kanban_notifications(s1, claim_records=[]) == []
     assert _collect_kanban_notifications(s2, claim_records=[]) == []
 
@@ -233,7 +233,7 @@ def test_expired_lease_is_reclaimed_and_acked_once():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap4", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-r")
         kb.complete_task(conn, tid, summary="lease-test")
     finally:
         conn.close()
@@ -279,7 +279,7 @@ def test_live_owner_renews_lease_past_original_expiry(monkeypatch):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="slow-turn", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="slow-owner")
         kb.complete_task(conn, tid, summary="still running")
     finally:
         conn.close()
@@ -320,7 +320,7 @@ def test_expired_owner_cannot_ack_before_a_contender_reclaims(monkeypatch):
     try:
         tid = kb.create_task(conn, title="expired-owner", assignee="worker")
         kb.register_captain_owner(
-            conn, tid, profile=profile, origin_session_key=None
+            conn, tid, profile=profile, origin_session_key="expired-owner"
         )
         kb.complete_task(conn, tid, summary="expires before settlement")
     finally:
@@ -365,7 +365,7 @@ def test_ack_exception_releases_claim_for_retry(monkeypatch):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="ack-error", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="ack-error")
         kb.complete_task(conn, tid, summary="retry after exception")
     finally:
         conn.close()
@@ -393,7 +393,7 @@ def test_zero_row_ack_is_failure_and_releases_claim_for_retry(monkeypatch):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="zero-ack", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="zero-ack")
         kb.complete_task(conn, tid, summary="zero rows is not success")
     finally:
         conn.close()
@@ -489,7 +489,7 @@ def test_captain_delivery_uses_one_event_per_turn_across_boards():
         try:
             tid = kb.create_task(conn, title=board, assignee="worker")
             kb.register_captain_owner(
-                conn, tid, profile=profile, origin_session_key=None
+                conn, tid, profile=profile, origin_session_key="one-event-turn"
             )
             kb.complete_task(conn, tid, summary=f"one from {board}")
         finally:
@@ -529,7 +529,7 @@ def test_captain_turn_does_not_batch_an_ordinary_subscription_event():
     try:
         captain_tid = kb.create_task(conn, title="captain", assignee="worker")
         kb.register_captain_owner(
-            conn, captain_tid, profile=profile, origin_session_key=None
+            conn, captain_tid, profile=profile, origin_session_key="captain-plus-ordinary"
         )
         kb.complete_task(conn, captain_tid, summary="captain event")
     finally:
@@ -567,7 +567,7 @@ def test_dispatch_failure_releases_then_accepted_retry_no_replay():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap5", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-f")
         kb.complete_task(conn, tid, summary="retry-me")
     finally:
         conn.close()
@@ -662,7 +662,7 @@ def test_reopen_creates_new_report_without_replaying_acked():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap8", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-re")
         kb.complete_task(conn, tid, summary="first pass")
     finally:
         conn.close()
@@ -734,7 +734,7 @@ def test_archive_keeps_pending_then_purges_after_accepted_report():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap-arc", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-arc")
         kb.complete_task(conn, tid, summary="before archive")
         assert kb.archive_task(conn, tid)
         # Archive with unreported work retains the pending row + registration.
@@ -775,7 +775,7 @@ def test_archive_with_no_unreported_work_purges_directly():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap-arc2", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-arc2")
         kb.complete_task(conn, tid, summary="clean")
     finally:
         conn.close()
@@ -808,7 +808,7 @@ def test_captain_report_is_bounded_and_privacy_safe():
             conn, title="cap-priv", assignee="worker",
             body="SECRET BODY LINE\nmore secret material",
         )
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-p")
         kb.complete_task(conn, tid, summary="visible first\nhidden second line")
     finally:
         conn.close()
@@ -830,7 +830,7 @@ def test_captain_report_omits_raw_error_and_force_redacts_secrets():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap-secret", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-secret")
         with kb.write_txn(conn):
             kb._append_event(
                 conn,
@@ -857,7 +857,7 @@ def test_event_gc_preserves_unreported_captain_source_until_ack():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap-gc", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-gc")
         assert kb.complete_task(conn, tid, summary="survives event gc")
         with kb.write_txn(conn):
             conn.execute(
@@ -946,7 +946,8 @@ def test_mixed_case_profile_session_claims_its_own_rows():
     conn = kb.connect()
     try:
         tid = kb.create_task(
-            conn, title="cap-norm2", assignee="worker", captain_profile="otto"
+            conn, title="cap-norm2", assignee="worker", captain_profile="otto",
+            captain_origin_session_key="live-otto",
         )
         kb.complete_task(conn, tid, summary="cross-case claim")
     finally:
@@ -1026,7 +1027,7 @@ def test_collector_without_claim_records_never_consumes_pending():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap-none", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="live-none")
         kb.complete_task(conn, tid, summary="must stay pending")
     finally:
         conn.close()
@@ -1089,22 +1090,21 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap-loop", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=loop_key)
         kb.complete_task(conn, tid, summary="loop delivery")
     finally:
         conn.close()
 
     attempts: list[str] = []
     completion_ids: list[str | None] = []
-    turn_purposes: list[str | None] = []
+
 
     def submit(_rid, _sid, _session, text, **kwargs):
         attempts.append(text)
         completion_ids.append(kwargs.get("completion_id"))
-        turn_purposes.append(kwargs.get("turn_purpose"))
         if len(attempts) == 1:
             return False
-        kwargs["on_terminal"](True)
+        kwargs["terminal_callback"]({"status": "settled"})
         return True
 
     def run_once():
@@ -1129,7 +1129,7 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     assert attempts[1] == attempts[0]
     assert completion_ids[0]
     assert completion_ids[1] == completion_ids[0]
-    assert turn_purposes == ["captain_report", "captain_report"]
+
     assert _inbox_states() == {"acked": 1}
 
     # Turn finishes; a later idle poll must not replay the acked report.
@@ -1140,7 +1140,7 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     assert _inbox_states() == {"acked": 1}
 
 
-def test_poller_keeps_lease_when_failed_turn_could_not_rollback_input(monkeypatch):
+def test_poller_keeps_lease_when_failed_turn_retains_input(monkeypatch):
     from tools.process_registry import process_registry
 
     loop_key = "captain-rollback-failed"
@@ -1153,7 +1153,7 @@ def test_poller_keeps_lease_when_failed_turn_could_not_rollback_input(monkeypatc
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap-rollback", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=loop_key)
         kb.complete_task(conn, tid, summary="rollback failed")
     finally:
         conn.close()
@@ -1162,7 +1162,7 @@ def test_poller_keeps_lease_when_failed_turn_could_not_rollback_input(monkeypatc
 
     def submit(_rid, _sid, _session, _text, **kwargs):
         terminal_values.append(None)
-        kwargs["on_terminal"](None)
+        kwargs["terminal_callback"]({"status": "failed"})
         return True
 
     monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
@@ -1192,7 +1192,7 @@ def test_poller_defers_captain_claim_for_codex_app_server(monkeypatch):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="cap-codex", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=loop_key)
         kb.complete_task(conn, tid, summary="retry on supported runtime")
     finally:
         conn.close()
@@ -1238,10 +1238,10 @@ def test_captain_completion_identity_namespaces_board_local_delivery_ids():
 
 
 @pytest.mark.parametrize("ack_failure", ["exception", "zero_rows"])
-def test_persisted_captain_report_reconciles_across_same_profile_sessions(
+def test_persisted_captain_report_reconciles_only_in_origin(
     monkeypatch, ack_failure
 ):
-    """A profile-wide receipt moves to the fallback session without a new turn."""
+    """Ack recovery neither moves the visible report nor starts a second turn."""
     from hermes_state import SessionDB
     from tools.process_registry import process_registry
 
@@ -1255,7 +1255,7 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="captain-reconcile", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=first_session_id)
         kb.complete_task(conn, tid, summary="durable once")
     finally:
         conn.close()
@@ -1297,7 +1297,7 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
             content="Captain durable report",
             display_metadata={"captain_completion_id": completion_id},
         )
-        kwargs["on_terminal"](True)
+        kwargs["terminal_callback"]({"status": "settled"})
         return True
 
     monkeypatch.setattr(kb, "ack_captain_reports", fail_first_ack)
@@ -1318,8 +1318,7 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
     assert len(attempts) == 1
     assert _inbox_states() == {"pending": 1}
 
-    # Session A disappears after committing the receipt but before ack. A
-    # distinct same-profile session B must reconcile that receipt profile-wide.
+    # A disappears after persisting its report. A sibling must not take it.
     server._sessions.clear()
     fallback = {
         **_session(fallback_session_id),
@@ -1334,6 +1333,10 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
     )
 
     assert len(attempts) == 1
+    assert _inbox_states() == {"pending": 1}
+    first["running"] = False
+    server._notification_poller_loop(_StopAfterOnePoll(), "resumed-origin", first)
+    assert len(attempts) == 1
     assert _inbox_states() == {"acked": 1}
     first_rows = db.get_messages_as_conversation(first_session_id)
     fallback_rows = db.get_messages_as_conversation(fallback_session_id)
@@ -1345,16 +1348,14 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
         == attempts[0]
     ]
     assert [row["content"] for row in captain_rows] == ["Captain durable report"]
-    assert all(row.get("content") != "Captain durable report" for row in first_rows)
-    assert db.get_session(first_session_id)["message_count"] == 0
-    assert db.get_session(fallback_session_id)["message_count"] == 4
+    assert all(row.get("content") != "Captain durable report" for row in fallback_rows)
+    assert db.get_session(first_session_id)["message_count"] == 2
+    assert db.get_session(fallback_session_id)["message_count"] == 2
     assert [row.get("content") for row in fallback["history"]] == [
         "fallback ordinary question",
         "fallback ordinary answer",
-        submitted_prompts[0],
-        "Captain durable report",
     ]
-    visible = server._history_to_messages(fallback["history"])
+    visible = server._history_to_messages(first["history"])
     assert [
         row["text"]
         for row in visible
@@ -1387,7 +1388,7 @@ def test_reconciliation_ack_failures_do_not_stop_poller_or_receiver_heartbeats(
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="captain-survives", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=session_id)
         kb.complete_task(conn, tid, summary="retry ack twice")
     finally:
         conn.close()
@@ -1642,7 +1643,7 @@ def test_backlog_is_paged_under_strict_row_and_byte_caps():
         for i in range(total):
             tid = kb.create_task(conn, title=f"paged-{i:04d}", assignee="worker")
             kb.register_captain_owner(
-                conn, tid, profile=profile, origin_session_key=None
+                conn, tid, profile=profile, origin_session_key="paged"
             )
             kb.complete_task(conn, tid, summary="x" * 300)
     finally:
@@ -1680,7 +1681,7 @@ def test_row_cap_is_global_across_multiple_boards():
                     conn, title=f"{board}-{index}", assignee="worker"
                 )
                 kb.register_captain_owner(
-                    conn, tid, profile=profile, origin_session_key=None
+                    conn, tid, profile=profile, origin_session_key="global-cap"
                 )
                 kb.complete_task(conn, tid, summary="global page")
         finally:
@@ -1697,7 +1698,7 @@ def test_row_cap_is_global_across_multiple_boards():
     ) == server._CAPTAIN_TURN_ROW_CAP
 
 
-def test_ineligible_first_page_cannot_starve_later_fallback_report():
+def test_ineligible_first_page_cannot_starve_later_exact_origin_report():
     profile = _profile_for(_session("fallback-reader"))
     conn = kb.connect()
     try:
@@ -1712,7 +1713,7 @@ def test_ineligible_first_page_cannot_starve_later_fallback_report():
             kb.complete_task(conn, tid, summary="origin owns this")
         fallback_tid = kb.create_task(conn, title="fallback", assignee="worker")
         kb.register_captain_owner(
-            conn, fallback_tid, profile=profile, origin_session_key=None
+            conn, fallback_tid, profile=profile, origin_session_key="fallback-reader"
         )
         kb.complete_task(conn, fallback_tid, summary="must not starve")
     finally:
@@ -1734,7 +1735,7 @@ def test_byte_cap_releases_unrendered_rows_for_next_page(monkeypatch):
         for idx in range(2):
             tid = kb.create_task(conn, title=f"byte-cap-{idx}", assignee="worker")
             kb.register_captain_owner(
-                conn, tid, profile=profile, origin_session_key=None
+                conn, tid, profile=profile, origin_session_key="byte-cap"
             )
             kb.complete_task(conn, tid, summary=f"report-{idx}")
     finally:
@@ -1767,7 +1768,7 @@ def test_gc_compacts_old_acked_rows_and_reopen_gets_new_event():
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="gc-acked", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
+        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key="gc-acked")
         kb.complete_task(conn, tid, summary="first")
     finally:
         conn.close()

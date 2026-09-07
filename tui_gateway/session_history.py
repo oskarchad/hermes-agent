@@ -230,6 +230,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             msg["display_kind"] = display_kind
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
+            if role == "assistant" and m["display_metadata"].get("captain_completion_id"):
+                msg["id"] = m["display_metadata"]["captain_completion_id"]
         messages.append(msg)
     return messages
 

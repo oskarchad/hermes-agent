@@ -247,7 +247,8 @@ def _commit_turn_history(
 def _result_status(result: dict) -> str:
     return (
         "interrupted" if result.get("interrupted")
-        else "error" if result.get("error") else "complete")
+        else "error" if result.get("error") or result.get("failed")
+        or result.get("completed") is False else "complete")
 
 
 def _turn_outcome(result: Any) -> tuple[Any, str, str | None]:
@@ -433,6 +434,7 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    completion_id: str | None = None
 
 
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
@@ -511,6 +513,8 @@ def _invoke_agent(
     agent = st.agent
 
     def _stream(delta):
+        if st.completion_id:
+            return  # Captain output becomes visible only after its durable receipt.
         with session["history_lock"]:
             _append_inflight_delta(session, delta)
         payload = {"text": delta}
@@ -525,7 +529,7 @@ def _invoke_agent(
     def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
         _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
     agent.interim_assistant_callback = (
-        _interim_assistant_cb if _load_interim_assistant_messages() else None)
+        _interim_assistant_cb if not st.completion_id and _load_interim_assistant_messages() else None)
     # A synthesized turn is typed at turn START so a crash persist writes a timeline event,
     # not a raw user bubble; the post-turn stamp is the fallback for an older agent.
     st.run_kwargs = run_kwargs = {
@@ -625,6 +629,8 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     result, agent = st.result, st.agent
     raw, status, last_reasoning = _turn_outcome(result)
     payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+    if st.completion_id:
+        payload["id"] = st.completion_id
     if last_reasoning:
         payload["reasoning"] = last_reasoning
     if status_note:
@@ -754,7 +760,11 @@ def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    completion_id: str | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None) -> bool:
+    if completion_id:
+        display_kind = "hidden"
+        display_metadata = {"authorship": "system", "captain_completion_id": completion_id}
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
@@ -782,7 +792,7 @@ def _run_prompt_submit(
         runtime_session_token = _current_runtime_session_record.set(session)
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
-            receipt_committed=terminal_callback is None)
+            receipt_committed=terminal_callback is None, completion_id=completion_id)
         st.marker_key = _record_turn_marker(session, text)
         goal_followup = None
         try:
@@ -793,12 +803,16 @@ def _run_prompt_submit(
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata)
+            if completion_id and _result_status(st.result) == "complete":
+                from tui_gateway.captain_turn import persist_report_identity
+                persist_report_identity(st.agent, st.result, completion_id)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
             _emit("message.complete", sid, payload)
-            goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
-            if status == "complete":
+            if not completion_id:
+                goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+            if status == "complete" and not completion_id:
                 _after_complete_turn(sid, session, st, raw)
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)

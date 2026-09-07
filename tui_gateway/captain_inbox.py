@@ -96,30 +96,9 @@ def _captain_row_eligible(
     row_tenant,
     now: int,
 ) -> bool:
-    """Whether this session may claim a Captain row with the given origin.
-
-    - No origin (gateway/CLI/cron/unattached) → same-profile only when untenant.
-    - We ARE the origin → always ours while live.
-    - A different origin → only if that origin is not live and the row is
-      untenant. Tenant-tagged fallback fails closed until session transport
-      carries authoritative tenant identity.
-    """
+    """Offline origins remain queued; unresolved origins must not be guessed."""
     origin = str(origin_key).strip() if origin_key else ""
-    if not origin:
-        return not row_tenant
-    if origin == str(this_key or ""):
-        return True
-    if row_tenant:
-        return False
-    from hermes_cli import kanban_db as _kb
-
-    return not _kb.captain_receiver_is_live(
-        conn,
-        profile=profile,
-        session_key=origin,
-        now=now,
-        max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
-    )
+    return bool(origin and origin == str(this_key or ""))
 
 
 def _collect_captain_reports(
@@ -164,16 +143,21 @@ def _collect_captain_reports(
         return 0
 
     this_key = str(session.get("session_key") or "")
+    from hermes_cli.kanban_origin import compression_destinations
+    db = getattr(session.get("agent"), "_session_db", None)
+    keys = compression_destinations(getattr(db, "db_path", None), this_key)
+    if not keys or keys[-1] != this_key:
+        return 0
     now = int(time.time())
     try:
-        candidates = _kb.read_captain_candidates(
+        candidates = [row for key in keys for row in _kb.read_captain_candidates(
             conn,
             profile=captain_profile,
             now=now,
             limit=row_limit,
-            receiver_session_key=this_key,
+            receiver_session_key=key,
             receiver_max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
-        )
+        )]
     except Exception:
         return 0
     eligible = [
@@ -182,7 +166,7 @@ def _collect_captain_reports(
         if _captain_row_eligible(
             conn,
             profile=captain_profile,
-            this_key=this_key,
+            this_key=str(c.get("origin_session_key")) if c.get("origin_session_key") in keys else this_key,
             origin_key=c.get("origin_session_key"),
             row_tenant=c.get("tenant"),
             now=now,
@@ -191,6 +175,7 @@ def _collect_captain_reports(
     if not eligible:
         return 0
     task_cache: dict = {}
+    origins = {int(c["event_id"]): c["origin_session_key"] for c in candidates}
     used_bytes = sum(len(t.encode("utf-8")) + 1 for t in texts)
     leased_count = 0
     for event_id in eligible[:row_limit]:
@@ -207,7 +192,7 @@ def _collect_captain_reports(
             event_ids=[event_id],
             now=now,
             lease_seconds=_CAPTAIN_LEASE_SECONDS,
-            receiver_session_key=this_key,
+            receiver_session_key=origins[event_id],
             receiver_max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
         )
         if not events:
@@ -1272,7 +1257,7 @@ def _notification_poller_loop(
                                         _settled_event.set()
                                     raise
                                 if succeeded is None:
-                                    # Rollback of the crash-staged input failed.
+                                    # The current turn core retains failed input.
                                     # Leave the claim leased rather than making a
                                     # dirty retry immediately eligible; normal
                                     # lease expiry provides the bounded retry.
@@ -1294,20 +1279,15 @@ def _notification_poller_loop(
                                     _settled_event.set()
 
                         try:
-                            _emit("message.start", sid)
                             accepted = _run_prompt_submit(
                                 rid,
                                 sid,
                                 session,
                                 "\n".join(_kanban_texts),
-                                on_terminal=_settle_after_terminal,
-                                completion_id=completion_id,
-                                require_persisted=_has_captain_claim,
-                                turn_purpose=(
-                                    _CAPTAIN_TURN_PURPOSE
-                                    if _has_captain_claim
-                                    else "ordinary"
+                                terminal_callback=lambda receipt, _settle=_settle_after_terminal: _settle(
+                                    True if receipt.get("status") == "settled" else None
                                 ),
+                                completion_id=completion_id if _has_captain_claim else None,
                             )
                             if accepted is False:
                                 raise RuntimeError("synthetic turn was not accepted")

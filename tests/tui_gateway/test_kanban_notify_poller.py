@@ -33,7 +33,10 @@ def _session(key: str = SESSION_KEY) -> dict:
 def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui"):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="notify tui", assignee="worker")
+        tid = kb.create_task(
+            conn, title="tui-sub-test", assignee="worker",
+            captain_origin_session_key=chat_id,
+        )
         kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
         return tid
     finally:
@@ -291,14 +294,15 @@ class TestNotificationPollerLoopKanbanWiring:
             _session,
             text,
             *,
-            on_terminal=None,
+            terminal_callback=None,
             completion_id=None,
             **_kwargs,
         ):
             submits.append(text)
             assert not any(event == "message.complete" for event, _ in emits)
-            if on_terminal is not None:
-                on_terminal(True)
+            server._emit("message.start", _sid)
+            if terminal_callback is not None:
+                terminal_callback({"status": "settled"})
             server._emit(
                 "message.complete",
                 _sid,
@@ -370,13 +374,13 @@ class TestNotificationPollerLoopKanbanWiring:
             current_session,
             text,
             *,
-            on_terminal=None,
+            terminal_callback=None,
             completion_id=None,
             **_kwargs,
         ):
             accepted = submit(rid, sid, current_session, text)
-            if accepted is not False and on_terminal is not None:
-                on_terminal(True)
+            if accepted is not False and terminal_callback is not None:
+                terminal_callback({"status": "settled"})
                 server._emit(
                     "message.complete",
                     sid,
@@ -403,7 +407,7 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(e == "message.start" for e, _ in emits)
         completions = [p for e, p in emits if e == "message.complete"]
         assert len(completions) == 1
-        assert completions[0]["id"]
+        assert completions[0]["status"] == "complete"
         assert any(tid in text for text in submits), submits
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
@@ -483,10 +487,10 @@ class TestNotificationPollerLoopKanbanWiring:
             _session,
             _text,
             *,
-            on_terminal=None,
+            terminal_callback=None,
             **_kwargs,
         ):
-            callbacks.append(on_terminal)
+            callbacks.append(terminal_callback)
             return True
 
         monkeypatch.setattr(server, "_run_prompt_submit", defer_terminal)
@@ -502,7 +506,7 @@ class TestNotificationPollerLoopKanbanWiring:
             # Let the poller enter another interval while the asynchronous turn
             # remains active. Its next loop must not rebind this turn's closure.
             _time.sleep(0.05)
-            callbacks[0](True)
+            callbacks[0]({"status": "settled"})
         finally:
             stop.set()
             thread.join(timeout=5)

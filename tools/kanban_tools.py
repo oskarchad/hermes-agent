@@ -835,6 +835,9 @@ def _handle_create(args: dict, **kw) -> str:
             "enabled_toolsets must be a list of toolset names, got "
             f"{type(enabled_toolsets).__name__}"
         )
+    from hermes_cli.kanban_origin import captain_origin_key
+    target = _resolve_notify_target()
+    origin_key = captain_origin_key(target["platform"], target["chat_id"]) if target else None
     with _board(args.get("board")) as (kb, conn):
         if project_id is None and workspace_kind is None and workspace_path is None:
             self_tid = os.environ.get("HERMES_KANBAN_TASK")
@@ -854,7 +857,9 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
+            captain_profile=target["notifier_profile"] if origin_key else None,
+            captain_origin_session_key=origin_key)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 

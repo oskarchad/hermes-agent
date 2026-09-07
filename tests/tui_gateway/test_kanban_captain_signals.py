@@ -272,7 +272,9 @@ def test_captain_signal_delivery_reads_bounded_redacted_authoritative_comment(
 
     conn = kb.connect(tmp_path / "delivery.db")
     try:
-        task_id = kb.create_task(conn, title="decision target", assignee="worker")
+        task_id = kb.create_task(conn, title="decision target", assignee="worker",
+                                 captain_profile="default",
+                                 captain_origin_session_key="captain-live")
         secret = "«redacted:sk-…»"
         comment_id = kb.add_comment(
             conn,
