@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v3"
+SCANNER_VERSION = "skills-guard-v4"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -395,34 +395,37 @@ _CONTAINMENT_REQUIREMENT = re.compile(
     r'(?P<quote>`?)[\w./-]*/etc/(?:passwd|shadow)(?P=quote)\s+'
     r'must\s+not\s+escape\s+(?:the\s+)?(?:base|root)(?:\s+dir(?:ectory)?)?\.?',
     re.IGNORECASE)
-_SYSTEM_PASSWORD_PATH = re.compile(r'/etc/passwd|/etc/shadow', re.IGNORECASE)
-# Inspect the whole line, including cells/sentences without a repeated path.
-# An instruction can refer to "the file" rather than spelling the path twice.
-_CONTAINMENT_ACCESS_CONTEXT = re.compile(
-    r'\b(?:read|open|cat|send|upload|copy|print|dump|extract|exfiltrate|transmit|'
-    r'fetch|retrieve|access|execute|run|curl|wget)\b', re.IGNORECASE)
+_CONTAINMENT_COMMENT = re.compile(
+    r'(?:\d+\.\s+path traversal\.\s+)?' + _CONTAINMENT_REQUIREMENT.pattern,
+    re.IGNORECASE)
 
 
-def _is_containment_reference(line: str, suffix: str) -> bool:
-    """Recognize a path-only containment requirement, not general 'safe' prose.
+def _is_containment_reference(lines: list[str], suffix: str) -> bool:
+    """Recognize only a complete file of containment requirements, never excerpts.
 
-    Only whole Markdown cells or the final sentence of a full-line Python/shell
-    comment qualify. Unknown prose, code arguments, assignments, and mixed access
-    remain critical. Even recognized references require review (high), not trust.
+    A verb blacklist or a nearby-line window loses instructions referring to
+    "the file" elsewhere. Every nonblank line/cell must fit this positive grammar;
+    unknown prose or executable context retains critical, even in benchmark docs.
+    This intentionally does not classify arbitrary documents as safe.
     """
-    if _CONTAINMENT_ACCESS_CONTEXT.search(line):
-        return False
-    text = line.strip()
-    if suffix in {'.py', '.sh', '.bash'} and text.startswith('#'):
-        clauses = [text[1:].strip().rsplit('. ', 1)[-1]]
-    elif suffix == '.md' and text.startswith('|') and text.endswith('|'):
-        clauses = [cell.strip() for cell in text[1:-1].split('|')]
-    else:
-        return False
-    references = [clause for clause in clauses if _CONTAINMENT_REQUIREMENT.fullmatch(clause)]
-    # Every sensitive path on the original line must belong to a recognized
-    # requirement; a second read/command in another cell is never waived.
-    return bool(references) and len(references) == len(_SYSTEM_PASSWORD_PATH.findall(line))
+    found = False
+    for line in lines:
+        text = line.strip()
+        if not text:
+            continue
+        if suffix in {'.py', '.sh', '.bash'} and text.startswith('#'):
+            if not _CONTAINMENT_COMMENT.fullmatch(text[1:].strip()):
+                return False
+        elif suffix == '.md' and text.startswith('|') and text.endswith('|'):
+            cells = [cell.strip() for cell in text[1:-1].split('|')]
+            if cells[0].lower() == 'constraint':
+                cells = cells[1:]
+            if not cells or not all(_CONTAINMENT_REQUIREMENT.fullmatch(cell) for cell in cells):
+                return False
+        else:
+            return False
+        found = True
+    return found
 
 
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
@@ -436,13 +439,14 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     except (UnicodeDecodeError, OSError):
         return []
     findings = []
+    containment_only = _is_containment_reference(lines, file_path.suffix.lower())
     docstring_lines = _compute_docstring_lines(lines)  # so code patterns don't fire on prose
     for pattern, pid, severity, category, description in _COMPILED_THREAT_PATTERNS:
         for i, line in enumerate(lines, start=1):
             if i not in docstring_lines and pattern.search(line):
                 text = line.strip()
                 finding_pid, finding_severity, finding_description = pid, severity, description
-                if pid == "system_passwd_access" and _is_containment_reference(line, file_path.suffix.lower()):
+                if pid == "system_passwd_access" and containment_only:
                     finding_pid, finding_severity = "system_passwd_reference", "high"
                     finding_description = "system password path in a containment requirement (review context)"
                 findings.append(Finding(finding_pid, finding_severity, category, rel_path, i,
