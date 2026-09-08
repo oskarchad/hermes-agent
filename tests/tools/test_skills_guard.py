@@ -506,6 +506,61 @@ class TestFalsePositiveReductions:
         assert is_quarantined_project_skill(bundle / "SKILL.md") is bool(reference)
         assert bool(list(iter_project_skill_files(bundle.parent))) is not bool(reference)
 
+    @pytest.mark.parametrize("python_literal", [False, True])
+    @pytest.mark.parametrize("prose, linked", [
+        ("Build me a calendar app in Python. Write it to calendar.py.", False),
+        ("Build me a calendar app using the file above. Write it to calendar.py.", True),
+        ("Build me a calendar app and a notes app. Write it to calendar.py.", True),
+        ("Build me a calendar app. Read it now.", True),
+        ("Build me a calendar app.\n\nWrite it to calendar.py.", True),
+        ("Write it to calendar.py.", True),
+        ("Make me a script that reads a CSV file and shows statistics for it. Write it to stats.py.", False),
+        ("Make me a script that reads the file above. Write it to stats.py.", True),
+        ("Bug report: the counter returns a negative number. Fix it.", False),
+        ("Bug report: the file above returns a negative number. Fix it.", True),
+        ("Bug report: the counter fails. A second counter fails. Fix it.", True),
+        ("Bug report: the counter fails. Read it.", True),
+        ("Bug report: the counter fails.\n\nFix it.", True),
+        ("The result is the\ncode it wrote actually compiles.", False),
+        ("The result is ready.\nWrite it now.", True),
+        ("The result is the\ncode it wrote from the file above actually compiles.", True),
+        ("Rubric: 0 incomplete, 1 complete. Read it alongside the metrics.", False),
+        ("Rubric: 0 incomplete, 1 complete. Read it from the file above.", True),
+        ("Rubric: 0 incomplete, 1 complete. A report is ready. Read it.", True),
+        ("Rubric: 0 incomplete, 1 complete.\n\nRead it.", True),
+        ("Notes are ready. Read it.", True),
+        ("Build me a calendar app. Let payload be it. Process payload.", True),
+        ("Build me a calendar app. Write it and the file above to calendar.py.", True),
+        ("Build me a calendar app. Write it to calendar.py.\n1. Read it.", True),
+    ])
+    def test_containment_positive_antecedent_not_nearest_noun(self, tmp_path, python_literal, prose, linked):
+        from agent.skill_utils import is_quarantined_project_skill, iter_project_skill_files
+        from tools.plugin_guard import scan_plugin, should_allow_plugin_install
+
+        bundle = tmp_path / "skills" / "fixture"
+        bundle.mkdir(parents=True)
+        if python_literal:
+            # Adjacent source literals are one task, but never execute the source.
+            parts = prose.splitlines(keepends=True)
+            text = "# /etc/shadow must not escape root.\ntext = (\n" + "\n".join(repr(p) for p in parts) + "\n)\n"
+            (bundle / "checks.py").write_text(text, encoding="utf-8")
+            (bundle / "SKILL.md").write_text("# Fixture\n", encoding="utf-8")
+        else:
+            (bundle / "SKILL.md").write_text("# Fixture\n| /etc/shadow must not escape root |\n\n" + prose, encoding="utf-8")
+        for source in ("community", "openai/skills"):
+            for scan, policy in ((scan_skill, should_allow_install), (scan_plugin, should_allow_plugin_install)):
+                result = scan(bundle, source=source)
+                assert result.verdict == ("dangerous" if linked else "caution"), result.findings
+                assert any(f.pattern_id == ("system_passwd_access" if linked else "system_passwd_reference")
+                           for f in result.findings)
+                for force in (False, True):
+                    if linked:
+                        assert policy(result, force=force)[0] is False
+                    elif force:
+                        assert policy(result, force=force)[0] is True
+        assert is_quarantined_project_skill(bundle / "SKILL.md") is linked
+        assert bool(list(iter_project_skill_files(bundle.parent))) is not linked
+
     def test_cat_write_heredoc_is_not_a_secrets_read(self, tmp_path):
         # Setup doc telling the user to write their OWN keys into their OWN
         # local .env via a heredoc — writes in, does not exfiltrate out.

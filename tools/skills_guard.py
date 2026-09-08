@@ -7,6 +7,7 @@ Known gap: language write APIs (open(..., 'w'), Path.write_text, shutil.copy*, f
 agent-config files surface only the low *_ref finding — static regexes cannot tie the call to a dynamic
 destination; future coverage belongs as a fourth "mechanical" tier next to agent_config_mod_shell."""
 
+import ast
 import re
 import fnmatch
 import hashlib
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v6"
+SCANNER_VERSION = "skills-guard-v7"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -418,8 +419,69 @@ _CONTAINMENT_BARE_PRONOUN = re.compile(
     # List markers, clause boundaries and trailing modifiers do not resolve "it".
     # Keep the operation generic: an unknown verb is still unresolved use.
     r'(?:^|[.!?;:|])[#\s>*+-]*(?:\d+[.)]\s+)?'
-    r'(?:(?:now|then|please)\s+)?\w+\s+it\b',
+    r'(?:(?:now|then|please)\s+)?(?P<operation>\w+)\s+it\b',
     re.IGNORECASE | re.MULTILINE)
+
+
+def _containment_contexts(text: str, suffix: str) -> list[str]:
+    """Decode Python literal tasks without importing/executing the scanned source.
+
+    Keep raw nonliteral code/comments, too. A string boundary never proves an
+    antecedent: an unresolved instruction in any literal vetoes the downgrade.
+    """
+    if suffix != '.py':
+        return [text]
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return [text]
+    raw_lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in raw_lines:
+        offsets.append(offsets[-1] + len(line.encode('utf-8')))
+    raw = bytearray(text.encode('utf-8'))
+    contexts = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            contexts.append(node.value)
+            start = offsets[node.lineno - 1] + node.col_offset
+            end = offsets[node.end_lineno - 1] + node.end_col_offset
+            raw[start:end] = bytes(10 if byte == 10 else 32 for byte in raw[start:end])
+    return [raw.decode('utf-8'), *contexts]
+
+
+def _containment_pronoun_reason(context: str, match: re.Match) -> str | None:
+    """Positive, bounded grammatical evidence; unknown/competing uses stay unresolved.
+
+    Supported: a prohibition, a subject in a relative clause, a construction
+    request followed by writing its product, repairing an explicit issue report,
+    and reading an explicitly defined numeric scale. Not nearest-noun resolution.
+    """
+    before = context[:match.start()]
+    if re.search(r'\bmust\s+not\s*$', before, re.IGNORECASE):
+        return 'prohibition'
+    if (re.search(r'\bthe\s*$', before, re.IGNORECASE)
+            and re.match(r'\s+(?:wrote|created|generated|produced)\b', context[match.end():], re.IGNORECASE)):
+        return 'relative-clause subject'
+    # Only an explicit antecedent in the immediately preceding sentence of the
+    # same paragraph can resolve the object. Blank lines never introduce one.
+    if re.search(r'\n\s*\n', context[match.start():match.start('operation')]):
+        return None
+    paragraph = re.split(r'\n\s*\n', before)[-1]
+    sentence = re.split(r'[.!?](?=\s|$)', paragraph)[-1].strip()
+    operation = match['operation'].lower()
+    if re.search(r'\b(?:and|or|with)\s+(?:a|an|the|another|this|that)\b', sentence, re.IGNORECASE):
+        return None
+    if operation == 'write' and re.fullmatch(
+            r'(?:build|make|write|create)\s+(?:me\s+)?(?:a|an)\s+\w.+', sentence, re.IGNORECASE):
+        return 'construction product'
+    if operation == 'fix' and re.search(
+            r'\b(?:bug|error|defect|issue)\s+report:\s*\S.+$', sentence, re.IGNORECASE):
+        return 'reported defect'
+    if operation == 'read' and re.search(
+            r'\b\w+:\s*0\s+[^:]+,\s*1\s+[^:]+$', sentence, re.IGNORECASE):
+        return 'defined numeric scale'
+    return None
 
 
 def _containment_reference_lines(lines: list[str], suffix: str) -> set[int]:
@@ -452,16 +514,22 @@ def _containment_reference_lines(lines: list[str], suffix: str) -> set[int]:
             residual.append(_CONTAINMENT_REQUIREMENT.sub('', line))
         else:
             residual.append(line)
-    # Formatting/comment prefixes cannot sever an otherwise explicit reference.
-    context = '\n'.join(line.lstrip().lstrip('#> ').replace('`', '').replace('*', '')
-                        for line in residual)
-    if _CONTAINMENT_LINK.search(context):
+    if not candidates:
         return set()
-    for match in _CONTAINMENT_BARE_PRONOUN.finditer(context):
-        # A wrapped "must not\ncrash it" is a prohibition, not a new
-        # imperative. Do not give line wrapping semantic authority.
-        if not re.search(r'\bmust\s+not\s*$', context[:match.start()], re.IGNORECASE):
-            return set()
+
+    def normalize(text: str) -> str:
+        return '\n'.join(line.lstrip().lstrip('#> ').replace('`', '').replace('*', '')
+                         for line in text.splitlines())
+
+    raw = '\n'.join(residual)
+    # Preserve the raw explicit-link veto as well as decoded string references.
+    contexts = [normalize(part) for part in _containment_contexts(raw, suffix)]
+    if any(_CONTAINMENT_LINK.search(part) for part in [normalize(raw), *contexts]):
+        return set()
+    for context in contexts:
+        for match in _CONTAINMENT_BARE_PRONOUN.finditer(context):
+            if _containment_pronoun_reason(context, match) is None:
+                return set()
     return candidates
 
 
