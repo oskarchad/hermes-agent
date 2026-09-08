@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v2"
+SCANNER_VERSION = "skills-guard-v3"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -391,6 +391,33 @@ def _compute_docstring_lines(lines: list) -> set:
     return doc_lines
 
 
+_CONTAINMENT_REQUIREMENT = re.compile(
+    r'(?P<quote>`?)[\w./-]*/etc/(?:passwd|shadow)(?P=quote)\s+'
+    r'must\s+not\s+escape\s+(?:the\s+)?(?:base|root)(?:\s+dir(?:ectory)?)?\.?',
+    re.IGNORECASE)
+_SYSTEM_PASSWORD_PATH = re.compile(r'/etc/passwd|/etc/shadow', re.IGNORECASE)
+
+
+def _is_containment_reference(line: str, suffix: str) -> bool:
+    """Recognize a path-only containment requirement, not general 'safe' prose.
+
+    Only whole Markdown cells or the final sentence of a full-line Python/shell
+    comment qualify. Unknown prose, code arguments, assignments, and mixed access
+    remain critical. Even recognized references require review (high), not trust.
+    """
+    text = line.strip()
+    if suffix in {'.py', '.sh', '.bash'} and text.startswith('#'):
+        clauses = [text[1:].strip().rsplit('. ', 1)[-1]]
+    elif suffix == '.md' and text.startswith('|') and text.endswith('|'):
+        clauses = [cell.strip() for cell in text[1:-1].split('|')]
+    else:
+        return False
+    references = [clause for clause in clauses if _CONTAINMENT_REQUIREMENT.fullmatch(clause)]
+    # Every sensitive path on the original line must belong to a recognized
+    # requirement; a second read/command in another cell is never waived.
+    return bool(references) and len(references) == len(_SYSTEM_PASSWORD_PATH.findall(line))
+
+
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     """Threat-pattern + invisible-unicode scan of one file; *rel_path* is the display path (default: file
     name). Regex findings dedupe per pattern per line; invisible chars yield one per line."""
@@ -407,8 +434,12 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
         for i, line in enumerate(lines, start=1):
             if i not in docstring_lines and pattern.search(line):
                 text = line.strip()
-                findings.append(Finding(pid, severity, category, rel_path, i,
-                                        text if len(text) <= 120 else text[:117] + "...", description))
+                finding_pid, finding_severity, finding_description = pid, severity, description
+                if pid == "system_passwd_access" and _is_containment_reference(line, file_path.suffix.lower()):
+                    finding_pid, finding_severity = "system_passwd_reference", "high"
+                    finding_description = "system password path in a containment requirement (review context)"
+                findings.append(Finding(finding_pid, finding_severity, category, rel_path, i,
+                                        text if len(text) <= 120 else text[:117] + "...", finding_description))
     for i, line in enumerate(lines, start=1):
         if (char := next((c for c in INVISIBLE_CHARS if c in line), None)) is not None:
             name = _unicode_char_name(char)
