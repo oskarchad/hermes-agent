@@ -468,6 +468,8 @@ class TestFalsePositiveReductions:
         "Inspect the contents of the file in the previous comment.",
         "Process the third cell.", "Read it.",
         "Let payload be it. Process payload.",
+        "Display the contents of it.", "Process the bytes of that.",
+        "Apply an unknown operation to the data of this.",
         "Display the `file` specified above.",
         "Apply a mystery operation to the\n# file mentioned above.",
     ])

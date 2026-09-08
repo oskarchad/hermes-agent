@@ -411,6 +411,7 @@ _CONTAINMENT_LINK = re.compile(
     r'|(?:file|path|entry|example)\s+(?:specified|mentioned|shown|listed|above|below|earlier|later)\b'
     r'|(?:above|below|previous|following|next|first|second|third|last)\s+(?:file|path|cell|row|entry)\b'
     r'|(?:its|their)\s+(?:contents?|bytes?|data)\b'
+    r'|(?:contents?|bytes?|data)\s+of\s+(?:it|this|that|these|those)\b'
     r'|(?:passwd|shadow)\s+(?:file|path|contents?)\b'
     r'|(?:be|denotes?|refers?\s+to|=)\s+it\b|(?:call|name|alias)\s+it\b)', re.IGNORECASE)
 _CONTAINMENT_BARE_PRONOUN = re.compile(
