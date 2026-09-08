@@ -3,6 +3,7 @@
 ## Index
 
 - [ADR 0001: Retain only upstream-missing custom runtime behavior](0001-retained-custom-runtime-delta.md)
+- [ADR 0002: Upstream-First Overlay Update Pattern for Major Refactors](0002-upstream-first-overlay-update.md)
 
 ## 2026-07-13: Scope plugin manager state by Hermes home/profile (keyed cache)
 

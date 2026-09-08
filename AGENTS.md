@@ -404,6 +404,9 @@ extract, not to regex around it.
 
 ## Routing Table — working in X → read X/AGENTS.md
 
+For retained runtime changes, read the [ADR index](docs/ADR.md).
+Contributor attribution follows the [contributor guide](contributors/README.md).
+
 | Area | Read | Covers |
 |---|---|---|
 | `run_agent.py`, `agent/` | `agent/AGENTS.md` | AIAgent + mixins, turn phases, caching integrity, message-flow invariants, compression, model/aux resolution |
