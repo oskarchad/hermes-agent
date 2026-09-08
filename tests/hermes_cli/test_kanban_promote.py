@@ -17,6 +17,7 @@ import pytest
 from hermes_cli import kanban as kb_cli
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli.kanban_db_promotion import promote_task
 
 
 @pytest.fixture
@@ -59,7 +60,7 @@ def _stuck_todo(conn, *, parents_done=True, n_parents=1):
 
 def test_promote_stuck_todo_succeeds(conn):
     child, _ = _stuck_todo(conn, parents_done=True)
-    ok, err = kb.promote_task(conn, child, actor="tester")
+    ok, err = promote_task(conn, child, actor="tester")
     assert ok and err is None
     assert kb.get_task(conn, child).status == "ready"
 

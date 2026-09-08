@@ -1025,6 +1025,8 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_db_promotion import promote_task
+
     reason = _joined_words(args.reason)
     author = _profile_author()
     # Dedupe while preserving order; positional task_id always first.
@@ -1034,7 +1036,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, force=force, dry_run=dry_run)
+            ok, err = promote_task(conn, tid, actor=author, reason=reason, force=force, dry_run=dry_run)
             results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run, "forced": force,
                             "reason": reason, "error": err})
 
