@@ -3980,7 +3980,8 @@ def specify_triage_task(
             )
         _append_event(
             conn, task_id, "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
+            # The automatic decomposer shares this transition with explicit specify.
+            {"changed_fields": changed_fields, "author": (author or "").strip() or None},
         )
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.

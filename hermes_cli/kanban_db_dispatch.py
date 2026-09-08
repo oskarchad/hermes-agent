@@ -1466,7 +1466,8 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
+    (PR URL in a recent comment without a later, unconsumed explicit
+    continuation; re-spawning risks a duplicate PR). The review
     lane skips the last two: they are the *inputs* to a review handoff. Stale /
     dead claim locks are NOT a guard reason — the reclaim passes own those.
     """
@@ -1539,13 +1540,31 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # Explicit lifecycle continuation authorizes ONE claim on the same card.
+    # Automatic promotion/recovery and comment prose must not mint permission.
+    continuation = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? "
+        "AND kind IN ('specified', 'unblocked', 'promoted_manual', "
+        "'review_reopened', 'changes_requested') "
+        # Legacy specified events have no author: they cannot prove authority.
+        "AND (kind != 'specified' OR (json_type(payload, '$.author') = 'text' "
+        "AND TRIM(json_extract(payload, '$.author')) NOT IN ('', 'auto-decomposer'))) "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events "
+        "WHERE task_id = ? AND kind = 'claimed'), 0) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, task_id),
+    ).fetchone()
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+            # Separate tables have no shared sequence: equal-second timestamps
+            # cannot prove that continuation followed this checkpoint. Fail closed.
+            if continuation is None or continuation["created_at"] <= c["created_at"]:
+                return "active_pr"
 
     return None
 
