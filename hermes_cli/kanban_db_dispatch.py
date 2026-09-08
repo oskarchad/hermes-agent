@@ -1546,6 +1546,9 @@ def check_respawn_guard(
         "SELECT created_at FROM task_events WHERE task_id = ? "
         "AND kind IN ('specified', 'unblocked', 'promoted_manual', "
         "'review_reopened', 'changes_requested') "
+        # Legacy specified events have no author: they cannot prove authority.
+        "AND (kind != 'specified' OR (json_type(payload, '$.author') = 'text' "
+        "AND TRIM(json_extract(payload, '$.author')) NOT IN ('', 'auto-decomposer'))) "
         "AND id > COALESCE((SELECT MAX(id) FROM task_events "
         "WHERE task_id = ? AND kind = 'claimed'), 0) "
         "ORDER BY id DESC LIMIT 1",
