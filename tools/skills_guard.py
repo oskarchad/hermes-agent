@@ -461,7 +461,7 @@ def _containment_pronoun_reason(context: str, match: re.Match) -> str | None:
     if re.search(r'\bmust\s+not\s*$', before, re.IGNORECASE):
         return 'prohibition'
     if (re.search(r'\bthe\s*$', before, re.IGNORECASE)
-            and re.match(r'\s+(?:wrote|created|generated|produced)\b', context[match.end():], re.IGNORECASE)):
+            and re.match(r'\s+(?:wrote|created|generated|produced|cut)\b', context[match.end():], re.IGNORECASE)):
         return 'relative-clause subject'
     # Only an explicit antecedent in the immediately preceding sentence of the
     # same paragraph can resolve the object. Blank lines never introduce one.
@@ -470,13 +470,14 @@ def _containment_pronoun_reason(context: str, match: re.Match) -> str | None:
     paragraph = re.split(r'\n\s*\n', before)[-1]
     sentence = re.split(r'[.!?](?=\s|$)', paragraph)[-1].strip()
     operation = match['operation'].lower()
-    if re.search(r'\b(?:and|or|with)\s+(?:a|an|the|another|this|that)\b', sentence, re.IGNORECASE):
+    if re.search(r'\b(?:and|or)\s+(?:a|an|the|another|this|that)\b', sentence, re.IGNORECASE):
         return None
-    if operation == 'write' and re.fullmatch(
-            r'(?:build|make|write|create)\s+(?:me\s+)?(?:a|an)\s+\w.+', sentence, re.IGNORECASE):
+    if (operation == 'write' and not re.search(r'\bwith\s+(?:a|an|the)\b', sentence, re.IGNORECASE)
+            and re.fullmatch(r'(?:build|make|write|create)\s+(?:me\s+)?(?:a|an)\s+\w.+',
+                             sentence, re.IGNORECASE | re.DOTALL)):
         return 'construction product'
     if operation == 'fix' and re.search(
-            r'\b(?:bug|error|defect|issue)\s+report:\s*\S.+$', sentence, re.IGNORECASE):
+            r'\b(?:bug|error|defect|issue)\s+report:\s*\S.+$', sentence, re.IGNORECASE | re.DOTALL):
         return 'reported defect'
     if operation == 'read' and re.search(
             r'\b\w+:\s*0\s+[^:]+,\s*1\s+[^:]+$', sentence, re.IGNORECASE):
