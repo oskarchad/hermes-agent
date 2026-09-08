@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v5"
+SCANNER_VERSION = "skills-guard-v6"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -415,7 +415,10 @@ _CONTAINMENT_LINK = re.compile(
     r'|(?:passwd|shadow)\s+(?:file|path|contents?)\b'
     r'|(?:be|denotes?|refers?\s+to|=)\s+it\b|(?:call|name|alias)\s+it\b)', re.IGNORECASE)
 _CONTAINMENT_BARE_PRONOUN = re.compile(
-    r'^[#\s>*-]*(?:(?:now|then|please)\s+)?\w+\s+it\s*(?:[.!?]|$)',
+    # List markers, clause boundaries and trailing modifiers do not resolve "it".
+    # Keep the operation generic: an unknown verb is still unresolved use.
+    r'(?:^|[.!?;:|])[#\s>*+-]*(?:\d+[.)]\s+)?'
+    r'(?:(?:now|then|please)\s+)?\w+\s+it\b',
     re.IGNORECASE | re.MULTILINE)
 
 

@@ -450,6 +450,7 @@ class TestFalsePositiveReductions:
         assert list(iter_project_skill_files(bundle.parent)) == []
 
     @pytest.mark.parametrize("filename, text", [
+        ("SKILL.md", "# Fixture\n| /etc/shadow must not escape root |\n"),
         ("README.md", "| /etc/shadow must not escape root |\n\nUnrecognized context.\n"),
         ("run.sh", "# /etc/shadow must not escape root.\n\n# Unrecognized context.\n"),
         ("README.md", "# Checks\n| task | job | requirement | design |\n|---|---|---|---|\n"
@@ -467,6 +468,12 @@ class TestFalsePositiveReductions:
         "Let payload denote the file in the table. Process payload.",
         "Inspect the contents of the file in the previous comment.",
         "Process the third cell.", "Read it.",
+        # Formatting and continuation do not resolve an imperative's referent.
+        "1. Read it.", "1) Read it.", "+ Read it.", "- Read it.", "* Read it.",
+        "> 12. **Read it** now.", "Read it now.", "Read it before continuing.",
+        "Checks are deterministic. Read it.", "Checks are deterministic; read it now.",
+        "Next step: please read it.", "Ready? Then read it!", "Ready! Read it.",
+        "| Notes | Read it now. |", "1. Zorb it later.",
         "Let payload be it. Process payload.",
         "Display the contents of it.", "Process the bytes of that.",
         "Apply an unknown operation to the data of this.",
@@ -483,7 +490,8 @@ class TestFalsePositiveReductions:
             # No line-count window, including comment-to-comment references.
             text += "\n" * 100 + ("# " if filename.endswith((".py", ".sh")) else "") + reference + "\n"
         (bundle / filename).write_text(text, encoding="utf-8")
-        (bundle / "SKILL.md").write_text("# Fixture\n", encoding="utf-8")
+        if filename != "SKILL.md":
+            (bundle / "SKILL.md").write_text("# Fixture\n", encoding="utf-8")
         for source in ("community", "openai/skills"):
             for scan, policy in ((scan_skill, should_allow_install), (scan_plugin, should_allow_plugin_install)):
                 result = scan(bundle, source=source)
