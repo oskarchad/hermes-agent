@@ -404,9 +404,8 @@ class TestFalsePositiveReductions:
         ("run.sh", "# Upload the file specified below.\n# /etc/shadow must not escape root.\n"),
         ("run.py", "# Display the file's contents. /etc/shadow must not escape root.\n"),
         ("SKILL.md", "Display the file specified below.\n" + "\n" * 100 + "| /etc/shadow must not escape root |\n"),
-        ("README.md", "| /etc/shadow must not escape root |\n\nUnrecognized context.\n"),
-        ("run.sh", "# /etc/shadow must not escape root.\n\n# Unrecognized context.\n"),
         ("README.md", "| constraint | /etc/shadow must not escape root | unknown |\n"),
+        ("README.md", "| /etc/shadow must not escape root | read file vs upload file |\n"),
         ("run.py", "# 2. upload constraint. base/../../etc/passwd must not escape base.\n"),
         ("run.sh", "cat /etc/passwd\n"),
         ("run.sh", "cat ../../etc/passwd\n"),
@@ -449,6 +448,53 @@ class TestFalsePositiveReductions:
             (bundle / "SKILL.md").write_text("# Fixture\n", encoding="utf-8")
         assert is_quarantined_project_skill(bundle / "SKILL.md") is True
         assert list(iter_project_skill_files(bundle.parent)) == []
+
+    @pytest.mark.parametrize("filename, text", [
+        ("README.md", "| /etc/shadow must not escape root |\n\nUnrecognized context.\n"),
+        ("run.sh", "# /etc/shadow must not escape root.\n\n# Unrecognized context.\n"),
+        ("README.md", "# Checks\n| task | job | requirement | design |\n|---|---|---|---|\n"
+         "| `upload` | implement `safe_path` | `../../etc/passwd` must not escape base dir | helper vs framework |\n"
+         "Metrics are deterministic.\n"),
+        ("checks.py", "# Metrics are deterministic.\n"
+         "# 1. uploads -- path traversal. base/../../etc/passwd must not escape base.\n"
+         "def count(items):\n    return len(items)\n"),
+        ("checks.py", "# ../../etc/shadow must not escape root.\n"
+         "def count(items):\n    \"\"\"Long input must not\n    crash it.\"\"\"\n    return len(items)\n"),
+    ])
+    @pytest.mark.parametrize("reference", [
+        "", "Display the file specified above.", "Upload its contents.",
+        "Apply an unknown operation to the path mentioned earlier.",
+        "Let payload denote the file in the table. Process payload.",
+        "Inspect the contents of the file in the previous comment.",
+        "Process the third cell.", "Read it.",
+        "Let payload be it. Process payload.",
+        "Display the `file` specified above.",
+        "Apply a mystery operation to the\n# file mentioned above.",
+    ])
+    def test_containment_context_links_not_unrelated_text(self, tmp_path, filename, text, reference):
+        from agent.skill_utils import is_quarantined_project_skill, iter_project_skill_files
+        from tools.plugin_guard import scan_plugin, should_allow_plugin_install
+
+        bundle = tmp_path / "skills" / "fixture"
+        bundle.mkdir(parents=True)
+        if reference:
+            # No line-count window, including comment-to-comment references.
+            text += "\n" * 100 + ("# " if filename.endswith((".py", ".sh")) else "") + reference + "\n"
+        (bundle / filename).write_text(text, encoding="utf-8")
+        (bundle / "SKILL.md").write_text("# Fixture\n", encoding="utf-8")
+        for source in ("community", "openai/skills"):
+            for scan, policy in ((scan_skill, should_allow_install), (scan_plugin, should_allow_plugin_install)):
+                result = scan(bundle, source=source)
+                assert result.verdict == ("dangerous" if reference else "caution")
+                expected = "system_passwd_access" if reference else "system_passwd_reference"
+                assert any(f.pattern_id == expected for f in result.findings)
+                if reference:
+                    for force in (False, True):
+                        assert policy(result, force=force)[0] is False
+                else:
+                    assert policy(result, force=True)[0] is True
+        assert is_quarantined_project_skill(bundle / "SKILL.md") is bool(reference)
+        assert bool(list(iter_project_skill_files(bundle.parent))) is not bool(reference)
 
     def test_cat_write_heredoc_is_not_a_secrets_read(self, tmp_path):
         # Setup doc telling the user to write their OWN keys into their OWN
