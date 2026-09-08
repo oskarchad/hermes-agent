@@ -396,6 +396,11 @@ _CONTAINMENT_REQUIREMENT = re.compile(
     r'must\s+not\s+escape\s+(?:the\s+)?(?:base|root)(?:\s+dir(?:ectory)?)?\.?',
     re.IGNORECASE)
 _SYSTEM_PASSWORD_PATH = re.compile(r'/etc/passwd|/etc/shadow', re.IGNORECASE)
+# Inspect the whole line, including cells/sentences without a repeated path.
+# An instruction can refer to "the file" rather than spelling the path twice.
+_CONTAINMENT_ACCESS_CONTEXT = re.compile(
+    r'\b(?:read|open|cat|send|upload|copy|print|dump|extract|exfiltrate|transmit|'
+    r'fetch|retrieve|access|execute|run|curl|wget)\b', re.IGNORECASE)
 
 
 def _is_containment_reference(line: str, suffix: str) -> bool:
@@ -405,6 +410,8 @@ def _is_containment_reference(line: str, suffix: str) -> bool:
     comment qualify. Unknown prose, code arguments, assignments, and mixed access
     remain critical. Even recognized references require review (high), not trust.
     """
+    if _CONTAINMENT_ACCESS_CONTEXT.search(line):
+        return False
     text = line.strip()
     if suffix in {'.py', '.sh', '.bash'} and text.startswith('#'):
         clauses = [text[1:].strip().rsplit('. ', 1)[-1]]
