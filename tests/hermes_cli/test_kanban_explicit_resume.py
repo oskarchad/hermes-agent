@@ -9,6 +9,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_decompose as decomp
+from hermes_cli.kanban_db_promotion import promote_task
 
 
 @pytest.fixture
@@ -42,7 +43,7 @@ def test_checkpoint_continuation_preserves_identity_gates_and_is_consumed(board,
         assert kb.unblock_task(board, tid)
     elif resume == "promoted_manual":
         # Even forced promotion cannot bypass the claim-time parent check.
-        assert kb.promote_task(board, tid, actor="operator", force=True)[0]
+        assert promote_task(board, tid, actor="operator", force=True)[0]
     else:
         assert kb.complete_task(board, parent)
         kb.recompute_ready(board)
@@ -138,7 +139,7 @@ def test_single_task_specification_requires_explicit_provenance(board, tmp_path,
         # A subsequent explicit lifecycle decision resumes this same task.
         now += 2
         assert kb.block_task(board, tid, reason="confirm checkpoint continuation", kind="needs_input")
-        assert kb.promote_task(board, tid, actor="operator")[0]
+        assert promote_task(board, tid, actor="operator")[0]
     assert kbd.check_respawn_guard(board, tid) is None
     claimed = kb.claim_task(board, tid)
     assert claimed is not None and claimed.id == tid

@@ -740,7 +740,7 @@ hermes kanban assign <id> <profile>                    # or 'none' to unassign
 hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to a profile
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
-hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
+hermes kanban promote <id>...                          # promote todo/blocked; ready continuation requires a reason
 hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
@@ -815,6 +815,27 @@ hermes kanban create "nightly backup audit" \
 ### Respawn guard
 
 The dispatcher refuses to re-spawn a ready task when it hit a quota/auth/429 error on the previous run (`blocker_auth`), or completed a run successfully within the guard window (`recent_success`), or a recent task comment links to a GitHub PR (`active_pr`). This prevents repeat worker storms on the same bug or task while a human catches up. See the `respawn_guarded` row in the [event reference](#event-reference).
+
+A downstream review card in `ready` can hit `active_pr` before its first run:
+the PR link is its input, but the dispatcher must not infer permission from a
+profile name, title, or comment. An operator can deliberately continue that
+same idle card through the existing promotion lifecycle:
+
+```bash
+hermes kanban promote <id> "Continue the existing PR checkpoint" --dry-run --json
+hermes kanban promote <id> "Continue the existing PR checkpoint" --json
+```
+
+For an already-ready card, a non-empty actor and reason are required. The
+operation leaves the task row (including phase, assignee, workspace, and retry
+counters) unchanged and records `promoted_manual` with `source_status: ready`.
+It refuses pending parents even with `--force`, an outstanding claim/run/PID,
+or pending handoff-worker teardown. Quota/auth and cooldown guards still apply
+at dispatch. The audit event must be strictly later than the PR comment
+(equal-second timestamps fail closed), and the next claim consumes it. An
+automatic requeue cannot reuse that permission. Dry-run records no permission.
+This is not a request for same-card review and does not start a worker directly.
+The shared implementation lives in `hermes_cli/kanban_db_promotion.py`.
 
 ### Drag-to-delete and bulk delete (dashboard)
 
