@@ -6140,6 +6140,7 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text,
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            allow_gateway_control=not getattr(message.author, "bot", False),
         )
         # Track participation so follow-ups in this thread don't need @mention.
         if thread_id:

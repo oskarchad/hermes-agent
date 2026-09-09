@@ -106,3 +106,119 @@ def test_trusted_bot_bypasses_gateway_authz(monkeypatch):
         is_bot=True,
     )
     assert runner._is_user_authorized(untrusted_source) is False
+
+
+def test_f1_trusted_bot_has_no_gateway_control_and_cannot_approve(monkeypatch):
+    """F1: A trusted bot admitted via DISCORD_ALLOWED_BOTS must have allow_gateway_control=False
+    and must NEVER be allowed to approve pending commands via plaintext or slash handlers."""
+    import asyncio
+    from datetime import datetime, timezone
+    from gateway.config import GatewayConfig, PlatformConfig, Platform
+    from gateway.session import SessionSource
+    from gateway.run import GatewayRunner
+    from tools.approval import _gateway_queues
+    from tools.approval_gateway_wait import _ApprovalEntry
+
+    monkeypatch.setenv("DISCORD_ALLOWED_BOTS", "888")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "999")
+    monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, extra={"history_backfill": False}))
+    me = SimpleNamespace(id=777, bot=True)
+    adapter._client = SimpleNamespace(user=me)
+    adapter._ready_event.set()
+    adapter._text_batch_delay_seconds = 0
+    adapter.handle_message = MagicMock(return_value=asyncio.sleep(0))
+
+    channel = MagicMock(spec=discord.Thread)
+    channel.id = 100
+    channel.parent_id = 101
+    channel.name = "pilot"
+    channel.topic = None
+    channel.parent = SimpleNamespace(id=101, name="test", topic=None)
+    channel.owner_id = 999
+
+    author = SimpleNamespace(id=888, bot=True, name="ObserverBot", display_name="ObserverBot")
+    msg = SimpleNamespace(
+        id=300,
+        content="<@777> yes",
+        type=discord.MessageType.default,
+        author=author,
+        mentions=[me],
+        channel=channel,
+        guild=SimpleNamespace(id=700, name="test"),
+        attachments=[],
+        reference=None,
+        message_snapshots=[],
+        created_at=datetime.now(timezone.utc),
+    )
+
+    asyncio.run(adapter._dispatch_discord_message(msg))
+    event = adapter.handle_message.call_args.args[0]
+
+    # ASSERTION 1: Trusted bot input MUST have allow_gateway_control=False
+    assert event.source.is_bot is True
+    assert event.allow_gateway_control is False
+
+    # ASSERTION 2: Plaintext approval resolver rejects bot event
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.DISCORD: adapter.config})
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.pairing_store = SimpleNamespace(is_approved=lambda *args: False)
+    runner._pending_approvals = {}
+
+    key = runner._session_key_for_source(event.source)
+    entry = _ApprovalEntry({"command": "DANGEROUS_COMMAND_SENTINEL"})
+    _gateway_queues.setdefault(key, []).append(entry)
+
+    try:
+        handled = asyncio.run(runner._route_plaintext_approval_while_busy(event, key))
+        assert handled is False
+        assert entry.event.is_set() is False
+        assert entry.result is None
+
+        # ASSERTION 3: Direct slash command /approve handler also rejects bot
+        reply = asyncio.run(runner._handle_approve_command(event))
+        assert entry.event.is_set() is False
+        assert entry.result is None
+    finally:
+        _gateway_queues.clear()
+
+
+def test_f4_yaml_allowed_bots_contract(tmp_path, monkeypatch):
+    """F4: Test that allowed_bots in YAML (both platforms.discord.allowed_bots and
+    platforms.discord.extra.allowed_bots) is recognized consistently by loader, adapter,
+    and gateway _is_user_authorized under profile scope."""
+    from gateway.config import load_gateway_config, Platform
+    from gateway.authz_mixin import GatewayAuthorizationMixin
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    config_file = tmp_path / "config.yaml"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    # Variant A: platforms.discord.allowed_bots
+    config_file.write_text("platforms:\n  discord:\n    allowed_bots: ['888']\n", encoding="utf-8")
+    loaded_a = load_gateway_config()
+    adapter_a = DiscordAdapter(loaded_a.platforms[Platform.DISCORD])
+    runner_a = GatewayAuthorizationMixin()
+    runner_a.config = loaded_a
+    runner_a.adapters = {Platform.DISCORD: adapter_a}
+    runner_a.pairing_store = SimpleNamespace(is_approved=lambda *args: False)
+
+    src_a = SessionSource(platform=Platform.DISCORD, chat_id="100", user_id="888", is_bot=True)
+    assert adapter_a._discord_allowed_bots() == {"888"}
+    assert runner_a._is_user_authorized(src_a) is True
+
+    # Variant B: platforms.discord.extra.allowed_bots
+    config_file.write_text("platforms:\n  discord:\n    extra:\n      allowed_bots: ['888']\n", encoding="utf-8")
+    loaded_b = load_gateway_config()
+    adapter_b = DiscordAdapter(loaded_b.platforms[Platform.DISCORD])
+    runner_b = GatewayAuthorizationMixin()
+    runner_b.config = loaded_b
+    runner_b.adapters = {Platform.DISCORD: adapter_b}
+    runner_b.pairing_store = SimpleNamespace(is_approved=lambda *args: False)
+
+    src_b = SessionSource(platform=Platform.DISCORD, chat_id="100", user_id="888", is_bot=True)
+    assert adapter_b._discord_allowed_bots() == {"888"}
+    assert runner_b._is_user_authorized(src_b) is True

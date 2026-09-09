@@ -452,10 +452,20 @@ class GatewayAuthorizationMixin:
                 return True
             if source.platform == Platform.DISCORD:
                 allowed_bots_env = _platform_gate_env("DISCORD_ALLOWED_BOTS", "")
-                if allowed_bots_env and source.user_id:
-                    allowed_bot_ids = {part.strip() for part in allowed_bots_env.split(",") if part.strip()}
-                    if str(source.user_id) in allowed_bot_ids:
-                        return True
+                allowed_bot_ids = set()
+                if allowed_bots_env:
+                    allowed_bot_ids |= {part.strip() for part in allowed_bots_env.split(",") if part.strip()}
+                adapter = self._adapter_for_source(source)
+                if adapter is not None and hasattr(adapter, "_discord_allowed_bots"):
+                    with contextlib.suppress(Exception):
+                        allowed_bot_ids |= adapter._discord_allowed_bots()
+                else:
+                    adapter_extra = self._adapter_extra_for_source(source)
+                    raw_extra_bots = adapter_extra.get("allowed_bots")
+                    if raw_extra_bots:
+                        allowed_bot_ids |= _coerce_allow_set(raw_extra_bots)
+                if source.user_id and str(source.user_id) in allowed_bot_ids:
+                    return True
         return False
 
     def _legacy_telegram_chat_grant(self, source, group_user_allowlist: str) -> bool:

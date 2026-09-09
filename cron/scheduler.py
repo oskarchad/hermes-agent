@@ -2809,7 +2809,38 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+    if d.success:
+        _maybe_run_post_job_hook(job)
     return True
+
+
+def _maybe_run_post_job_hook(job: dict) -> None:
+    """Execute optional post-run hook configured on a completed job."""
+    hook_cfg = job.get("post_run_hook")
+    if not hook_cfg:
+        return
+    try:
+        if isinstance(hook_cfg, str):
+            mod_name, func_name = hook_cfg.split(":", 1)
+            kwargs = {}
+        elif isinstance(hook_cfg, dict):
+            target = hook_cfg.get("target", "")
+            if ":" not in target:
+                return
+            mod_name, func_name = target.split(":", 1)
+            kwargs = hook_cfg.get("kwargs", {})
+        else:
+            return
+
+        import importlib
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, func_name)
+        if kwargs:
+            fn(**kwargs)
+        else:
+            fn(job=job)
+    except Exception as e:
+        logger.warning("Post-run hook failed for job %s: %s", job.get("id"), e)
 
 
 def _deliver_crash_failure(

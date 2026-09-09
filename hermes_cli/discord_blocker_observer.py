@@ -54,16 +54,66 @@ class DiscordBlockerObserver:
         self._history: Dict[str, Dict[str, Any]] = {}
 
     def extract_blocked_items(self, state: Dict[str, Any]) -> List[BlockerItem]:
-        """Extract only topics marked as blocked from state['evidence']."""
+        """Extract only topics marked as blocked.
+        Prioritize the authoritative list content '**Zablokowane**' section if present.
+        If list_content has a '**Zablokowane**' section, derive candidates strictly from it
+        (never falling back to searching historical notes when the section is empty).
+        If list_content is absent, only include items with explicit status == 'blocked'.
+        Never match 'done' items.
+        """
         evidence = state.get("evidence", {})
+        list_content = state.get("list_content", "") or ""
         blocked: List[BlockerItem] = []
+
+        blocked_topics_from_list: Optional[Set[str]] = None
+        if "**zablokowane**" in list_content.lower():
+            # Parse sections in list_content
+            lines = list_content.splitlines()
+            in_blocked = False
+            found_topics: Set[str] = set()
+            for line in lines:
+                l_str = line.strip()
+                if l_str.startswith("**") and l_str.endswith("**"):
+                    sec_name = l_str.strip("*").strip().lower()
+                    if sec_name == "zablokowane":
+                        in_blocked = True
+                        continue
+                    else:
+                        in_blocked = False
+                elif in_blocked and (l_str.startswith("☐") or l_str.startswith("-") or l_str.startswith("*")):
+                    # Item line: e.g. "☐ Audyt wizualny PDP — luki..."
+                    content_after_bullet = l_str.lstrip("☐-* ").strip()
+                    topic = content_after_bullet.split("—", 1)[0].split("-", 1)[0].strip()
+                    if topic:
+                        found_topics.add(topic.lower())
+            blocked_topics_from_list = found_topics
+
         for topic, info in evidence.items():
             if not isinstance(info, dict):
                 continue
-            status = str(info.get("status", "")).lower()
+            status = str(info.get("status", "")).lower().strip()
             note = str(info.get("note", ""))
-            # Check either status field or note containing 'zablokowan'
-            if status == "blocked" or "zablokowan" in note.lower() or "zablokowane" in status:
+
+            # Explicit exclusion: done/completed status is NEVER blocked
+            if status in {"done", "completed", "resolved", "zakończone"}:
+                continue
+
+            is_blocked = False
+            if blocked_topics_from_list is not None:
+                # Strictly match against topics found in the authoritative list section
+                is_blocked = topic.lower() in blocked_topics_from_list or any(
+                    bt in topic.lower() or topic.lower() in bt for bt in blocked_topics_from_list
+                )
+            else:
+                # If no list_content section available, require explicit blocked status or note starting with Zablokowane
+                if status in {"blocked", "zablokowane"}:
+                    is_blocked = True
+                elif not status and note.strip().lower().startswith("zablokowan") and not any(
+                    ex in note.lower() for ex in ["wcześniej zablokowan", "odblokowan", "zakończon"]
+                ):
+                    is_blocked = True
+
+            if is_blocked:
                 blocked.append(
                     BlockerItem(
                         topic=topic,
@@ -87,15 +137,69 @@ class DiscordBlockerObserver:
         raw = json.dumps(norm, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def _check_if_replied_or_acted(self, messages: List[Dict[str, Any]], last_suggested_time: float) -> bool:
-        """Check if Otto or operator answered/acted in the thread after the suggestion."""
+    def _check_if_replied_or_acted(
+        self,
+        messages: List[Dict[str, Any]],
+        last_suggested_time: float,
+        prev_last_id: Optional[str] = None,
+    ) -> bool:
+        """Check if Otto or operator answered/acted in the thread strictly after the suggestion was sent.
+        Exclude observer's own messages. Plain ACK is not an action.
+        Requires valid timestamp > last_suggested_time or cursor > prev_last_id.
+        """
         for m in reversed(messages):
-            author = str(m.get("author", "")).lower()
-            content = str(m.get("content", "")).lower()
-            # If Otto or operator replied or mentioned action
-            if "otto" in author or self.target_bot_id in author:
-                return True
-            if any(act in content for act in ["kanban_unblock", "odblokowan", "wznawiam", "przyjęto", "zgoda"]):
+            # Check message timestamp strictly
+            ts = m.get("timestamp")
+            m_time = 0.0
+            if ts is not None:
+                try:
+                    if isinstance(ts, (int, float)):
+                        m_time = float(ts)
+                    elif isinstance(ts, str):
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        m_time = dt.timestamp()
+                except Exception:
+                    m_time = 0.0
+
+            # If last_suggested_time is set, strictly check timestamp if present;
+            # if timestamp is not present, check message id / cursor vs last seen message id
+            if last_suggested_time > 0:
+                if ts is not None:
+                    if m_time <= last_suggested_time:
+                        continue
+                elif prev_last_id:
+                    try:
+                        if int(str(m.get("id", "0"))) <= int(prev_last_id):
+                            continue
+                    except Exception:
+                        pass
+
+            author_field = m.get("author", "")
+            author_str = ""
+            author_id = ""
+            if isinstance(author_field, dict):
+                author_str = str(author_field.get("username", "")).lower()
+                author_id = str(author_field.get("id", "")).strip()
+            else:
+                author_str = str(author_field).lower()
+                author_id = str(author_field).strip()
+
+            # Ignore observer's own suggestions
+            content_str = str(m.get("content", ""))
+            if "obserwator blokad" in content_str.lower() or "observerbot" in author_str:
+                continue
+
+            content_lower = content_str.lower()
+            # Distinguish real action/readback from plain ACK
+            is_actor = "otto" in author_str or (self.target_bot_id and self.target_bot_id == author_id)
+            if not is_actor:
+                continue
+
+            # Real action / readback keywords (plain ACK like 'przyjęto', 'ok', 'widzę' does NOT count)
+            real_actions = ["kanban_unblock", "odblokowan", "wykonano", "odblokowano", "wznawiam"]
+            # Exclude plain conversational notes without actual command or action execution
+            if any(act in content_lower for act in real_actions) and not ("czeka" in content_lower and "nie wykonano" in content_lower):
                 return True
         return False
 
@@ -119,8 +223,21 @@ class DiscordBlockerObserver:
                 report.errors.append(f"Missing channel_id for {item.topic}")
                 continue
 
+            if not thread_reader:
+                report.errors.append(f"Thread reader unavailable for {item.topic}; cannot verify thread")
+                continue
+
             # Read thread messages if reader provided
-            messages = thread_reader(channel_id) if thread_reader else []
+            try:
+                messages = thread_reader(channel_id)
+            except Exception as e:
+                report.errors.append(f"Thread read failed for {item.topic}: {e}")
+                continue
+
+            if messages is None:
+                report.errors.append(f"Thread read returned None for {item.topic}")
+                continue
+
             thread_hash = self._compute_thread_hash(messages)
             prev_record = self._history.get(item.topic)
 
@@ -129,8 +246,10 @@ class DiscordBlockerObserver:
                 prev_hash = prev_record.get("hash")
                 last_time = prev_record.get("last_suggested_at", 0.0)
 
+                prev_last_id = prev_record.get("last_message_id")
+
                 # Check if thread was settled/acted upon
-                if self._check_if_replied_or_acted(messages, last_time):
+                if self._check_if_replied_or_acted(messages, last_time, prev_last_id=prev_last_id):
                     report.settled_topics.append(item.topic)
                     prev_record["settled"] = True
                     continue
@@ -159,7 +278,7 @@ class DiscordBlockerObserver:
             # Evaluate using LLM or structured heuristic
             blocker_reason = item.note
             proof_link = ""
-            allowed_action = "Zweryfikuj przyczynę blokady w wątku i wykonaj kanban_unblock lub zgłoś decyzję operatorowi."
+            allowed_action = "Zweryfikuj przyczynę blokady w wątku i zgłoś decyzję operatorowi."
 
             if messages:
                 latest_m = messages[-1]
@@ -175,6 +294,7 @@ class DiscordBlockerObserver:
                         allowed_action = eval_res.get("action", allowed_action)
                 except Exception as e:
                     report.errors.append(f"LLM evaluator error on {item.topic}: {e}")
+                    allowed_action = f"Błąd analizy wątku ({e}); wymagana manualna weryfikacja."
             else:
                 # Deterministic heuristic if no LLM passed
                 pass
@@ -190,9 +310,11 @@ class DiscordBlockerObserver:
                 is_followup=False,
             )
             report.suggestions.append(sugg)
+            last_msg_id = str(messages[-1].get("id", "")) if messages else ""
             self._history[item.topic] = {
                 "hash": thread_hash,
                 "last_suggested_at": now,
+                "last_message_id": last_msg_id,
                 "followup_sent": False,
                 "settled": False,
             }
