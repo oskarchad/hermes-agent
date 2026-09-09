@@ -2809,16 +2809,25 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
-    if d.success:
-        _maybe_run_post_job_hook(job)
+    if d.success and job.get("post_run_hook"):
+        # A hook is a separate observed attempt, not a rewrite of updater success.
+        from cron.executions import create_execution
+        hook_execution = create_execution(job["id"], source="post_run_hook:" + execution_id)
+        try:
+            result = _maybe_run_post_job_hook(job)
+            errors = getattr(result, "errors", [])
+            finish_execution(hook_execution["id"], success=not bool(errors),
+                             error="Post-run observer reported failure; inspect observer report." if errors else None)
+        except Exception:
+            finish_execution(hook_execution["id"], success=False, error="Post-run hook failed.")
     return True
 
 
-def _maybe_run_post_job_hook(job: dict) -> None:
+def _maybe_run_post_job_hook(job: dict) -> Any:
     """Execute optional post-run hook configured on a completed job."""
     hook_cfg = job.get("post_run_hook")
     if not hook_cfg:
-        return
+        return None
     try:
         if isinstance(hook_cfg, str):
             mod_name, func_name = hook_cfg.split(":", 1)
@@ -2826,21 +2835,22 @@ def _maybe_run_post_job_hook(job: dict) -> None:
         elif isinstance(hook_cfg, dict):
             target = hook_cfg.get("target", "")
             if ":" not in target:
-                return
+                return None
             mod_name, func_name = target.split(":", 1)
             kwargs = hook_cfg.get("kwargs", {})
         else:
-            return
+            return None
 
         import importlib
         mod = importlib.import_module(mod_name)
         fn = getattr(mod, func_name)
         if kwargs:
-            fn(**kwargs)
+            return fn(**kwargs)
         else:
-            fn(job=job)
-    except Exception as e:
-        logger.warning("Post-run hook failed for job %s: %s", job.get("id"), e)
+            return fn(job=job)
+    except Exception:
+        logger.warning("Post-run hook failed for job %s", job.get("id"))
+        raise
 
 
 def _deliver_crash_failure(
