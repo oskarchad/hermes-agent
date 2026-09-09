@@ -542,6 +542,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES", "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS", "DISCORD_NO_THREAD_CHANNELS", "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS", "DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOW_BOTS",
+    "DISCORD_ALLOWED_BOTS",
     "GATEWAY_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS",
 )
 
@@ -1365,11 +1366,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return False, False
         role_authorized = False
         if getattr(message.author, "bot", False):
+            allowed_bots = self._discord_allowed_bots()
+            is_trusted_bot = bool(allowed_bots and str(message.author.id) in allowed_bots)
             allow_bots = self._get_allow_bots()
-            if allow_bots == "none":
-                return False, False
-            if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
-                return False, False
+            if not is_trusted_bot:
+                if allow_bots == "none":
+                    return False, False
+                if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
+                    return False, False
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
@@ -4966,6 +4970,18 @@ class DiscordAdapter(BasePlatformAdapter):
     def _get_allow_bots(self) -> str:
         """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
         return self._gate_env("DISCORD_ALLOW_BOTS", "none").lower().strip() or "none"
+
+    def _discord_allowed_bots(self) -> set[str]:
+        """Per-profile set of allowed bot IDs (DISCORD_ALLOWED_BOTS or extra['allowed_bots'])."""
+        raw = self.config.extra.get("allowed_bots")
+        if raw is None:
+            raw = self._gate_env("DISCORD_ALLOWED_BOTS")
+        if isinstance(raw, list):
+            return {str(b).strip() for b in raw if str(b).strip()}
+        s = str(raw or "").strip()
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
 
     def _discord_free_response_channels(self) -> set:
         """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit."""
