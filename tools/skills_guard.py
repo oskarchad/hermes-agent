@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v11"
+SCANNER_VERSION = "skills-guard-v12"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -450,7 +450,8 @@ def _containment_contexts(text: str, suffix: str) -> list[str]:
     return [raw.decode('utf-8'), *contexts]
 
 
-def _containment_pronoun_reason(context: str, match: re.Match) -> str | None:
+def _containment_pronoun_reason(context: str, match: re.Match, source: str = '',
+                                source_offset: int | None = None) -> str | None:
     """Positive, bounded grammatical evidence; unknown/competing uses stay unresolved.
 
     Supported: a prohibition, a subject in a relative clause, a construction
@@ -469,11 +470,20 @@ def _containment_pronoun_reason(context: str, match: re.Match) -> str | None:
     # same paragraph can resolve the object. Blank lines never introduce one.
     if re.search(r'\n\s*\n', context[match.start():match.start('operation')]):
         return None
+    if operation == 'fix':
+        from tools.skills_guard_references import complete_report
+        if complete_report(context, match.start(), match.end(), source, source_offset):
+            return 'complete locally bound report'
     paragraph = re.split(r'\n\s*\n', before)[-1]
     sentences = [s.strip() for s in re.split(r'[.!?](?=\s|$)', paragraph) if s.strip()]
     if not sentences:
         return None
     sentence = sentences[-1]
+    if operation == 'write':
+        from tools.skills_guard_references import constructed_product
+        continuation = re.split(r'(?<=[.!?])\s', context[match.end():], maxsplit=1)[0]
+        if constructed_product(sentence, continuation):
+            return 'complete constructed product'
     if re.search(r'\b(?:and|or)\s+(?:a|an|the|another|this|that)\b', sentence, re.IGNORECASE):
         return None
     if operation == 'read' and re.search(
@@ -515,18 +525,34 @@ def _containment_reference_lines(lines: list[str], suffix: str) -> set[int]:
     if not candidates:
         return set()
 
-    def normalize(text: str) -> str:
-        return '\n'.join(line.lstrip().lstrip('#> ').replace('`', '').replace('*', '')
-                         for line in text.splitlines())
+    def normalize(text: str) -> tuple[str, list[int]]:
+        # Preserve the existing markup normalization AND map each output char
+        # back to its original source offset for exact docstring ownership.
+        chars, positions = [], []
+        offset = 0
+        for raw_line in text.splitlines(keepends=True):
+            line = raw_line.rstrip('\r\n')
+            stripped = line.lstrip().lstrip('#> ')
+            start = len(line) - len(stripped)
+            for index, char in enumerate(stripped, offset + start):
+                if char not in '`*':
+                    chars.append(char)
+                    positions.append(index)
+            if raw_line.endswith(('\n', '\r')):
+                chars.append('\n')
+                positions.append(offset + len(line))
+            offset += len(raw_line)
+        return ''.join(chars), positions
 
     raw = '\n'.join(residual)
     # Preserve the raw explicit-link veto as well as decoded string references.
-    contexts = [normalize(part) for part in _containment_contexts(raw, suffix)]
-    if any(_CONTAINMENT_LINK.search(part) for part in [normalize(raw), *contexts]):
+    sources = _containment_contexts(raw, suffix)
+    contexts = [normalize(part) for part in sources]
+    if any(_CONTAINMENT_LINK.search(part) for part in [normalize(raw)[0], *(c[0] for c in contexts)]):
         return set()
-    for context in contexts:
+    for source, (context, positions) in zip(sources, contexts):
         for match in _CONTAINMENT_BARE_PRONOUN.finditer(context):
-            if _containment_pronoun_reason(context, match) is None:
+            if _containment_pronoun_reason(context, match, source, positions[match.start()]) is None:
                 return set()
     return candidates
 

@@ -545,13 +545,13 @@ class TestFalsePositiveReductions:
 
     @pytest.mark.parametrize("python_literal", [False, True])
     @pytest.mark.parametrize("prose, linked", [
-        ("Build me a calendar app in Python. Write it to calendar.py.", True),
+        ("Build me a calendar app in Python. Write it to calendar.py.", False),
         ("Build me a calendar app using the file above. Write it to calendar.py.", True),
         ("Build me a calendar app and a notes app. Write it to calendar.py.", True),
         ("Build me a calendar app. Read it now.", True),
         ("Build me a calendar app.\n\nWrite it to calendar.py.", True),
         ("Write it to calendar.py.", True),
-        ("Make me a script that reads a CSV file and shows statistics for it. Write it to stats.py.", True),
+        ("Make me a script that reads a CSV file and shows statistics for it. Write it to stats.py.", False),
         ("Make me a script with a module that reads it. Write it to output.txt.", True),
         ("Make me a script with a module containing it. Write it to output.txt.", True),
         ("Make me a script that reads the file above. Write it to stats.py.", True),
@@ -567,7 +567,7 @@ class TestFalsePositiveReductions:
         ("Rubric: 0 incomplete, 1 complete. Read it from the file above.", True),
         ("Rubric: 0 incomplete, 1 complete. A report is ready. Read it.", True),
         ("Rubric: 0 incomplete, 1 complete.\n\nRead it.", True),
-        ("Bug report: after transfers an account is left with\na negative balance. Fix it.", True),
+        ("Bug report: after transfers an account is left with\na negative balance. Fix it.", False),
         ("Bug report: after transfers the file above is left with\na negative balance. Fix it.", True),
         ("Bug report: this crashes on real\nexports containing a separator. Fix it.", True),
         ("Bug report: this crashes on the\nfile above. Fix it.", True),
