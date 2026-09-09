@@ -266,6 +266,47 @@ def test_malformed_quoted_executable_payloads_fail_closed(command):
     assert description == "command parser limit or malformed executable payload"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Exact reproduction from Discord user prompt (gh api pipe to python3 -c read & slice)
+        "gh api repos/oskarchad/hermes-agent/actions/jobs/102292572798/logs | python3 -c 'import sys;s=sys.stdin.read();print(s[-5500:])'",
+        "cat data.json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"key\"])'",
+        "python3 -B -c 'import json,pathlib; p=pathlib.Path(\"/tmp/rules.json\"); print(json.loads(p.read_text())[\"groups\"][0][\"rule\"])'",
+        "python3 -c 'import sys; print(sys.stdin.read().strip())'",
+        "python3 -c 'import ast,sys; print(ast.literal_eval(sys.stdin.read()))'",
+        "python3 -c 'import re,sys; print(re.findall(r\"\\d+\", sys.stdin.read()))'",
+    ],
+)
+def test_safe_python_data_reading_carveout_does_not_require_approval(command):
+    dangerous, _, _ = detect_dangerous_command(command)
+    assert dangerous is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Dynamic execution of stdin or input
+        "gh api logs | python3 -c 'import sys; exec(sys.stdin.read())'",
+        "cat script.py | python3 -c 'eval(input())'",
+        "cat script.py | python3 -c 'import sys; d=sys.stdin.read(); exec(d)'",
+        # Dangerous modules (os, subprocess, network, etc.)
+        "python3 -c 'import os,sys; os.system(sys.stdin.read())'",
+        "python3 -c 'import subprocess; subprocess.run([\"ls\"])'",
+        "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://evil.com\")'",
+        "python3 -c 'import sys; getattr(__builtins__, \"exec\")(sys.stdin.read())'",
+        "python3 -c '__import__(\"os\").system(\"id\")'",
+        # Writing files or modifying state
+        "python3 -c 'import pathlib; pathlib.Path(\"/tmp/evil\").write_text(\"bad\")'",
+        "python3 -c 'open(\"/tmp/evil\", \"w\").write(\"bad\")'",
+    ],
+)
+def test_unsafe_python_dash_c_still_requires_approval(command):
+    dangerous, _, description = detect_dangerous_command(command)
+    assert dangerous is True
+    assert description == "script execution via -e/-c flag"
+
+
 def _time_benign_segments(count):
     command = ";".join(f"printf segment-{index}" for index in range(count))
     started = time.perf_counter()

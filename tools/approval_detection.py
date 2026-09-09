@@ -4,6 +4,7 @@ Pure command classification for :mod:`tools.approval` — no approval state, con
 prompting live here.
 """
 
+import ast
 import functools
 import logging
 import os
@@ -722,6 +723,82 @@ def _iter_top_level_shell_segments(command: str):
         yield command[start:]
 
 
+_SAFE_PYTHON_DATA_MODULES = frozenset({"sys", "json", "pathlib", "ast", "re"})
+_DANGEROUS_CALL_NAMES = frozenset({
+    "exec", "eval", "compile", "__import__",
+    "system", "popen", "spawn", "fork", "call", "check_call", "check_output",
+    "getattr", "setattr", "delattr",
+})
+_DANGEROUS_MODULE_ROOTS = frozenset({
+    "os", "subprocess", "posix", "nt", "pty", "socket", "http", "urllib",
+    "requests", "shutil", "builtins", "__builtin__", "importlib", "ctypes",
+    "signal", "multiprocessing", "threading",
+})
+_MUTATION_OR_WRITE_CALLS = frozenset({
+    "write", "writelines", "write_text", "write_bytes", "unlink", "remove",
+    "rmdir", "mkdir", "rename", "replace", "chmod", "chown", "touch",
+})
+
+
+def _is_safe_python_data_code(code_str: str) -> bool:
+    """Return True if code_str is proven to be a safe data-reading/parsing script.
+
+    Carveout for issue #136: commands like `gh api ... | python3 -c 'import sys; print(sys.stdin.read()[-5500:])'`
+    or `python3 -c 'import json,pathlib; print(json.loads(pathlib.Path(...).read_text()))'` only read and format
+    data. They do NOT execute downloaded code, spawn subprocesses, make network calls, or write files.
+    Any parse failure, dynamic execution primitive, unapproved module, or write operation fails closed (returns False).
+    """
+    try:
+        tree = ast.parse(code_str)
+    except Exception:
+        return False
+
+    if not tree.body:
+        return False
+
+    has_read_or_parse = False
+
+    for node in ast.walk(tree):
+        # Disallow definitions that could hide dynamic execution or rebind builtins
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False
+
+        # Imports: only safe data-handling modules allowed
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in _DANGEROUS_MODULE_ROOTS or root not in _SAFE_PYTHON_DATA_MODULES:
+                    return False
+        elif isinstance(node, ast.ImportFrom):
+            if not node.module:
+                return False
+            root = node.module.split(".")[0]
+            if root in _DANGEROUS_MODULE_ROOTS or root not in _SAFE_PYTHON_DATA_MODULES:
+                return False
+
+        # Calls: forbid exec/eval/system/popen/compile/mutation
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id in _DANGEROUS_CALL_NAMES or func.id in _MUTATION_OR_WRITE_CALLS:
+                    return False
+                if func.id == "open":
+                    # Forbid open() to avoid arbitrary file writing or uncontrolled file descriptors
+                    return False
+            elif isinstance(func, ast.Attribute):
+                if func.attr in _DANGEROUS_CALL_NAMES or func.attr in _MUTATION_OR_WRITE_CALLS:
+                    return False
+                if func.attr in ("read", "readline", "readlines", "load", "loads", "literal_eval", "read_text", "read_bytes"):
+                    has_read_or_parse = True
+
+        # Attribute access: forbid double underscore dunder access (e.g. __builtins__, __subclasses__)
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                return False
+
+    return has_read_or_parse
+
+
 def _interpreter_exec_flag(family: str, args: list[str]) -> str | None:
     """Return an execution-bearing interpreter option, if present."""
     flags, with_arg = _INTERPRETER_EXEC_FLAGS[family], _INTERPRETER_WITH_ARG[family]
@@ -828,7 +905,23 @@ def _execution_flag_findings(command: str):
                 continue
             args = tokens[1:]
             if family and _interpreter_exec_flag(family, args):
-                yield ("script execution via -e/-c flag", None)
+                if family == "python":
+                    # Check if -c payload is a safe data-reading/parsing script
+                    idx = -1
+                    for i, arg in enumerate(args):
+                        if arg == "-c":
+                            idx = i + 1
+                            break
+                        elif arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]:
+                            idx = i + 1
+                            break
+                    code_payload = args[idx] if 0 <= idx < len(args) else None
+                    if code_payload and _is_safe_python_data_code(code_payload):
+                        pass
+                    else:
+                        yield ("script execution via -e/-c flag", None)
+                else:
+                    yield ("script execution via -e/-c flag", None)
             elif family and any(token.startswith("<<") for token in args):
                 yield ("script execution via heredoc", None)
             else:

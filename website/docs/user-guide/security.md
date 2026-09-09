@@ -749,7 +749,20 @@ When `tirith_fail_open` is `true` (default), commands proceed if tirith is not i
 
 Tirith ships prebuilt binaries for Linux (x86_64 / aarch64) and macOS (x86_64 / arm64). On platforms with no prebuilt binary (Windows, etc.), tirith is silently skipped — pattern-matching guards still run, and the CLI does not surface an "unavailable" banner. To use tirith on Windows, run Hermes under WSL.
 
-Tirith's verdict integrates with the approval flow: safe commands pass through, while both suspicious and blocked commands trigger user approval with the full tirith findings (severity, title, description, safer alternatives). Users can approve or deny — the default choice is deny to keep unattended scenarios secure.
+
+### Pipeline & Data-Reading Safe Carveout
+
+Hermes pattern detection and Tirith scanning distinguish dangerous code execution from benign data reading and formatting. Commands like:
+
+```bash
+gh api repos/owner/repo/actions/jobs/123/logs | python3 -c 'import sys; s=sys.stdin.read(); print(s[-5000:])'
+cat data.json | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])'
+python3 -c 'import json, pathlib; print(json.loads(pathlib.Path("rules.json").read_text()))'
+```
+
+are recognized as safe data parsers (using only standard read/parse modules like `sys`, `json`, `pathlib`, `ast`, `re` with no dynamic `exec`/`eval`, subprocesses, network requests, or file writes). Such commands do not trigger the `script execution via -e/-c flag` approval warning and execute without prompts in interactive and headless single-query sessions.
+Upstream Tirith >=0.3.3 similarly recognizes Python data pipelines (`is_python_dash_c_data_pipeline`), avoiding false-positive `pipe_to_interpreter` blocks on data slicing and log reading.
+
 
 ### Context File Injection Protection
 
