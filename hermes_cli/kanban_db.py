@@ -2957,7 +2957,13 @@ def reassign_task(
     reason: Optional[str] = None,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
-    ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    ``reclaim_first`` releases its claim — the "this profile's model is broken" path.
+
+    Validates target profile eligibility BEFORE reclaim/teardown so an invalid or
+    disabled target never stops an existing worker or mutates run state (F2 safeguard).
+    """
+    profile = _canonical_assignee(profile)
+    require_dispatch_enabled(profile)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")

@@ -143,3 +143,66 @@ def test_admission_and_review_return_refuse_disabled_without_rewriting_provenanc
     ))
     result = decompose.decompose_task(triage)
     assert not result.ok and "dispatch_enabled" in result.reason
+
+
+def test_f1_write_profile_meta_preserves_malformed_fail_closed_policy(fleet):
+    profiles_root, _ = fleet
+    retired_dir = profiles.get_profile_dir("retired")
+    p_yaml = retired_dir / "profile.yaml"
+    bad_content = "dispatch_enabled: false\ndescription: [\n"
+    p_yaml.write_text(bad_content, encoding="utf-8")
+
+    # The refusal must be active
+    err = profiles.profile_dispatch_error("retired")
+    assert err is not None and "dispatch_enabled" in err
+
+    # Attempting to describe or update display name must fail instead of overwriting
+    with pytest.raises(ValueError, match="not valid YAML"):
+        profiles.write_profile_meta(retired_dir, description="new text", description_auto=False)
+
+    with pytest.raises(ValueError, match="not valid YAML"):
+        profiles.write_profile_meta(retired_dir, display_name="Retired Display")
+
+    # Content and refusal remain intact
+    assert p_yaml.read_text(encoding="utf-8") == bad_content
+    err2 = profiles.profile_dispatch_error("retired")
+    assert err2 == err
+
+    # Non-mapping YAML also fails closed and is protected
+    p_yaml.write_text("- item1\n- item2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a YAML mapping"):
+        profiles.write_profile_meta(retired_dir, description="new text")
+
+    # Valid profile.yaml updates without losing dispatch_enabled: false
+    valid_content = "dispatch_enabled: false\ndescription: old\n"
+    p_yaml.write_text(valid_content, encoding="utf-8")
+    profiles.write_profile_meta(retired_dir, description="new text")
+    import yaml
+    updated = yaml.safe_load(p_yaml.read_text(encoding="utf-8"))
+    assert updated["dispatch_enabled"] is False
+    assert updated["description"] == "new text"
+
+
+def test_f2_reassign_task_validates_target_before_reclaim_and_teardown(fleet):
+    _, conn = fleet
+    profiles.get_profile_dir("retired").joinpath("profile.yaml").write_text("dispatch_enabled: false\n")
+
+    t = kb.create_task(conn, title="running task", assignee="wrench")
+    run = kb.claim_task(conn, t)
+    assert run is not None
+    assert kb.get_task(conn, t).status == "running"
+    assert kb.get_task(conn, t).assignee == "wrench"
+    events_before = kb.list_events(conn, t)
+
+    # Calling reassign_task with reclaim_first=True targeting disabled profile
+    with pytest.raises(ValueError, match="dispatch_enabled"):
+        kb.reassign_task(conn, t, "retired", reclaim_first=True, reason="switch broken profile")
+
+    # Verification: worker was NOT reclaimed, task is still running, assignee unchanged, no events added
+    task_after = kb.get_task(conn, t)
+    assert task_after is not None
+    assert task_after.status == "running"
+    assert task_after.assignee == "wrench"
+    assert task_after.current_run_id == run.current_run_id
+    assert task_after.claim_lock == run.claim_lock
+    assert kb.list_events(conn, t) == events_before

@@ -651,11 +651,26 @@ def write_profile_meta(
     display_name: Optional[str] = None,
 ) -> None:
     """Update ``profile.yaml`` in place: only passed fields are overwritten; the file is
-    created if missing. The profile directory itself must exist."""
+    created if missing. The profile directory itself must exist.
+
+    Refuses to overwrite an existing unparsable or non-mapping file so metadata edits
+    never clobber invalid/fail-closed policies (F1 safeguard).
+    """
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
     path = profile_dir / "profile.yaml"
-    existing: dict = _load_yaml_dict(path) or {}
+    if path.is_file():
+        import yaml
+        try:
+            raw_content = path.read_text(encoding="utf-8")
+            loaded = yaml.safe_load(raw_content)
+        except Exception as exc:
+            raise ValueError(f"cannot update metadata: existing {path} is not valid YAML: {exc}") from exc
+        if loaded is not None and not isinstance(loaded, dict):
+            raise ValueError(f"cannot update metadata: existing {path} is not a YAML mapping")
+        existing: dict = loaded or {}
+    else:
+        existing = {}
     if description is not None:
         existing["description"] = description.strip()
     if description_auto is not None:
