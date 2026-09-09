@@ -26,6 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_profile_policy import require_dispatch_enabled
+from hermes_cli.profiles import profile_dispatch_error
+
 from toolsets import (
     KANBAN_TASK_TOOLSETS_BOUNDED_ENV,
     MANDATORY_KANBAN_TASK_TOOLSETS,
@@ -1555,6 +1558,7 @@ def create_task(
         if row:
             return row["id"]
 
+    require_dispatch_enabled(assignee)
     enabled_toolsets_list = normalize_enabled_toolsets(
         enabled_toolsets,
         hermes_home=_profile_home_for_task(assignee),
@@ -1795,6 +1799,7 @@ def list_tasks(
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
+    require_dispatch_enabled(profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -3548,6 +3553,9 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        dispatch_error = profile_dispatch_error(reviewer or implementer)
+        if dispatch_error:
+            return _ret(False, dispatch_error)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -3642,6 +3650,9 @@ def request_changes(
         implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
+        dispatch_error = profile_dispatch_error(implementer)
+        if dispatch_error:
+            return False, dispatch_error
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
@@ -3942,6 +3953,7 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
+    require_dispatch_enabled(assignee)
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -4041,7 +4053,10 @@ def decompose_triage_task(
         return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
+    require_dispatch_enabled(root_assignee)
     _validate_children_graph(children)
+    for child in children:
+        require_dispatch_enabled(_canonical_assignee(child.get("assignee")))
 
     # ONE txn so the fan-out is atomic; helpers that open their own write_txn
     # (create_task, link_tasks, add_comment) must not be called in here.

@@ -140,6 +140,8 @@ def _resolve_profile_from_cfg(cfg: dict, key: str) -> str:
     catches children the decomposer can't route."""
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get(key) or "").strip()
+    from hermes_cli.kanban_profile_policy import require_dispatch_enabled
+    require_dispatch_enabled(explicit)
     if explicit:
         try:
             if profiles_mod.profile_exists(explicit):
@@ -147,9 +149,11 @@ def _resolve_profile_from_cfg(cfg: dict, key: str) -> str:
         except Exception:
             pass
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        fallback = profiles_mod.get_active_profile_name() or "default"
     except Exception:
-        return "default"
+        fallback = "default"
+    require_dispatch_enabled(fallback)
+    return fallback
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
@@ -162,13 +166,17 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         return [], set()
     roster = []
     for p in all_profiles:
+        error = profiles_mod.profile_dispatch_error(p.name)
+        if error:
+            logger.warning("decompose: %s", error)
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,
             "description": desc or f"(no description; profile named {p.name!r})",
             "has_description": bool(desc),
         })
-    return roster, {p.name for p in all_profiles}
+    return roster, {p["name"] for p in roster}
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -183,9 +191,12 @@ def _format_roster(roster: list[dict]) -> str:
 def _normalize_assignee_choice(assignee: object, *, default_assignee: str, valid_names: set[str]) -> str:
     """A valid assignee, else ``default_assignee`` — promoted work is never
     left unassigned."""
+    from hermes_cli.kanban_profile_policy import require_dispatch_enabled
+    require_dispatch_enabled(default_assignee)
     if not isinstance(assignee, str) or not assignee.strip():
         return default_assignee
     chosen = assignee.strip()
+    require_dispatch_enabled(chosen)
     return chosen if chosen in valid_names else default_assignee
 
 
@@ -308,7 +319,10 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
-    routing = _load_routing()
+    try:
+        routing = _load_routing()
+    except ValueError as exc:
+        return DecomposeOutcome(task_id, False, str(exc))
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(
@@ -326,9 +340,12 @@ def decompose_task(
         return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
 
     audit_author = author or _profile_author()
-    if not parsed.get("fanout"):
-        return _apply_single(task, parsed, routing, audit_author)
-    return _apply_fanout(task_id, parsed, routing, audit_author)
+    try:
+        if not parsed.get("fanout"):
+            return _apply_single(task, parsed, routing, audit_author)
+        return _apply_fanout(task_id, parsed, routing, audit_author)
+    except ValueError as exc:
+        return DecomposeOutcome(task_id, False, str(exc))
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

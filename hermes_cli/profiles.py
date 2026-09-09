@@ -606,6 +606,34 @@ def _count_skills(profile_dir: Path) -> int:
 # never an error; the kanban decomposer falls back to the profile name.
 
 
+def profile_dispatch_error(name: Optional[str]) -> Optional[str]:
+    """Kanban admission refusal, or None when profile metadata permits work.
+
+    Existence is separate: non-profile control-plane assignees remain legal
+    board owners. Never reuse the forgiving inventory loader here: a corrupt
+    opt-out must not turn into permission. Read fresh for re-enabling.
+    """
+    if not name:
+        return None
+    import yaml
+
+    path = get_profile_dir(name) / "profile.yaml"
+    prefix = f"Profile {name!r} dispatch_enabled"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return f"{prefix}: cannot read valid profile.yaml; ask the Captain to repair routing."
+    if data is None:
+        data = {}
+    if not isinstance(data, dict) or type(data.get("dispatch_enabled", True)) is not bool:
+        return f"{prefix} must be a YAML boolean; ask the Captain to repair routing."
+    if not data.get("dispatch_enabled", True):
+        return f"{prefix}=false; ask the Captain to choose an enabled assignee or re-enable this profile."
+    return None
+
+
 def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``profile.yaml`` -> ``{description, description_auto, display_name}`` (empty
     defaults when missing/unreadable). Never raises — a corrupt file on one profile must not
