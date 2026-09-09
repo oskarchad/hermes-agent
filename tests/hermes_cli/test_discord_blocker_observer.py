@@ -24,8 +24,8 @@ def test_no_current_blocked_links_never_uses_historical_notes(content):
     assert DiscordBlockerObserver().extract_blocked_items(state(content)) == []
 
 
-def test_selection_uses_exact_thread_link_not_topic_substrings():
-    s = state("**Zablokowane**\n☐ Different title → <#100>\n**Ostatnio zrobione**\n☑ A → <#101>")
+def test_selection_uses_exact_message_link_not_topic_substrings():
+    s = state("**Zablokowane**\n☐ Different title → https://discord.com/channels/700/100/201\n**Ostatnio zrobione**\n☑ A → <#101>")
     s["evidence"]["A longer"] = {"channel_id": "101", "note": "Zablokowane"}
     assert [i.channel_id for i in DiscordBlockerObserver().extract_blocked_items(s)] == ["100"]
 
@@ -41,10 +41,14 @@ def test_text_or_display_name_never_proves_action(text):
 def test_response_retains_source_time_and_delivery_correlation_without_settlement(monkeypatch):
     monkeypatch.setattr("hermes_cli.discord_blocker_observer.time.time", lambda: 200)
     o = DiscordBlockerObserver(target_bot_id="777")
-    o._history["A"] = {"version": 2, "delivery_receipt": {
-        "id": "250", "author_id": o.observer_bot_id, "delivered_at": 150}}
+    o.evaluate(state(), lambda _: [message()], known)
+    rec = o._history["A"]
+    rec.pop("pending_suggestion")
+    rec["delivery_receipt"] = {"id": "250", "author_id": o.observer_bot_id, "delivered_at": 150,
+                               "revision": rec["revision"], "episode": rec["episode"]}
     response = message("301", "777", "ACK; not executed", "2026-09-09T20:00:00Z")
-    report = o.evaluate(state(), lambda _: [response], known)
+    response["message_reference"] = {"message_id": "250", "channel_id": "100"}
+    report = o.evaluate(state(), lambda _: [message(), response], known)
     assert not report.settled_topics and report.model_calls == 0
     assert o._history["A"]["disposition"] == {
         "kind": "response_observed_not_action", "message_id": "301", "author_id": "777",

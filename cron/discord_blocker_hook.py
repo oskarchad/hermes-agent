@@ -8,7 +8,7 @@ from pathlib import Path
 
 from hermes_cli.discord_blocker_observer import (
     DiscordBlockerObserver, ObserverReport, MODEL, PROVIDER, RADAR_ID,
-    author_id, timestamp, validate_analysis,
+    author_id, timestamp, validate_analysis, validate_history,
 )
 
 
@@ -76,7 +76,8 @@ def _deliver(record, request, token, sidecar, history, radar_id, target_bot_id):
         raise ValueError("Delivery readback mismatch")
     delivered_at = timestamp(message.get("timestamp"))
     receipt = {"id": pending["sent_id"], "author_id": radar_id,
-               "timestamp": message["timestamp"], "delivered_at": delivered_at}
+               "timestamp": message["timestamp"], "delivered_at": delivered_at,
+               "revision": pending["revision"], "episode": pending["episode"]}
     if pending["followup"]:
         record["followup_receipt"] = receipt
         record["followup_sent"] = True
@@ -100,6 +101,10 @@ def _run(path, target_bot_id, observer_bot_id, dry_run):
             saved = json.loads(sidecar.read_text())
             if not isinstance(saved, dict) or any(not isinstance(v, dict) for v in saved.values()):
                 raise ValueError("Invalid state")
+            if any(v.get("version") != 3 for v in saved.values()):
+                report.errors.append("observer_legacy_state_requires_disposition")
+                return report
+            validate_history(saved)
             observer._history = saved
         except (ValueError, OSError):
             report.errors.append("observer_state_corrupt")
@@ -125,17 +130,19 @@ def _run(path, target_bot_id, observer_bot_id, dry_run):
         report.errors.append("observer_source_or_credential_failed")
         return report
     if dry_run:
-        report.evaluated_items = [i.topic for i in observer.extract_blocked_items(state)]
+        try:
+            report.evaluated_items = [i.topic for i in observer.extract_blocked_items(state)]
+        except (ValueError, TypeError, AttributeError):
+            report.errors.append("blocked_topic_identity_unknown")
         return report
     report = observer.evaluate(state,
         thread_reader=lambda ch: request("GET", f"/channels/{ch}/messages?limit=100", token),
         llm_evaluator=gemini_evaluator)
     # Durable pending is saved BEFORE a POST. A known sent ID retries only GET.
     _save(sidecar, observer._history)
-    candidates = {i.topic for i in observer.extract_blocked_items(state)}
-    for topic, record in observer._history.items():
-        if topic not in candidates or not record.get("pending_suggestion"):
-            continue
+    # Only the topic/revision decision made after a successful read permits transport.
+    for topic in report.delivery_topics:
+        record = observer._history[topic]
         try:
             _deliver(record, request, token, sidecar, observer._history, observer_bot_id, target_bot_id)
         except Exception:
