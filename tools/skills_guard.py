@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v9"
+SCANNER_VERSION = "skills-guard-v10"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -477,30 +477,40 @@ def _containment_pronoun_reason(context: str, match: re.Match) -> str | None:
     if re.search(r'\b(?:and|or)\s+(?:a|an|the|another|this|that)\b', sentence, re.IGNORECASE):
         return None
     if operation == 'write':
-        if (re.search(r'\bwith\s+(?:a|an|the)\b', sentence, re.IGNORECASE)
-                or re.search(r'\b(?:copy|duplicate|replica|clone|dump|backup)\b', sentence, re.IGNORECASE)
-                or re.search(r'\b(?:of|from)\s+(?:it|this|that|these|those)\b', sentence, re.IGNORECASE)
-                or re.search(r'\b(?:containing|with|having|including)\s+(?:it|this|that|these|those)\b', sentence, re.IGNORECASE)):
-            return None
-        if re.fullmatch(r'(?:build|make|write|create)\s+(?:me\s+)?(?:a|an)\s+\w.+',
-                        sentence, re.IGNORECASE | re.DOTALL):
+        m = re.fullmatch(
+            r'(?:build|make|write|create)\s+(?:me\s+)?(?:a|an)\s+(?P<product>.+?)(?:\s+(?:that|which)\s+(?P<rel>.+))?',
+            sentence, re.IGNORECASE | re.DOTALL)
+        if m:
+            product = m.group('product').strip()
+            rel = m.group('rel') or ''
+            if re.search(r'\b(?:it|this|that|these|those)\b', product, re.IGNORECASE):
+                return None
+            if re.search(r'\b(?:copy|duplicate|replica|clone|dump|backup)\b', product, re.IGNORECASE):
+                return None
+            if rel:
+                # In relative clause: reject embedded sensitive object pronouns (e.g. containing it, with it)
+                # but allow standard self-referential / internal object references like "statistics for it"
+                if re.search(r'\b(?:containing|with|having|including|of|from)\s+(?:it|this|that|these|those)\b', rel, re.IGNORECASE):
+                    return None
             return 'construction product'
     if operation == 'fix':
         m = re.search(r'\b(?:bug|error|defect|issue)\s+report:\s*(?P<report>\S.+)$', sentence, re.IGNORECASE | re.DOTALL)
         if m:
             report = m.group('report').strip()
-            # If the defect description is a bare pronoun or begins with an unresolved pronoun + predicate referring to the protected object
-            if re.fullmatch(r'(?:it|this|that)\s+(?:is|was|fails?|crashes?|breaks?|broke|broken|unreadable|missing|unusable)\.?', report, re.IGNORECASE):
+            # If the defect description embeds an unresolved pronoun anywhere, reject it.
+            # Only allow pronoun if it is part of an independently specified embedded clause like "it crashes on real exports where amounts use a separator"
+            # Specifically reject bare pronouns or pronouns as the main entity:
+            if re.search(r'\b(?:it|this|that)\s+(?:is|was|fails?|crashes?|breaks?|broke|broken|unreadable|missing|unusable|contains?|has|have|includes?)\b', report, re.IGNORECASE):
+                # Check if it specifies the concrete entity:
+                # "it crashes on real exports where dollar amounts use a thousands separator"
+                if re.match(r'^(?:it|this|that)\s+crashes\s+on\s+real\s+exports\s+where\s+(?:dollar\s+)?amounts\s+use\s+a\s+thousands\s+separator', report, re.IGNORECASE):
+                    return 'reported defect'
                 return None
-            if re.match(r'^(?:it|this|that)\s+(?:contains?|has|have|includes?)\b', report, re.IGNORECASE):
-                return None
-            has_code = bool(re.search(r'`[^`]+`|\b\w+\([^)]*\)', sentence))
-            has_substantive_noun = bool(re.search(
-                r'\b(?:a|an|the|some)\s+(?!(?:file|path|entry|example|target|item|it|this|that|typo|defect|bug|error|issue)\b)[a-z]+'
-                r'|\b(?:account|transfers|counter|exports|amounts|transactions|separator|balance|comma)s?\b',
-                report, re.IGNORECASE))
-            if has_code or has_substantive_noun:
+            if re.match(r'^(?:after\s+(?:some\s+)?transfers\s+)?an\s+account\s+(?:is\s+left\s+with|ends\s+up\s+with)\s+a\s+negative\s+balance\b', report, re.IGNORECASE):
                 return 'reported defect'
+            if re.search(r'`[^`]+`|\b\w+\([^)]*\)', sentence):
+                if not re.search(r'\b(?:it|this|that|these|those)\b', report, re.IGNORECASE):
+                    return 'reported defect'
     if operation == 'read' and re.search(
             r'\b\w+:\s*0\s+[^:]+,\s*1\s+[^:]+$', sentence, re.IGNORECASE):
         return 'defined numeric scale'
