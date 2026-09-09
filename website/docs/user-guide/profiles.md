@@ -269,6 +269,22 @@ stored as `display_name` in `~/.hermes/profile.yaml`; remove that line to
 revert. Named profiles can carry a `display_name` too (it survives a real
 rename), but `rename` for them still renames the profile itself.
 
+### Disabling Kanban dispatch while preserving profile history
+
+A profile can be retired from automated Kanban work without deleting its
+data, removing its directory, or losing access to its sessions and history.
+Set `dispatch_enabled: false` in that profile's `profile.yaml`:
+
+```yaml
+# ~/.hermes/profiles/<name>/profile.yaml
+dispatch_enabled: false
+```
+
+- When absent or set to `true`, the profile remains eligible for Kanban dispatch as normal.
+- When `false`, the profile stays in the inventory (`hermes profile list`, history, WebUI, and named lookups still work), but it is excluded from the automated Kanban roster, new task creation, task assignments, and review dispatch.
+- Invalid non-boolean values fail closed and block dispatch until corrected by the Captain.
+
+
 ## Deleting a profile
 
 ```bash

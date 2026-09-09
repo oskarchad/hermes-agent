@@ -26,6 +26,8 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from toolsets import KANBAN_TASK_TOOLSETS_BOUNDED_ENV
+from hermes_cli.profiles import profile_dispatch_error
+from hermes_cli.kanban_profile_policy import block_ineligible_dispatch
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -299,7 +301,7 @@ def _signal_owned_worker(
         try:
             pgid = os.getpgid(int(pid))
             if pgid == int(pid):
-                os.killpg(pgid, sig)
+                os.killpg(pgid, sig)  # windows-footgun: ok — POSIX + hasattr guarded above
                 return "process_group"
         except (ProcessLookupError, PermissionError, OSError):
             pass
@@ -1592,7 +1594,7 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    return any(profile_exists(row["assignee"]) and not profile_dispatch_error(row["assignee"]) for row in rows)
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -1869,6 +1871,10 @@ def _dispatch_lane_task(
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
+    if profile_dispatch_error(assignee):
+        if dry_run or block_ineligible_dispatch(conn, row, assignee):
+            result.auto_blocked.append(task_id)
+        return False
     _effective_toolsets, _toolsets_error = _validate_task_toolsets_for_spawn(
         row["enabled_toolsets"], assignee=assignee
     )
@@ -2104,7 +2110,10 @@ def _any_spawnable_review(review_rows: list[sqlite3.Row]) -> bool:
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
         return any(row["assignee"] for row in review_rows)
-    return any(row["assignee"] and profile_exists(row["assignee"]) for row in review_rows)
+    return any(
+        row["assignee"] and profile_exists(row["assignee"]) and not profile_dispatch_error(row["assignee"])
+        for row in review_rows
+    )
 
 
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
@@ -2113,6 +2122,10 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     downstream profile_exists check still buckets a missing profile as
     nonspawnable."""
     name = (default_assignee or "").strip() or None
+    error = profile_dispatch_error(name)
+    if error:
+        _kb._log.warning("kanban dispatch: %s", error)
+        return None
     if name:
         try:
             from hermes_cli.profiles import profile_exists

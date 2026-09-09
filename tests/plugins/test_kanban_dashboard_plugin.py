@@ -1144,6 +1144,46 @@ def test_reassign_endpoint_switches_profile(client):
         conn2.close()
 
 
+def test_f3_dashboard_assignment_maps_disabled_profile_to_400(client, tmp_path, monkeypatch):
+    """PATCH /tasks/<id> and POST /tasks/<id>/reassign return 400 when assignee is disabled."""
+    from hermes_cli import profiles
+    retired_dir = tmp_path / "profiles" / "retired"
+    retired_dir.mkdir(parents=True)
+    (retired_dir / "profile.yaml").write_text("dispatch_enabled: false\n")
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: tmp_path / "profiles")
+
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="task for dashboard", assignee="orig")
+    finally:
+        conn.close()
+
+    # 1. PATCH assignee targeting disabled profile -> 400 with actionable detail
+    r_patch = client.patch(
+        f"/api/plugins/kanban/tasks/{t}",
+        json={"assignee": "retired"},
+    )
+    assert r_patch.status_code == 400, r_patch.text
+    assert "dispatch_enabled" in r_patch.json().get("detail", "")
+
+    # 2. POST reassign targeting disabled profile -> 400 with actionable detail
+    r_reassign = client.post(
+        f"/api/plugins/kanban/tasks/{t}/reassign",
+        json={"profile": "retired", "reclaim_first": True},
+    )
+    assert r_reassign.status_code == 400, r_reassign.text
+    assert "dispatch_enabled" in r_reassign.json().get("detail", "")
+
+    # Ensure task state remained unchanged under original assignee
+    conn2 = kbc.connect()
+    try:
+        row = conn2.execute("SELECT assignee, status FROM tasks WHERE id=?", (t,)).fetchone()
+        assert row["assignee"] == "orig"
+    finally:
+        conn2.close()
+
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics endpoint (/api/plugins/kanban/diagnostics)
 # ---------------------------------------------------------------------------
