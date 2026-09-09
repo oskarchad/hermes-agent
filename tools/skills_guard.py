@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v8"
+SCANNER_VERSION = "skills-guard-v9"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -476,22 +476,27 @@ def _containment_pronoun_reason(context: str, match: re.Match) -> str | None:
     sentence = sentences[-1]
     if re.search(r'\b(?:and|or)\s+(?:a|an|the|another|this|that)\b', sentence, re.IGNORECASE):
         return None
-    if (operation == 'write' and not re.search(r'\bwith\s+(?:a|an|the)\b', sentence, re.IGNORECASE)
-            and not re.search(r'\b(?:copy|duplicate|replica|clone|dump|backup)\b', sentence, re.IGNORECASE)
-            and not re.search(r'\b(?:of|from)\s+(?:it|this|that|these|those)\b', sentence, re.IGNORECASE)
-            and re.fullmatch(r'(?:build|make|write|create)\s+(?:me\s+)?(?:a|an)\s+\w.+',
-                             sentence, re.IGNORECASE | re.DOTALL)):
-        return 'construction product'
+    if operation == 'write':
+        if (re.search(r'\bwith\s+(?:a|an|the)\b', sentence, re.IGNORECASE)
+                or re.search(r'\b(?:copy|duplicate|replica|clone|dump|backup)\b', sentence, re.IGNORECASE)
+                or re.search(r'\b(?:of|from)\s+(?:it|this|that|these|those)\b', sentence, re.IGNORECASE)
+                or re.search(r'\b(?:containing|with|having|including)\s+(?:it|this|that|these|those)\b', sentence, re.IGNORECASE)):
+            return None
+        if re.fullmatch(r'(?:build|make|write|create)\s+(?:me\s+)?(?:a|an)\s+\w.+',
+                        sentence, re.IGNORECASE | re.DOTALL):
+            return 'construction product'
     if operation == 'fix':
         m = re.search(r'\b(?:bug|error|defect|issue)\s+report:\s*(?P<report>\S.+)$', sentence, re.IGNORECASE | re.DOTALL)
         if m:
             report = m.group('report').strip()
-            # Bare pronoun or generic reference without a substantive domain entity is rejected
+            # If the defect description is a bare pronoun or begins with an unresolved pronoun + predicate referring to the protected object
             if re.fullmatch(r'(?:it|this|that)\s+(?:is|was|fails?|crashes?|breaks?|broke|broken|unreadable|missing|unusable)\.?', report, re.IGNORECASE):
+                return None
+            if re.match(r'^(?:it|this|that)\s+(?:contains?|has|have|includes?)\b', report, re.IGNORECASE):
                 return None
             has_code = bool(re.search(r'`[^`]+`|\b\w+\([^)]*\)', sentence))
             has_substantive_noun = bool(re.search(
-                r'\b(?:a|an|the|some)\s+(?!(?:file|path|entry|example|target|item|it|this|that)\b)[a-z]+'
+                r'\b(?:a|an|the|some)\s+(?!(?:file|path|entry|example|target|item|it|this|that|typo|defect|bug|error|issue)\b)[a-z]+'
                 r'|\b(?:account|transfers|counter|exports|amounts|transactions|separator|balance|comma)s?\b',
                 report, re.IGNORECASE))
             if has_code or has_substantive_noun:
