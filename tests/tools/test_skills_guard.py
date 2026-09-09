@@ -506,6 +506,43 @@ class TestFalsePositiveReductions:
         assert is_quarantined_project_skill(bundle / "SKILL.md") is bool(reference)
         assert bool(list(iter_project_skill_files(bundle.parent))) is not bool(reference)
 
+    @pytest.mark.parametrize("continuation, linked", [
+        ('def describe():\n    return "Generate a calendar report."\n', False),
+        ('def describe():\n    return "Read it."\n', True),
+        ('def describe():\n    return "Build a module that reads it. Write it to output.txt."\n', True),
+        ('def describe():\n    return "Build a module containing it. Write it to output.txt."\n', True),
+        ('def describe():\n    return "Read the file specified above."\n', True),
+        # A remote consumer joins distinct source definitions. Neither the
+        # function boundary nor the literal's boundary proves independence.
+        ('def describe():\n    return "Read it."\n'
+         'jobs = {"check": check, "instruction": describe}\n'
+         'def dispatch(consume):\n'
+         '    return consume(jobs["check"], jobs["instruction"]())\n', True),
+    ])
+    def test_source_unit_boundary_does_not_prove_reference_independence(
+            self, tmp_path, continuation, linked):
+        from agent.skill_utils import is_quarantined_project_skill
+        from tools.plugin_guard import scan_plugin, should_allow_plugin_install
+
+        bundle = tmp_path / "fixture"
+        bundle.mkdir()
+        (bundle / "SKILL.md").write_text("# Fixture\n", encoding="utf-8")
+        # Source is scanner input only: no import, eval, or benchmark execution.
+        text = ("# /etc/shadow must not escape root.\n"
+                "def check(value):\n    return value\n\n" + continuation)
+        (bundle / "checks.py").write_text(text, encoding="utf-8")
+        for source in ("community", "openai/skills"):
+            for scan, policy in ((scan_skill, should_allow_install),
+                                 (scan_plugin, should_allow_plugin_install)):
+                result = scan(bundle, source=source)
+                assert result.verdict == ("dangerous" if linked else "caution")
+                expected = "system_passwd_access" if linked else "system_passwd_reference"
+                assert any(f.pattern_id == expected and f.line == 1 for f in result.findings)
+                if linked:
+                    for force in (False, True):
+                        assert policy(result, force=force)[0] is False
+        assert is_quarantined_project_skill(bundle / "SKILL.md") is linked
+
     @pytest.mark.parametrize("python_literal", [False, True])
     @pytest.mark.parametrize("prose, linked", [
         ("Build me a calendar app in Python. Write it to calendar.py.", True),
