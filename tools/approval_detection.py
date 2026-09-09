@@ -723,11 +723,101 @@ def _iter_top_level_shell_segments(command: str):
         yield command[start:]
 
 
+def _python_c_payload(args: list[str]) -> tuple[bool, str | None]:
+    """Return whether Python ``-c`` occurs and the code payload it owns.
+
+    Python option grammar:
+    - Short options with arguments: -W <arg>, -X <arg> (can be separate or attached: -Wonce, -Xdev).
+    - Long options with arguments: --check-hash-based-pycs <arg> (separate or =).
+    - Flag -c: can be separate (-c CODE) or attached (-cCODE).
+    - Bundled short flags preceding -c: e.g. -Bc CODE, -BcCODE (where B takes no arg).
+    - Stop parsing on '--' or first non-option token.
+    - If -c occurs, it consumes its attached suffix or the following argument.
+    """
+    flags_with_arg = _INTERPRETER_WITH_ARG["python"]
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--" or not token.startswith("-"):
+            break
+
+        # Long options with arguments: e.g. --check-hash-based-pycs[=val]
+        option, equals, _ = token.partition("=")
+        if option in flags_with_arg:
+            if not equals:
+                index += 2
+            else:
+                index += 1
+            continue
+
+        # Short options or bundles: token starts with '-'
+        # Check attached short options with args: e.g. -Warg, -Xarg
+        has_attached_short_arg = any(
+            token.startswith(opt) and len(token) > len(opt)
+            for opt in flags_with_arg if opt.startswith("-") and not opt.startswith("--")
+        )
+        if has_attached_short_arg:
+            index += 1
+            continue
+
+        # Check if option is separate short with arg: e.g. -W, -X
+        if token in flags_with_arg:
+            index += 2
+            continue
+
+        # Check for -c or bundled -...c
+        # If token is "-c" exactly:
+        if token == "-c":
+            payload = args[index + 1] if index + 1 < len(args) else None
+            return True, payload
+
+        # If token starts with "-c" and has attached code: "-cCODE"
+        if token.startswith("-c") and len(token) > 2:
+            return True, token[2:]
+
+        # If token is a short bundle: e.g. "-uB" or "-Bc" or "-BcCODE"
+        if not token.startswith("--") and len(token) > 2:
+            chars = token[1:]
+            if "c" in chars:
+                c_idx = chars.index("c")
+                # Any chars before 'c' must be boolean options (none of them take args)
+                prefix = chars[:c_idx]
+                # If 'c' is the last char in the bundle: e.g. "-Bc"
+                if c_idx == len(chars) - 1:
+                    payload = args[index + 1] if index + 1 < len(args) else None
+                    return True, payload
+                else:
+                    # Attached code after 'c': e.g. "-BcCODE"
+                    return True, chars[c_idx + 1:]
+
+        index += 1
+
+    return False, None
+
+
 _SAFE_PYTHON_DATA_MODULES = frozenset({"sys", "json", "pathlib", "ast", "re"})
+_SAFE_MODULE_ATTR_LOOKUPS = {
+    "sys": frozenset({"stdin", "stdout", "stderr", "argv"}),
+    "json": frozenset({"load", "loads"}),
+    "pathlib": frozenset({"Path"}),
+    "ast": frozenset({"literal_eval"}),
+    "re": frozenset({"search", "match", "fullmatch", "split", "findall", "finditer", "sub", "subn"}),
+}
+_SAFE_RECEIVER_METHODS = {
+    "sys.stdin": frozenset({"read", "readline", "readlines"}),
+    "pathlib.Path": frozenset({"read_text", "read_bytes"}),
+    "json": frozenset({"load", "loads"}),
+    "ast": frozenset({"literal_eval"}),
+    "re": frozenset({"search", "match", "fullmatch", "split", "findall", "finditer", "sub", "subn"}),
+}
+_SAFE_BUILTIN_CALLS = frozenset({
+    "print", "len", "str", "int", "float", "bool", "bytes", "list", "dict", "set", "tuple",
+    "min", "max", "sum", "sorted", "reversed", "enumerate", "zip", "range",
+})
 _DANGEROUS_CALL_NAMES = frozenset({
     "exec", "eval", "compile", "__import__",
     "system", "popen", "spawn", "fork", "call", "check_call", "check_output",
-    "getattr", "setattr", "delattr",
+    "getattr", "setattr", "delattr", "open",
 })
 _DANGEROUS_MODULE_ROOTS = frozenset({
     "os", "subprocess", "posix", "nt", "pty", "socket", "http", "urllib",
@@ -746,7 +836,14 @@ def _is_safe_python_data_code(code_str: str) -> bool:
     Carveout for issue #136: commands like `gh api ... | python3 -c 'import sys; print(sys.stdin.read()[-5500:])'`
     or `python3 -c 'import json,pathlib; print(json.loads(pathlib.Path(...).read_text()))'` only read and format
     data. They do NOT execute downloaded code, spawn subprocesses, make network calls, or write files.
-    Any parse failure, dynamic execution primitive, unapproved module, or write operation fails closed (returns False).
+    Positive verification of operations:
+    - Imports restricted strictly to _SAFE_PYTHON_DATA_MODULES (sys, json, pathlib, ast, re).
+    - No aliasing to arbitrary callable objects.
+    - Calls restricted strictly to known safe operations on proven safe receivers:
+      * Builtins: print, len, str, int, etc.
+      * Receiver methods: sys.stdin.read(), pathlib.Path(...).read_text(), json.loads(), etc.
+    - Forbid all definitions, mutations, dunder attributes, and unknown call targets.
+    - Must contain at least one recognized safe read/parse operation.
     """
     try:
         tree = ast.parse(code_str)
@@ -756,44 +853,155 @@ def _is_safe_python_data_code(code_str: str) -> bool:
     if not tree.body:
         return False
 
+    # Track imported symbols and bindings
+    # module_bindings: alias_name -> canonical_module_name (e.g. "json" -> "json", "sys" -> "sys")
+    module_bindings: dict[str, str] = {}
+    # var_types: var_name -> inferred_type (e.g. "p" -> "pathlib.Path", "s" -> "data_str")
+    var_types: dict[str, str] = {}
     has_read_or_parse = False
 
-    for node in ast.walk(tree):
-        # Disallow definitions that could hide dynamic execution or rebind builtins
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                root = alias.name.split(".")[0]
+                if root not in _SAFE_PYTHON_DATA_MODULES or root in _DANGEROUS_MODULE_ROOTS:
+                    return False
+                target_name = alias.asname or alias.name
+                module_bindings[target_name] = alias.name
+        elif isinstance(stmt, ast.ImportFrom):
+            if not stmt.module:
+                return False
+            root = stmt.module.split(".")[0]
+            if root not in _SAFE_PYTHON_DATA_MODULES or root in _DANGEROUS_MODULE_ROOTS:
+                return False
+            for alias in stmt.names:
+                # Disallow wildcard imports
+                if alias.name == "*":
+                    return False
+                # Check imported attribute against allowed module lookups
+                allowed = _SAFE_MODULE_ATTR_LOOKUPS.get(stmt.module, frozenset())
+                if alias.name not in allowed:
+                    return False
+                target_name = alias.asname or alias.name
+                # Record binding as module.attr
+                module_bindings[target_name] = f"{stmt.module}.{alias.name}"
+        elif isinstance(stmt, ast.Assign):
+            # Assignment: verify value is safe and track binding
+            if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+                return False
+            var_name = stmt.targets[0].id
+            # Disallow rebinding of known modules or builtins
+            if var_name in module_bindings or var_name in _SAFE_BUILTIN_CALLS:
+                return False
+            # Evaluate rhs type/safety
+            rhs = stmt.value
+            # Forbid aliasing a module or callable directly: e.g. f = eval, p = sys.stdin.read
+            if isinstance(rhs, (ast.Name, ast.Attribute)):
+                # If it refers to an attribute or name without calling it, forbid (prevents function aliasing)
+                return False
+        elif isinstance(stmt, (ast.Expr, ast.If, ast.For, ast.With)):
+            pass
+        else:
+            # Forbid definitions (FunctionDef, AsyncFunctionDef, ClassDef) and complex statements
             return False
 
-        # Imports: only safe data-handling modules allowed
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = alias.name.split(".")[0]
-                if root in _DANGEROUS_MODULE_ROOTS or root not in _SAFE_PYTHON_DATA_MODULES:
-                    return False
-        elif isinstance(node, ast.ImportFrom):
-            if not node.module:
-                return False
-            root = node.module.split(".")[0]
-            if root in _DANGEROUS_MODULE_ROOTS or root not in _SAFE_PYTHON_DATA_MODULES:
+    # Walk all nodes in AST to enforce strict node-level rules
+    for node in ast.walk(tree):
+        # Disallow definitions
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return False
+
+        # Disallow dunder attributes entirely
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("__") and node.attr.endswith("__"):
                 return False
 
-        # Calls: forbid exec/eval/system/popen/compile/mutation
-        elif isinstance(node, ast.Call):
+        # Inspect all calls: positive allowlist
+        if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Name):
-                if func.id in _DANGEROUS_CALL_NAMES or func.id in _MUTATION_OR_WRITE_CALLS:
-                    return False
-                if func.id == "open":
-                    # Forbid open() to avoid arbitrary file writing or uncontrolled file descriptors
+                func_id = func.id
+                if func_id in _SAFE_BUILTIN_CALLS:
+                    pass
+                elif func_id in module_bindings:
+                    # An imported symbol called directly: e.g. from json import loads; loads(...)
+                    bound = module_bindings[func_id]
+                    if bound in ("json.loads", "json.load", "ast.literal_eval", "pathlib.Path"):
+                        has_read_or_parse = True
+                    elif bound.startswith("re."):
+                        has_read_or_parse = True
+                    else:
+                        return False
+                else:
+                    # Unknown function call -> fail closed
                     return False
             elif isinstance(func, ast.Attribute):
-                if func.attr in _DANGEROUS_CALL_NAMES or func.attr in _MUTATION_OR_WRITE_CALLS:
+                attr = func.attr
+                if attr in _DANGEROUS_CALL_NAMES or attr in _MUTATION_OR_WRITE_CALLS:
                     return False
-                if func.attr in ("read", "readline", "readlines", "load", "loads", "literal_eval", "read_text", "read_bytes"):
-                    has_read_or_parse = True
-
-        # Attribute access: forbid double underscore dunder access (e.g. __builtins__, __subclasses__)
-        elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("__") and node.attr.endswith("__"):
+                # Determine receiver
+                receiver = func.value
+                # Case 1: receiver is a Name
+                if isinstance(receiver, ast.Name):
+                    rec_name = receiver.id
+                    if rec_name in module_bindings:
+                        mod = module_bindings[rec_name]
+                        if mod == "json" and attr in ("loads", "load"):
+                            has_read_or_parse = True
+                        elif mod == "pathlib" and attr == "Path":
+                            pass
+                        elif mod == "ast" and attr == "literal_eval":
+                            has_read_or_parse = True
+                        elif mod == "re" and attr in _SAFE_RECEIVER_METHODS["re"]:
+                            has_read_or_parse = True
+                        else:
+                            return False
+                    elif attr in ("strip", "split", "replace", "lower", "upper", "startswith", "endswith", "format", "join"):
+                        # Safe string formatting/slicing method
+                        pass
+                    elif attr in ("get", "keys", "values", "items"):
+                        # Safe dict access
+                        pass
+                    elif attr in ("read", "readline", "readlines", "read_text", "read_bytes"):
+                        has_read_or_parse = True
+                    else:
+                        return False
+                # Case 2: receiver is sys.stdin (Attribute on Name "sys")
+                elif isinstance(receiver, ast.Attribute):
+                    # Check if receiver is sys.stdin
+                    if (
+                        isinstance(receiver.value, ast.Name)
+                        and module_bindings.get(receiver.value.id) == "sys"
+                        and receiver.attr == "stdin"
+                        and attr in ("read", "readline", "readlines")
+                    ):
+                        has_read_or_parse = True
+                    # Check if receiver is pathlib.Path(...) call
+                    elif (
+                        isinstance(receiver, ast.Call)
+                        and attr in ("read_text", "read_bytes")
+                    ):
+                        has_read_or_parse = True
+                    elif attr in ("strip", "split", "replace", "lower", "upper", "startswith", "endswith", "format", "join"):
+                        pass
+                    elif attr in ("get", "keys", "values", "items"):
+                        pass
+                    else:
+                        return False
+                # Case 3: chained call e.g. sys.stdin.read().strip() or pathlib.Path(...).read_text().splitlines()
+                elif isinstance(receiver, ast.Call):
+                    if attr in ("strip", "split", "splitlines", "replace", "lower", "upper", "startswith", "endswith", "format", "join"):
+                        pass
+                    elif attr in ("read_text", "read_bytes"):
+                        has_read_or_parse = True
+                    elif attr in ("get", "keys", "values", "items"):
+                        pass
+                    else:
+                        return False
+                else:
+                    return False
+            else:
+                # Calling something that is not Name or Attribute (e.g. subscript or call expression f()())
                 return False
 
     return has_read_or_parse
@@ -907,16 +1115,8 @@ def _execution_flag_findings(command: str):
             if family and _interpreter_exec_flag(family, args):
                 if family == "python":
                     # Check if -c payload is a safe data-reading/parsing script
-                    idx = -1
-                    for i, arg in enumerate(args):
-                        if arg == "-c":
-                            idx = i + 1
-                            break
-                        elif arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]:
-                            idx = i + 1
-                            break
-                    code_payload = args[idx] if 0 <= idx < len(args) else None
-                    if code_payload and _is_safe_python_data_code(code_payload):
+                    c_found, code_payload = _python_c_payload(args)
+                    if c_found and code_payload and _is_safe_python_data_code(code_payload):
                         pass
                     else:
                         yield ("script execution via -e/-c flag", None)

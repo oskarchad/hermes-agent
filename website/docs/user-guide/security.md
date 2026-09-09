@@ -752,7 +752,7 @@ Tirith ships prebuilt binaries for Linux (x86_64 / aarch64) and macOS (x86_64 / 
 
 ### Pipeline & Data-Reading Safe Carveout
 
-Hermes pattern detection and Tirith scanning distinguish dangerous code execution from benign data reading and formatting. Commands like:
+Hermes pattern detection recognizes safe data-reading and formatting operations in `python -c` scripts, distinguishing them from dangerous code execution. Commands like:
 
 ```bash
 gh api repos/owner/repo/actions/jobs/123/logs | python3 -c 'import sys; s=sys.stdin.read(); print(s[-5000:])'
@@ -760,8 +760,9 @@ cat data.json | python3 -c 'import json, sys; print(json.load(sys.stdin)["status
 python3 -c 'import json, pathlib; print(json.loads(pathlib.Path("rules.json").read_text()))'
 ```
 
-are recognized as safe data parsers (using only standard read/parse modules like `sys`, `json`, `pathlib`, `ast`, `re` with no dynamic `exec`/`eval`, subprocesses, network requests, or file writes). Such commands do not trigger the `script execution via -e/-c flag` approval warning and execute without prompts in interactive and headless single-query sessions.
-Upstream Tirith >=0.3.3 similarly recognizes Python data pipelines (`is_python_dash_c_data_pipeline`), avoiding false-positive `pipe_to_interpreter` blocks on data slicing and log reading.
+are verified by AST inspection as safe data parsers (using standard read/parse modules like `sys`, `json`, `pathlib`, `ast`, `re` with no dynamic `exec`/`eval`, subprocesses, network requests, file writes, or callable aliasing). Such commands do not trigger the native `script execution via -e/-c flag` approval warning. Note that other security layers (such as operator command deny rules, Tirith scanner checks, and filesystem guards) remain authoritative and are not bypassed by this carveout.
+
+Upstream Tirith >=0.3.2 (available in v0.3.3) similarly recognizes Python data pipelines (`is_python_dash_c_data_pipeline`), avoiding `pipe_to_interpreter` blocks on data slicing and log reading. If an older Tirith binary (e.g. 0.3.0) is installed in a profile or default home, updating it to >=0.3.3 resolves the pipe scanner warning.
 
 
 ### Context File Injection Protection

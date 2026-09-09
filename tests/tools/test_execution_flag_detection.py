@@ -276,6 +276,14 @@ def test_malformed_quoted_executable_payloads_fail_closed(command):
         "python3 -c 'import sys; print(sys.stdin.read().strip())'",
         "python3 -c 'import ast,sys; print(ast.literal_eval(sys.stdin.read()))'",
         "python3 -c 'import re,sys; print(re.findall(r\"\\d+\", sys.stdin.read()))'",
+        # Attached -cCODE
+        "python3 -c'import sys; print(sys.stdin.read()[:10])'",
+        # Bundled -Bc
+        "python3 -Bc 'import sys; print(sys.stdin.read())'",
+        # Option with arg -W ignore before -c
+        "python3 -W ignore -c 'import sys; print(sys.stdin.read())'",
+        # Option with attached arg -Wignore before -c
+        "python3 -Wignore -c 'import sys; print(sys.stdin.read())'",
     ],
 )
 def test_safe_python_data_reading_carveout_does_not_require_approval(command):
@@ -290,6 +298,13 @@ def test_safe_python_data_reading_carveout_does_not_require_approval(command):
         "gh api logs | python3 -c 'import sys; exec(sys.stdin.read())'",
         "cat script.py | python3 -c 'eval(input())'",
         "cat script.py | python3 -c 'import sys; d=sys.stdin.read(); exec(d)'",
+        # F1 counterexamples from Gauge: alias to eval, open() for writing
+        "python3 -c 'import sys; f=eval; f(sys.stdin.read())'",
+        "python3 -c 'import json,pathlib; json.loads(\"{}\"); pathlib.Path(\"/tmp/report-target\").open(\"w\").close()'",
+        "python3 -c 'import json,pathlib; p=pathlib.Path(\"/tmp/report-target\"); p.open(\"w\").write(\"test\")'",
+        # F2 counterexamples from Gauge: attached code with safe trailing decoy, option argument ownership
+        "python3 -c'import os; os.system(\"id\")' 'import json; json.loads(\"{}\")'",
+        "python3 -W'import json; json.loads(\"{}\")' -c 'import os; os.system(\"id\")'",
         # Dangerous modules (os, subprocess, network, etc.)
         "python3 -c 'import os,sys; os.system(sys.stdin.read())'",
         "python3 -c 'import subprocess; subprocess.run([\"ls\"])'",
