@@ -7,6 +7,7 @@ Known gap: language write APIs (open(..., 'w'), Path.write_text, shutil.copy*, f
 agent-config files surface only the low *_ref finding — static regexes cannot tie the call to a dynamic
 destination; future coverage belongs as a fourth "mechanical" tier next to agent_config_mod_shell."""
 
+import ast
 import re
 import fnmatch
 import hashlib
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v2"
+SCANNER_VERSION = "skills-guard-v8"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -391,6 +392,165 @@ def _compute_docstring_lines(lines: list) -> set:
     return doc_lines
 
 
+_CONTAINMENT_REQUIREMENT = re.compile(
+    r'(?P<quote>`?)[\w./-]*/etc/(?:passwd|shadow)(?P=quote)\s+'
+    r'must\s+not\s+escape\s+(?:the\s+)?(?:base|root)(?:\s+dir(?:ectory)?)?\.?',
+    re.IGNORECASE)
+_CONTAINMENT_COMMENT = re.compile(
+    r'(?:\d+\.\s+(?:[\w-]+\s+--\s+)?path traversal\.\s+)?'
+    + _CONTAINMENT_REQUIREMENT.pattern,
+    re.IGNORECASE)
+_CONTAINMENT_DESIGN = r'(?:[\w]+-[\w]+\s+)?(?:helper|framework|library|utility|function|module)'
+_CONTAINMENT_LABEL = re.compile(
+    r'(?:constraint|`[\w.-]+`|implement\s+`[\w.]+`|'
+    + _CONTAINMENT_DESIGN + r'\s+vs\s+' + _CONTAINMENT_DESIGN + r')',
+    re.IGNORECASE)
+# Relations, not an access-verb blacklist: an unknown operation on one of these
+# referents is just as ambiguous as "read". Scan the entire input, across lines.
+_CONTAINMENT_LINK = re.compile(
+    r'\b(?:the\s+file\b|(?:this|that|these|those|said|aforementioned)\s+(?:file|path|entry|example)\b'
+    r'|(?:file|path|entry|example)\s+(?:specified|mentioned|shown|listed|above|below|earlier|later)\b'
+    r'|(?:above|below|previous|following|next|first|second|third|last)\s+(?:file|path|cell|row|entry)\b'
+    r'|(?:its|their)\s+(?:contents?|bytes?|data)\b'
+    r'|(?:contents?|bytes?|data)\s+of\s+(?:it|this|that|these|those)\b'
+    r'|(?:passwd|shadow)\s+(?:file|path|contents?)\b'
+    r'|(?:be|denotes?|refers?\s+to|=)\s+it\b|(?:call|name|alias)\s+it\b)', re.IGNORECASE)
+_CONTAINMENT_BARE_PRONOUN = re.compile(
+    # List markers, clause boundaries and trailing modifiers do not resolve "it".
+    # Keep the operation generic: an unknown verb is still unresolved use.
+    r'(?:^|[.!?;:|])[#\s>*+-]*(?:\d+[.)]\s+)?'
+    r'(?:(?:now|then|please)\s+)?(?P<operation>\w+)\s+it\b',
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _containment_contexts(text: str, suffix: str) -> list[str]:
+    """Decode Python literal tasks without importing/executing the scanned source.
+
+    Keep raw nonliteral code/comments, too. A string boundary never proves an
+    antecedent: an unresolved instruction in any literal vetoes the downgrade.
+    """
+    if suffix != '.py':
+        return [text]
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return [text]
+    raw_lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in raw_lines:
+        offsets.append(offsets[-1] + len(line.encode('utf-8')))
+    raw = bytearray(text.encode('utf-8'))
+    contexts = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            contexts.append(node.value)
+            start = offsets[node.lineno - 1] + node.col_offset
+            end = offsets[node.end_lineno - 1] + node.end_col_offset
+            raw[start:end] = bytes(10 if byte == 10 else 32 for byte in raw[start:end])
+    return [raw.decode('utf-8'), *contexts]
+
+
+def _containment_pronoun_reason(context: str, match: re.Match) -> str | None:
+    """Positive, bounded grammatical evidence; unknown/competing uses stay unresolved.
+
+    Supported: a prohibition, a subject in a relative clause, a construction
+    request followed by writing its product, repairing an explicit issue report,
+    and reading an explicitly defined numeric scale. Not nearest-noun resolution.
+    """
+    before = context[:match.start()]
+    if re.search(r'\bmust\s+not\s*$', before, re.IGNORECASE):
+        return 'prohibition'
+    operation = match['operation'].lower()
+    if (re.search(r'\bthe\s*$', before, re.IGNORECASE)
+            and operation not in {'file', 'path', 'entry', 'target', 'example'}
+            and re.match(r'\s+(?:wrote|created|generated|produced|cut)\b', context[match.end():], re.IGNORECASE)):
+        return 'relative-clause subject'
+    # Only an explicit antecedent in the immediately preceding sentence of the
+    # same paragraph can resolve the object. Blank lines never introduce one.
+    if re.search(r'\n\s*\n', context[match.start():match.start('operation')]):
+        return None
+    paragraph = re.split(r'\n\s*\n', before)[-1]
+    sentences = [s.strip() for s in re.split(r'[.!?](?=\s|$)', paragraph) if s.strip()]
+    if not sentences:
+        return None
+    sentence = sentences[-1]
+    if re.search(r'\b(?:and|or)\s+(?:a|an|the|another|this|that)\b', sentence, re.IGNORECASE):
+        return None
+    if (operation == 'write' and not re.search(r'\bwith\s+(?:a|an|the)\b', sentence, re.IGNORECASE)
+            and not re.search(r'\b(?:copy|duplicate|replica|clone|dump|backup)\b', sentence, re.IGNORECASE)
+            and not re.search(r'\b(?:of|from)\s+(?:it|this|that|these|those)\b', sentence, re.IGNORECASE)
+            and re.fullmatch(r'(?:build|make|write|create)\s+(?:me\s+)?(?:a|an)\s+\w.+',
+                             sentence, re.IGNORECASE | re.DOTALL)):
+        return 'construction product'
+    if operation == 'fix':
+        m = re.search(r'\b(?:bug|error|defect|issue)\s+report:\s*(?P<report>\S.+)$', sentence, re.IGNORECASE | re.DOTALL)
+        if m:
+            report = m.group('report').strip()
+            # Bare pronoun or generic reference without a substantive domain entity is rejected
+            if re.fullmatch(r'(?:it|this|that)\s+(?:is|was|fails?|crashes?|breaks?|broke|broken|unreadable|missing|unusable)\.?', report, re.IGNORECASE):
+                return None
+            has_code = bool(re.search(r'`[^`]+`|\b\w+\([^)]*\)', sentence))
+            has_substantive_noun = bool(re.search(
+                r'\b(?:a|an|the|some)\s+(?!(?:file|path|entry|example|target|item|it|this|that)\b)[a-z]+'
+                r'|\b(?:account|transfers|counter|exports|amounts|transactions|separator|balance|comma)s?\b',
+                report, re.IGNORECASE))
+            if has_code or has_substantive_noun:
+                return 'reported defect'
+    if operation == 'read' and re.search(
+            r'\b\w+:\s*0\s+[^:]+,\s*1\s+[^:]+$', sentence, re.IGNORECASE):
+        return 'defined numeric scale'
+    return None
+
+
+def _containment_reference_lines(lines: list[str], suffix: str) -> set[int]:
+    """Recognize a small English containment grammar, not a safe whole document.
+
+    Each candidate must occupy a complete comment or table cell; all adjacent
+    cells must be requirements or explicit labels/implementation targets/design
+    alternatives. Other path occurrences retain their original finding. Before
+    downgrading, inspect the entire residual document for unresolved file/path,
+    basename, spatial and possessive references (including alias introductions).
+    Unknown linked uses veto; unrelated source/prose does not. This is a lexical
+    scanner, not arbitrary-language coreference or program/data-flow analysis.
+    """
+    candidates = set()
+    residual = []
+    for i, line in enumerate(lines, start=1):
+        text = line.strip()
+        recognized = False
+        if suffix in {'.py', '.sh', '.bash'} and text.startswith('#'):
+            recognized = _CONTAINMENT_COMMENT.fullmatch(text[1:].strip()) is not None
+        elif suffix == '.md' and text.startswith('|') and text.endswith('|'):
+            cells = [cell.strip() for cell in text[1:-1].split('|')]
+            recognized = (any(_CONTAINMENT_REQUIREMENT.fullmatch(cell) for cell in cells)
+                          and all(_CONTAINMENT_REQUIREMENT.fullmatch(cell)
+                                  or _CONTAINMENT_LABEL.fullmatch(cell) for cell in cells))
+        if recognized:
+            candidates.add(i)
+            # Preserve neighboring cells in the reference check: labels are not
+            # evidence that a cross-cell or remote instruction is independent.
+            residual.append(_CONTAINMENT_REQUIREMENT.sub('', line))
+        else:
+            residual.append(line)
+    if not candidates:
+        return set()
+
+    def normalize(text: str) -> str:
+        return '\n'.join(line.lstrip().lstrip('#> ').replace('`', '').replace('*', '')
+                         for line in text.splitlines())
+
+    raw = '\n'.join(residual)
+    # Preserve the raw explicit-link veto as well as decoded string references.
+    contexts = [normalize(part) for part in _containment_contexts(raw, suffix)]
+    if any(_CONTAINMENT_LINK.search(part) for part in [normalize(raw), *contexts]):
+        return set()
+    for context in contexts:
+        for match in _CONTAINMENT_BARE_PRONOUN.finditer(context):
+            if _containment_pronoun_reason(context, match) is None:
+                return set()
+    return candidates
+
+
 def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     """Threat-pattern + invisible-unicode scan of one file; *rel_path* is the display path (default: file
     name). Regex findings dedupe per pattern per line; invisible chars yield one per line."""
@@ -402,13 +562,18 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
     except (UnicodeDecodeError, OSError):
         return []
     findings = []
+    containment_lines = _containment_reference_lines(lines, file_path.suffix.lower())
     docstring_lines = _compute_docstring_lines(lines)  # so code patterns don't fire on prose
     for pattern, pid, severity, category, description in _COMPILED_THREAT_PATTERNS:
         for i, line in enumerate(lines, start=1):
             if i not in docstring_lines and pattern.search(line):
                 text = line.strip()
-                findings.append(Finding(pid, severity, category, rel_path, i,
-                                        text if len(text) <= 120 else text[:117] + "...", description))
+                finding_pid, finding_severity, finding_description = pid, severity, description
+                if pid == "system_passwd_access" and i in containment_lines:
+                    finding_pid, finding_severity = "system_passwd_reference", "high"
+                    finding_description = "system password path in a containment requirement (review context)"
+                findings.append(Finding(finding_pid, finding_severity, category, rel_path, i,
+                                        text if len(text) <= 120 else text[:117] + "...", finding_description))
     for i, line in enumerate(lines, start=1):
         if (char := next((c for c in INVISIBLE_CHARS if c in line), None)) is not None:
             name = _unicode_char_name(char)
