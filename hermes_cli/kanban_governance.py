@@ -141,15 +141,43 @@ def bind_created_tx(conn, task_id, parents):
                  (task_id, binding["workflow_id"], store.canonical_bytes(binding).decode(), source, wf["revision"]))
 
 
+def bind_linked_tx(conn, parent_id, child_id):
+    parent = store.binding(conn, parent_id)
+    child = store.binding(conn, child_id)
+    if parent is None:
+        return
+    if child is None:
+        bind_created_tx(conn, child_id, (parent_id,))
+    elif child["workflow_id"] != parent["workflow_id"]:
+        recovery_tx(conn, parent["workflow_id"], "conflicting membership")
+        recovery_tx(conn, child["workflow_id"], "conflicting membership")
+        child["role"] = "unclassified"
+        conn.execute("UPDATE kanban_task_bindings SET binding_json=?,source_action=NULL WHERE task_id=?",
+                     (store.canonical_bytes(child).decode(), child_id))
+    for row in conn.execute("SELECT child_id FROM task_links WHERE parent_id=?", (child_id,)).fetchall():
+        bind_linked_tx(conn, child_id, row[0])
+
+
 def evaluate_tx(conn, task_id, operation, *, expected_run_id=None):
     if not conn.in_transaction:
         raise RuntimeError("evaluation requires transaction")
     binding = store.binding(conn, task_id)
     if binding is None:
+        known = conn.execute("SELECT workflow_id FROM kanban_dispositions WHERE task_id=?", (task_id,)).fetchone()
+        if known:
+            return recovery_tx(conn, known[0], "issued binding missing")
         return TransitionDisposition(True, "not governed")
     if binding["role"] == "recovery":
         return TransitionDisposition(True, "independent recovery")
     wf_id = binding["workflow_id"]
+    if operation.startswith("assign:"):
+        source = conn.execute(
+            "SELECT d.payload_json FROM kanban_task_bindings b "
+            "JOIN kanban_dispositions d ON d.action_key=b.source_action WHERE b.task_id=?",
+            (task_id,),
+        ).fetchone()
+        if source is None or json.loads(source[0])["assignee"] != operation[len("assign:"):]:
+            return recovery_tx(conn, wf_id, "issued owner change denied")
     if binding["role"] == "unclassified":
         return recovery_tx(conn, wf_id, "unclassified descendant")
     validator = _validators.get(conn, {}).get(binding["contract"])
@@ -157,7 +185,7 @@ def evaluate_tx(conn, task_id, operation, *, expected_run_id=None):
         return recovery_tx(conn, wf_id, "validator unavailable")
     try:
         result = validator.evaluate(conn, task_id, operation)
-    except (ValueError, KeyError, TypeError, OSError):
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError):
         return recovery_tx(conn, wf_id, "validator error")
     for order in result.work:
         reserve_tx(conn, order)
@@ -180,7 +208,7 @@ def _reconcile_tx(conn, workflow_id):
         return
     try:
         work = validator.reconcile(conn, workflow_id)
-    except (ValueError, KeyError, TypeError, OSError):
+    except (ValueError, KeyError, TypeError, OSError, RuntimeError):
         recovery_tx(conn, workflow_id, "validator error")
         return
     for order in work:

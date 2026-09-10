@@ -1798,6 +1798,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "assign:" + (profile or "")).allowed:
+            return False
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -1922,6 +1925,8 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
+        from hermes_cli.kanban_governance import bind_linked_tx
+        bind_linked_tx(conn, parent_id, child_id)
         _link(conn, parent_id, child_id)
         # If child was ready but parent is not yet done, demote child to todo.
         if _task_status(conn, parent_id) != "done":
@@ -3530,6 +3535,10 @@ def request_review(
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        disposition = evaluate_tx(conn, task_id, "review", expected_run_id=expected_run_id)
+        if not disposition.allowed:
+            return _ret(False, disposition.reason)
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -3774,6 +3783,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "unblock").allowed:
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3956,6 +3968,10 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        operation = "assign:" + assignee if assignee is not None else "specify"
+        if not evaluate_tx(conn, task_id, operation).allowed:
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
