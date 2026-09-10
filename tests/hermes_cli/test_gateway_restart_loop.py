@@ -603,6 +603,12 @@ class TestTerminalToolGatewayLifecycleGuard:
         (["sudo", "hermes", "gateway", "stop"], True),
         (["sh", "-c", "hermes gateway stop"], True),
         (["env", "-S", "sh -c 'hermes gateway stop'"], True),
+        (["python3", "-c", "import os; os.system('hermes gateway stop')"], True),
+        (["timeout", "10", "env", "-S", 'sh -c "hermes gateway stop"'], True),
+        (["launchctl", "kill", "SIGTERM", "gui/501/ai.hermes.gateway"], True),
+        (["launchctl", "stop", "gui/501/ai.hermes.gateway"], True),
+        (["launchctl", "kill", "SIGTERM", "gui/501/com.example.other"], False),
+        (["launchctl", "stop", "gui/501/com.example.other"], False),
     ])
     def test_python_argv_execution_roles_reach_real_caller(self, monkeypatch, tmp_path, argv, blocked):
         from tools.terminal_tool_guards import gateway_lifecycle_block

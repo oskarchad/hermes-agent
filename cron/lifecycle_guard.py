@@ -25,6 +25,10 @@ class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
 
 
+class _IncompleteProcessArgv(ValueError):
+    """A recognized execution operand has no owner in the bounded argv walk."""
+
+
 # Shell-level command shapes that target the gateway lifecycle; each branch is anchored on a
 # concrete command identifier so it fires only on command-shaped strings, never prose.
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
@@ -473,12 +477,17 @@ def _executable_name(token: str) -> str:
     return Path(token).name or token
 
 
-def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
-    """Index of the command a wrapper chain actually executes. Unchanged if not a wrapper; may be
-    ``len(segment)`` when a wrapper has no operand — callers must bounds-check."""
+def _peel_transparent_prefixes(
+    segment: list[str], index: int, *, require_coverage: bool = False,
+) -> int:
+    """Find the wrapper endpoint; literal argv also requires owned option operands.
+
+    Legacy string callers keep best-effort discovery. The argv consumer cannot
+    use an empty discovery result as proof that a masked operand was inspected.
+    """
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(segment):
-            return index
+            break
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
             return index
@@ -490,9 +499,17 @@ def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
                 # POSIX end-of-options: the command starts at the next token.
                 index += 1
                 break
+            if require_coverage and any(
+                token == option or token.startswith(option + "=")
+                or (len(option) == 2 and token.startswith(option))
+                for option in _STRING_COMMAND_OPTIONS.get(name, ())
+            ):
+                raise _IncompleteProcessArgv("wrapper command string")
             if token in value_options:
                 index += 2
                 continue
+            if require_coverage and token.startswith("-"):
+                raise _IncompleteProcessArgv("unsupported wrapper option")
             if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
                 index += 1
                 continue
@@ -500,6 +517,10 @@ def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
         for _ in range(_TRANSPARENT_PREFIX_OPERANDS.get(name, 0)):
             if index < len(segment) and not segment[index].startswith("-"):
                 index += 1
+    if require_coverage and (
+        index >= len(segment) or _executable_name(segment[index]) in _TRANSPARENT_COMMAND_PREFIXES
+    ):
+        raise _IncompleteProcessArgv("wrapper endpoint unresolved")
     return index
 
 
@@ -597,20 +618,24 @@ def _direct_argv_lifecycle_scan(argv: list[str]) -> bool:
     Shell-program operands and script paths are inspected separately by the
     existing recursive walk, including for programs not named by these patterns.
     """
-    index = _executed_command_index(argv)
+    from tools.approval_detection import _interpreter_family
+
+    index = _command_token_index(argv)
     if index is None:
-        return False
+        raise _IncompleteProcessArgv("missing executable")
+    index = _peel_transparent_prefixes(argv, index, require_coverage=True)
     executable = _executable_name(argv[index])
+    # These recognized interpreters have no program-source owner here. Refuse
+    # the invocation, including innocuous forms, rather than interpreting a new
+    # language. osascript is the other heredoc interpreter; eval/xargs are the
+    # execution consumers already recognized by _PIPE_TO_INTERPRETER.
+    if _interpreter_family(executable) or executable in {"osascript", "eval", "xargs"}:
+        raise _IncompleteProcessArgv("non-shell interpreter")
     if executable not in {"hermes", "launchctl", "systemctl", "kill", "pkill"}:
+        # Only executable-reference coverage for arbitrary programs, not a
+        # claim that their arguments are safe or cannot carry another language.
         return False
-    arguments = argv[index + 1:]
-    if executable == "launchctl" and arguments and arguments[0].lower() in {"submit", "bootstrap"}:
-        return True
-    command = " ".join([executable, *arguments])
-    if _GATEWAY_LIFECYCLE_PATTERN.match(command):
-        return True
-    profile = _PROFILE_FLAG_LIFECYCLE_PATTERN.match(command)
-    return bool(profile and _named_profile_is_current(profile.group(1) or profile.group(2)))
+    return _direct_lifecycle_scan(" ".join([executable, *argv[index + 1:]]))
 
 
 # --- path handling ----------------------------------------------------------------------------
@@ -717,8 +742,10 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield token[len(prefix):]
 
 
-def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
-    """Yield the scripts the token at *index* executes, if any."""
+def _references_at(
+    segment: list[str], index: int, cwd: Optional[str], *, require_coverage: bool = False,
+) -> Iterator[Path]:
+    """Yield owned script operands; masked argv must not silently lose shell source."""
     if index >= len(segment):
         return
     executable = segment[index]
@@ -727,6 +754,8 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
     if executable_name in {".", "source"}:
         if len(segment) > index + 1:
             yield from _resolved_or_nothing(segment[index + 1], cwd)
+        elif require_coverage:
+            raise _IncompleteProcessArgv("missing sourced script")
         return
 
     if executable_name in _SHELL_EXECUTABLES:
@@ -738,14 +767,20 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
                 arg_index += 1
                 break
             if argument in _SHELL_COMMAND_FLAGS:
-                break
+                if require_coverage and arg_index + 1 >= len(arguments):
+                    raise _IncompleteProcessArgv("missing shell program")
+                break  # _iter_shell_command_payloads owns this exact flag's source.
             if argument in _SHELL_OPTIONS_WITH_VALUES:
                 arg_index += 2
                 continue
+            if require_coverage and argument.startswith(("-", "+")):
+                raise _IncompleteProcessArgv("unsupported shell option")
             if argument.startswith("-"):
                 arg_index += 1
                 continue
             break
+        if require_coverage and arg_index >= len(arguments):
+            raise _IncompleteProcessArgv("unresolved shell stdin")
         if arg_index < len(arguments) and arguments[arg_index] not in _SHELL_COMMAND_FLAGS:
             yield from _resolved_or_nothing(arguments[arg_index], cwd)
         return
@@ -764,10 +799,10 @@ def _iter_referenced_shell_scripts(command: str | list[str], *, cwd: Optional[st
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
+        yield from _references_at(segment, index, cwd, require_coverage=isinstance(command, list))
         peeled = _peel_transparent_prefixes(segment, index)
         if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+            yield from _references_at(segment, peeled, cwd, require_coverage=isinstance(command, list))
 
 
 def _iter_shell_command_payloads(command: str | list[str]) -> Iterator[str]:
@@ -961,8 +996,8 @@ def _python_process_payloads(source: str) -> Optional[tuple[list[str | list[str]
             if argument.end_lineno is None or argument.end_col_offset is None:
                 return None
             payloads.append(argv)
-            # The structured walk owns this literal operand now. Do not parse it
-            # again as shell source (parentheses/substitutions in argv are data).
+            # Keep data out of shell re-tokenization. This is not a coverage
+            # verdict: the consumer must finish inspection or explicitly refuse.
             data_spans.append((offsets[argument.lineno - 1] + argument.col_offset,
                                offsets[argument.end_lineno - 1] + argument.end_col_offset))
         else:
@@ -1008,10 +1043,14 @@ def _contains_unsafe_gateway_action(
             if inspected is None:
                 return True
             payloads, reference_source = inspected
+            try:
+                for payload in payloads:
+                    if recurse(payload, cwd):
+                        return True
+            except _IncompleteProcessArgv as exc:
+                logger.warning("lifecycle guard incomplete process argv inspection (%s); refusing", exc)
+                return True
             reference_sources.append(reference_source)
-            for payload in payloads:
-                if recurse(payload, cwd):
-                    return True
         # Unknown Python constructs retain their old shell walk; only proven data
         # and structured operands already owned by recursion are removed.
         command = "\n".join(reference_sources)

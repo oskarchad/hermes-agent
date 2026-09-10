@@ -262,6 +262,52 @@ def test_python_argv_data_and_script_positions_share_bounded_walk(monkeypatch, t
         ) is True
 
 
+@pytest.mark.parametrize("argv", [
+    ["python3", "-c", "print('ok')"],
+    ["python3.12", "-I", "-cprint('ok')"],
+    ["python3", "benign.py"],
+    ["node", "--eval=console.log('ok')"],
+    ["perl", "-e", "print 'ok'"],
+    ["ruby", "-e", "puts 'ok'"],
+    ["php", "-r", "print('ok');"],
+    ["pwsh", "-command", "Write-Output ok"],
+    ["osascript", "-e", 'return "ok"'],
+    ["xargs", "printf"],
+    ["eval", "printf ok"],
+    ["env", "--split-string=printf ok"],
+    ["timeout", "10", "env", "-Sprintf ok"],
+    ["timeout", "10", "su", "--command=printf ok", "nobody"],
+    ["sudo", "runuser", "-c", "printf ok", "nobody"],
+    ["sh", "-lc", "printf ok"],
+    ["sh", "--command=printf ok"],
+    ["sh", "-c"],
+    ["source"],
+    ["env"],
+    ["timeout", "10"],
+    ["env"] * (lifecycle_guard._MAX_PREFIX_PEELS + 1) + ["printf", "ok"],
+])
+def test_python_argv_unowned_execution_is_refusal_not_detection(argv, tmp_path, caplog):
+    from tools import process_registry
+    from tools.terminal_tool_guards import gateway_lifecycle_block
+    from unittest.mock import patch
+
+    command = "python3 - <<'PY'\nsubprocess.run(" + repr(argv) + ")\nPY"
+    # Innocuous, unsupported execution is still refused, not certified as data.
+    with caplog.at_level("WARNING", logger=lifecycle_guard.logger.name):
+        assert guard(command, cwd=str(tmp_path)) is True
+    assert "incomplete process argv inspection" in caplog.text
+    assert "falling back to direct-scan verdict" not in caplog.text
+    with patch.object(process_registry, "_is_supervised_gateway_process", return_value=True):
+        assert gateway_lifecycle_block(
+            command=command, env=object(), env_type="local", cwd=str(tmp_path),
+            workdir=str(tmp_path), session_key="coverage-refusal",
+        ) is not None
+    # The new boundary applies only inside the complete quoted Python stdin lane.
+    assert guard("python3 -c \"print('ok')\"", cwd=str(tmp_path)) is False
+    assert guard("python3 - <<'PY'\nsubprocess.run(['sh', '-c', 'printf ok'])\nPY",
+                 cwd=str(tmp_path)) is False
+
+
 # --- scheduler entry point --------------------------------------------------
 
 
