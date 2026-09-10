@@ -197,20 +197,40 @@ class DiscordBlockerObserver:
 
     def _observe_responses(self, state, record, messages):
         actors = {self.target_bot_id, str(state.get("operator_id", ""))} - {"", self.observer_bot_id}
-        receipt = record.get("delivery_receipt")
+        channel = record.get("channel_id")
+        revisions = [r for r in [*record.get("revisions", []), record] if r.get("channel_id") == channel]
+        receipts = {str(r[key]["id"]): r[key] for r in revisions
+                    for key in ("delivery_receipt", "followup_receipt") if r.get(key)}
+        ancestry = {mid: mid for mid in receipts}
+        for revision in revisions:
+            known = revision.get("disposition") or {}
+            if known.get("suggestion_message_id") in receipts:
+                ancestry[str(known["message_id"])] = known["suggestion_message_id"]
         for m in messages:
+            mid = str(m["id"])
+            ref = m.get("message_reference") or {}
+            if str(ref.get("channel_id", channel)) == channel:
+                parent = ancestry.get(str(ref.get("message_id")))
+                if parent:
+                    ancestry[mid] = parent
             if author_id(m) not in actors:
                 continue
+            suggestion_id = ancestry.get(mid)
+            receipt = receipts.get(suggestion_id or "")
             try:
                 observed_at = timestamp(m.get("timestamp"))
-                if receipt and (int(m["id"]) <= int(receipt["id"]) or observed_at <= receipt["delivered_at"]):
+                if receipt and (int(mid) <= int(receipt["id"]) or observed_at <= receipt["delivered_at"]):
                     continue
             except (ValueError, TypeError):
                 continue
+            # Re-reading an older window must not replace the latest response.
+            previous = record.get("disposition") or {}
+            if int(mid) < int(previous.get("message_id", "0")):
+                continue
             record["disposition"] = {"kind": "response_observed_not_action",
-                                     "message_id": str(m["id"]), "author_id": author_id(m),
+                                     "message_id": mid, "author_id": author_id(m),
                                      "timestamp": m["timestamp"],
-                                     "suggestion_message_id": receipt["id"] if receipt else None}
+                                     "suggestion_message_id": suggestion_id}
 
     def _start_revision(self, record, item, digest):
         history = record.get("revisions", [])

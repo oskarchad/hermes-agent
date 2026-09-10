@@ -365,3 +365,84 @@ def test_current_blocked_entry_reaches_evaluator_and_revision_return_is_new_deli
     assert history(e)["A"]["delivery_receipt"]["id"] != first["id"]
     assert history(e)["A"]["delivery_receipt"]["delivered_at"] == e["clock"][0]
     assert not run(e).model_calls
+
+
+@pytest.mark.parametrize("followup", [False, True])
+def test_r1_late_reply_tracks_archived_receipt_ancestry(pipeline, monkeypatch, tmp_path, followup):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(pipeline["home"]))
+    e = pipeline
+    s = json.loads(e["path"].read_text())
+    s["evidence"]["B"] = {"channel_id": "100", "message_id": "203", "note": "B completed"}
+    e["path"].write_text(json.dumps(s))
+    assert run(e).model_calls == 1
+    old = history(e)["A"]["delivery_receipt"]
+    if followup:
+        e["clock"][0] += 1200
+        assert not run(e).model_calls
+        old = history(e)["A"]["followup_receipt"]
+    e["clock"][0] += 20
+    correction = e["msg"](500, "999", "Correction: certificate ready; account access revoked.")
+    correction["message_reference"] = {"channel_id": "100", "message_id": old["id"]}
+    e["messages"].insert(0, correction)
+    e["result"] = {"status": "known", "reason": "Access revoked", "action": "Check account access", "evidence_ids": ["500"]}
+    assert run(e).model_calls == 1
+    latest = history(e)["A"]["delivery_receipt"]
+    assert latest["id"] != old["id"]
+    assert not run(e).model_calls
+    for mid, parent in [(600, old["id"]), (601, "600")]:
+        e["clock"][0] += 20
+        reply = e["msg"](mid, "777", "ACK")
+        reply["message_reference"] = {"channel_id": "100", "message_id": parent}
+        e["messages"].insert(0, reply)
+        assert not run(e).model_calls
+        before = history(e)["A"]["disposition"]
+        assert before["message_id"] == str(mid)
+        assert before["suggestion_message_id"] == old["id"]
+        assert before["kind"] == "response_observed_not_action"
+        assert not run(e).model_calls
+        after = history(e)["A"]["disposition"]
+        assert after == before
+        e["sequence"][-1].update(response_before=before, response_after=after)
+    key = "followup_receipt" if followup else "delivery_receipt"
+    assert history(e)["A"]["revisions"][0][key] == old
+    assert len(e["models"]) == 2 and len(e["posts"]) == 2 + int(followup)
+    assert all(not tick["settled"] for tick in e["sequence"])
+
+
+@pytest.mark.parametrize("correlation", ["explicit", "retained", "unknown"])
+def test_r1_unknown_restart_preserves_known_response_not_inferred_association(pipeline, monkeypatch, tmp_path, correlation):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(pipeline["home"]))
+    e = pipeline
+    assert run(e).model_calls == 1
+    old = history(e)["A"]["delivery_receipt"]
+    e["clock"][0] += 20
+    correction = e["msg"](500, "999", "Correction: certificate ready; previous advice obsolete; cause unknown.")
+    correction["message_reference"] = {"channel_id": "100", "message_id": old["id"] if correlation == "explicit" else "201"}
+    e["messages"].insert(0, correction)
+    if correlation == "retained":
+        # Existing v3 state already knows response500 -> proposal301, as in Gauge B.
+        # A replay with only the topic anchor must not erase that retained fact.
+        saved = history(e)
+        saved["A"]["disposition"] = {"kind": "response_observed_not_action", "message_id": "500",
+            "author_id": "999", "timestamp": correction["timestamp"], "suggestion_message_id": old["id"]}
+        (e["path"].parent / "discord-blocker-observer-state.json").write_text(json.dumps(saved))
+    e["result"] = {"status": "unknown", "reason": "Need new evidence", "evidence_ids": ["500"]}
+    assert run(e).model_calls == 1
+    before = history(e)["A"]["disposition"]
+    expected = None if correlation == "unknown" else old["id"]
+    assert before["message_id"] == "500" and before["suggestion_message_id"] == expected
+    e["clock"][0] += 2400
+    assert not run(e).model_calls
+    after = history(e)["A"]["disposition"]
+    e["sequence"][-1].update(response_before=before, response_after=after)
+    assert after == before
+    assert history(e)["A"]["revisions"][0]["delivery_receipt"] == old
+    assert not history(e)["A"].get("delivery_receipt")
+    assert len(e["models"]) == 2 and len(e["posts"]) == 1
+    assert all(not tick["settled"] for tick in e["sequence"])
