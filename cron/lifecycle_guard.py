@@ -159,6 +159,12 @@ _TRANSPARENT_COMMAND_PREFIXES = frozenset({
     "pkexec", "su", "runuser", "setpriv", "systemd-run", "nsenter", "unshare",
 })
 
+# These recognized wrappers are not options-then-command in every supported
+# mode: su/runuser have a user operand, nsenter has optional option values, and
+# ionice has variadic process targets. Do not infer argv coverage by peeling
+# them; legacy string discovery keeps its existing best-effort behavior.
+_UNSUPPORTED_ARGV_WRAPPERS = frozenset({"su", "runuser", "nsenter", "ionice"})
+
 # Wrapper options that consume the NEXT token, so a value is never mistaken for the command.
 _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
     "sudo": {"-u", "-g", "-U", "-C", "-p", "-r", "-t", "-T", "--user", "--group", "--prompt"},
@@ -491,6 +497,8 @@ def _peel_transparent_prefixes(
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
             return index
+        if require_coverage and name in _UNSUPPORTED_ARGV_WRAPPERS:
+            raise _IncompleteProcessArgv("unsupported wrapper grammar")
         value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
         index += 1
         while index < len(segment):

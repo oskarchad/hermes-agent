@@ -308,6 +308,32 @@ def test_python_argv_unowned_execution_is_refusal_not_detection(argv, tmp_path, 
                  cwd=str(tmp_path)) is False
 
 
+@pytest.mark.parametrize("argv", [
+    ["su", "report-user", "--command=printf ok"],
+    ["runuser", "report-user", "-c", "printf ok"],
+    ["su", "report-user"],
+    ["runuser", "-u", "report-user", "--", "printf", "ok"],
+    ["nsenter", "--root", "printf", "ok"],
+    ["nsenter", "-S", "printf", "ok"],
+    ["ionice", "-p", "123", "456"],
+])
+@pytest.mark.parametrize("prefix", [[], ["timeout", "10"], ["env", "nice", "-n", "2"]])
+def test_python_argv_unsupported_wrapper_grammar_refuses_before_peeling(
+    argv, prefix, tmp_path, caplog,
+):
+    import shlex
+
+    argv = prefix + argv
+    command = "python3 - <<'PY'\nsubprocess.run(" + repr(argv) + ")\nPY"
+    with caplog.at_level("WARNING", logger=lifecycle_guard.logger.name):
+        assert guard(command, cwd=str(tmp_path)) is True
+    assert "incomplete process argv inspection (unsupported wrapper grammar)" in caplog.text
+    assert "falling back to direct-scan verdict" not in caplog.text
+    # Benign unsupported invocations are not detected lifecycle actions, and
+    # legacy string callers do not acquire the new literal-argv refusal policy.
+    assert guard(shlex.join(argv), cwd=str(tmp_path)) is False
+
+
 # --- scheduler entry point --------------------------------------------------
 
 
