@@ -726,71 +726,75 @@ def _iter_top_level_shell_segments(command: str):
 def _python_c_payload(args: list[str]) -> tuple[bool, str | None]:
     """Return whether Python ``-c`` occurs and the code payload it owns.
 
-    Python option grammar:
-    - Short options with arguments: -W <arg>, -X <arg> (can be separate or attached: -Wonce, -Xdev).
-    - Long options with arguments: --check-hash-based-pycs <arg> (separate or =).
-    - Flag -c: can be separate (-c CODE) or attached (-cCODE).
+    One shared left-to-right option parser matching Python CLI invocation grammar:
+    - Short options with arguments: -W <arg>, -X <arg> (separate or attached: -Wignore, -Xdev).
+    - Long options with arguments: --check-hash-based-pycs <arg> (separate or =val).
+    - Short boolean options: -B, -u, -s, -E, etc.
+    - Flag -c: separate (-c CODE) or attached (-cCODE).
     - Bundled short flags preceding -c: e.g. -Bc CODE, -BcCODE (where B takes no arg).
+    - If an option with arg precedes -c in a bundle (e.g. -BWcfoo), the argument-taking
+      option owns the remainder of the bundle; -c is NOT matched there.
     - Stop parsing on '--' or first non-option token.
-    - If -c occurs, it consumes its attached suffix or the following argument.
     """
-    flags_with_arg = _INTERPRETER_WITH_ARG["python"]
     index = 0
+    short_with_arg = {"-W", "-X"}
+    long_with_arg = {"--check-hash-based-pycs"}
+
     while index < len(args):
         token = args[index]
-        if token == "--" or not token.startswith("-"):
-            break
+        if token == "--":
+            return False, None
+        if not token.startswith("-") or token == "-":
+            return False, None
 
-        # Long options with arguments: e.g. --check-hash-based-pycs[=val]
-        option, equals, _ = token.partition("=")
-        if option in flags_with_arg:
-            if not equals:
-                index += 2
+        # Long options: --opt or --opt=val
+        if token.startswith("--"):
+            opt_name, equals, _ = token.partition("=")
+            if opt_name in long_with_arg:
+                if equals:
+                    index += 1
+                else:
+                    index += 2
+                continue
             else:
                 index += 1
-            continue
+                continue
 
-        # Short options or bundles: token starts with '-'
-        # Check attached short options with args: e.g. -Warg, -Xarg
-        has_attached_short_arg = any(
-            token.startswith(opt) and len(token) > len(opt)
-            for opt in flags_with_arg if opt.startswith("-") and not opt.startswith("--")
-        )
-        if has_attached_short_arg:
-            index += 1
-            continue
-
-        # Check if option is separate short with arg: e.g. -W, -X
-        if token in flags_with_arg:
-            index += 2
-            continue
-
-        # Check for -c or bundled -...c
-        # If token is "-c" exactly:
-        if token == "-c":
-            payload = args[index + 1] if index + 1 < len(args) else None
-            return True, payload
-
-        # If token starts with "-c" and has attached code: "-cCODE"
-        if token.startswith("-c") and len(token) > 2:
-            return True, token[2:]
-
-        # If token is a short bundle: e.g. "-uB" or "-Bc" or "-BcCODE"
-        if not token.startswith("--") and len(token) > 2:
-            chars = token[1:]
-            if "c" in chars:
-                c_idx = chars.index("c")
-                # Any chars before 'c' must be boolean options (none of them take args)
-                prefix = chars[:c_idx]
-                # If 'c' is the last char in the bundle: e.g. "-Bc"
-                if c_idx == len(chars) - 1:
+        # Short options bundle: token starts with '-'
+        chars = token[1:]
+        consumed_token = False
+        for i, ch in enumerate(chars):
+            opt_ch = f"-{ch}"
+            if opt_ch in short_with_arg:
+                rest_of_token = chars[i + 1:]
+                if rest_of_token:
+                    # Attached argument: e.g. -Wignore or -BWcfoo
+                    index += 1
+                    consumed_token = True
+                    break
+                else:
+                    # Separate argument: e.g. -W ignore
+                    index += 2
+                    consumed_token = True
+                    break
+            elif ch == "c":
+                # -c option found!
+                rest_of_token = chars[i + 1:]
+                if rest_of_token:
+                    # Attached code: e.g. -cCODE or -BcCODE
+                    return True, rest_of_token
+                else:
+                    # Separate code: e.g. -c CODE or -Bc CODE
                     payload = args[index + 1] if index + 1 < len(args) else None
                     return True, payload
-                else:
-                    # Attached code after 'c': e.g. "-BcCODE"
-                    return True, chars[c_idx + 1:]
+            elif ch == "m":
+                # -m mod terminates option list
+                return False, None
+            else:
+                continue
 
-        index += 1
+        if not consumed_token:
+            index += 1
 
     return False, None
 
@@ -899,16 +903,18 @@ def _is_safe_python_data_code(code_str: str) -> bool:
             if isinstance(rhs, (ast.Name, ast.Attribute)):
                 # If it refers to an attribute or name without calling it, forbid (prevents function aliasing)
                 return False
-        elif isinstance(stmt, (ast.Expr, ast.If, ast.For, ast.With)):
+        elif isinstance(stmt, ast.Expr):
             pass
         else:
-            # Forbid definitions (FunctionDef, AsyncFunctionDef, ClassDef) and complex statements
+            # Forbid compound statements (If, For, While, With, Try), definitions, etc.
             return False
 
     # Walk all nodes in AST to enforce strict node-level rules
     for node in ast.walk(tree):
-        # Disallow definitions
+        # Disallow definitions and compound statements anywhere in the tree
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return False
+        if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match)):
             return False
 
         # Disallow dunder attributes entirely
@@ -1112,16 +1118,17 @@ def _execution_flag_findings(command: str):
             if not tokens:
                 continue
             args = tokens[1:]
-            if family and _interpreter_exec_flag(family, args):
-                if family == "python":
-                    # Check if -c payload is a safe data-reading/parsing script
-                    c_found, code_payload = _python_c_payload(args)
-                    if c_found and code_payload and _is_safe_python_data_code(code_payload):
+            if family == "python":
+                c_found, code_payload = _python_c_payload(args)
+                if c_found:
+                    if code_payload and _is_safe_python_data_code(code_payload):
                         pass
                     else:
                         yield ("script execution via -e/-c flag", None)
-                else:
-                    yield ("script execution via -e/-c flag", None)
+                elif any(token.startswith("<<") for token in args):
+                    yield ("script execution via heredoc", None)
+            elif family and _interpreter_exec_flag(family, args):
+                yield ("script execution via -e/-c flag", None)
             elif family and any(token.startswith("<<") for token in args):
                 yield ("script execution via heredoc", None)
             else:

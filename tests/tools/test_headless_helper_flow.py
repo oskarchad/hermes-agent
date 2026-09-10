@@ -1,5 +1,5 @@
 """Test demonstrating a headless helper in an isolated environment reading a fixture
-and writing its own authored report using standard supported tools.
+and writing its own authored report using standard supported tools (read_file, write_file).
 Also asserts that unauthorized writes, arbitrary execution, and operator deny rules
 remain enforced.
 """
@@ -11,11 +11,14 @@ from pathlib import Path
 
 import pytest
 from tools.approval import check_all_command_guards, detect_dangerous_command
+from tools.file_tools import read_file_tool, write_file_tool
 
 
 def test_headless_helper_reads_fixture_and_produces_report(tmp_path, monkeypatch):
-    """AC: A headless worker in an isolated HOME reads fixture and produces its own report."""
-    # Setup isolated HOME and task directory
+    """AC: A headless worker in an isolated HOME reads fixture and produces its own report
+
+    using supported structured tools without false approval blocks.
+    """
     fake_home = tmp_path / "fake_home"
     fake_home.mkdir()
     monkeypatch.setenv("HOME", str(fake_home))
@@ -24,56 +27,66 @@ def test_headless_helper_reads_fixture_and_produces_report(tmp_path, monkeypatch
     task_dir = tmp_path / "task_workspace"
     task_dir.mkdir()
 
-    # Fixture file (e.g. rules.json)
+    # 1. Fixture file (e.g. rules.json)
     fixture_path = task_dir / "rules.json"
-    fixture_path.write_text(json.dumps({
+    fixture_data = {
         "schema_version": "v1",
         "rules": [
             {"id": "RULE-1", "severity": "high", "pattern": "exec("},
             {"id": "RULE-2", "severity": "medium", "pattern": "eval("},
         ]
-    }))
+    }
+    fixture_path.write_text(json.dumps(fixture_data, indent=2))
 
-    # Helper script command that reads fixture via python -c safe carveout and parses it
+    # 2. Pipeline read command: gh api pipe to python3 -c safe data read
     read_cmd = f"python3 -c 'import json,pathlib; print(json.loads(pathlib.Path(\"{fixture_path}\").read_text())[\"rules\"][0][\"id\"])'"
-
-    # 1. Verify approval guard does NOT block read_cmd in headless / unattended mode
     guard_result = check_all_command_guards(read_cmd, "local")
-    # check_all_command_guards returns None or {'approved': True, ...} when allowed, and {'approved': False, ...} when blocked
     assert guard_result is None or guard_result.get("approved") is True, f"Expected safe read command to be allowed, got: {guard_result}"
 
-    # 2. Run the read command as a subprocess
-    proc = subprocess.run(
-        ["python3", "-c", f"import json,pathlib; print(json.loads(pathlib.Path('{fixture_path}').read_text())['rules'][0]['id'])"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    first_rule_id = proc.stdout.strip()
-    assert first_rule_id == "RULE-1"
+    # 3. Helper reads the fixture using supported read_file_tool
+    read_result = read_file_tool(path=str(fixture_path), task_id="test_helper_task")
+    read_dict = json.loads(read_result)
+    assert "content" in read_dict
+    assert "RULE-1" in read_dict["content"]
 
-    # 3. Helper produces its own authored report
-    report_file = task_dir / "report.json"
-    report_content = {
+    # 4. Helper writes its own authored report using supported write_file_tool
+    report_path = task_dir / "report.json"
+    report_payload = json.dumps({
         "author": "headless-helper",
         "status": "complete",
-        "analyzed_rule": first_rule_id,
-        "summary": "Processed 1 rule successfully without approval blocks."
-    }
-    report_file.write_text(json.dumps(report_content, indent=2))
+        "analyzed_rule": "RULE-1",
+        "summary": "Processed fixture successfully via supported structured tools.",
+    }, indent=2)
 
-    # Assert report was written and contains correct content
-    assert report_file.exists()
-    loaded_report = json.loads(report_file.read_text())
+    write_result = write_file_tool(path=str(report_path), content=report_payload, task_id="test_helper_task")
+    write_dict = json.loads(write_result)
+    assert write_dict.get("verified") is True
+    assert str(report_path) in write_dict.get("files_modified", [])
+
+    # 5. Verify the report file exists and contains the exact content written by helper
+    assert report_path.exists()
+    loaded_report = json.loads(report_path.read_text())
     assert loaded_report["author"] == "headless-helper"
     assert loaded_report["analyzed_rule"] == "RULE-1"
 
 
-def test_dangerous_execution_and_unauthorized_writes_remain_blocked():
-    """Negative tests: arbitrary execution and dangerous code must still be flagged."""
+def test_dangerous_execution_and_unauthorized_writes_remain_blocked(tmp_path):
+    """Negative tests: arbitrary execution, unsafe compound statements, open() and operator deny remain enforced."""
     # Direct code execution via eval/exec
     eval_cmd = "python3 -c 'import sys; f=eval; f(sys.stdin.read())'"
     dangerous, _, desc = detect_dangerous_command(eval_cmd)
+    assert dangerous is True
+    assert desc == "script execution via -e/-c flag"
+
+    # Compound statement rebinding (F1 Gauge counterexample)
+    nested_rebind = "python3 -c 'import sys\nif True:\n    from builtins import eval as print\nprint(sys.stdin.read())'"
+    dangerous, _, desc = detect_dangerous_command(nested_rebind)
+    assert dangerous is True
+    assert desc == "script execution via -e/-c flag"
+
+    # Bundled option arg ownership (F2 Gauge counterexample)
+    bundle_cmd = "python3 -BWc'import sys; print(sys.stdin.read())' -c 'import sys; exec(sys.stdin.read())'"
+    dangerous, _, desc = detect_dangerous_command(bundle_cmd)
     assert dangerous is True
     assert desc == "script execution via -e/-c flag"
 
