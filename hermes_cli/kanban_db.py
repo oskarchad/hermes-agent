@@ -1610,6 +1610,8 @@ def create_task(
                 )
                 for pid in parents:
                     _link(conn, pid, task_id)
+                from hermes_cli.kanban_governance import bind_created_tx
+                bind_created_tx(conn, task_id, parents)
                 _append_event(
                     conn,
                     task_id,
@@ -2484,6 +2486,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                from hermes_cli.kanban_governance import evaluate_tx
+                if not evaluate_tx(conn, task_id, "promote").allowed:
+                    continue
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2588,6 +2593,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "claim").allowed:
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -3060,7 +3068,10 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    from hermes_cli import kanban_governance as governance
     with write_txn(conn):
+        if not governance.evaluate_tx(conn, task_id, "complete", expected_run_id=expected_run_id).allowed:
+            return False
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
@@ -3108,6 +3119,8 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+        governance.record_transition_tx(conn, task_id, "complete", run_id)
+    governance.drain(conn)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
