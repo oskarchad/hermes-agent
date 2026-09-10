@@ -108,6 +108,20 @@ def read_object(conn, task_id, sha):
     return value
 
 
+def mark_transport_unresolved(conn, invocation_id):
+    from hermes_cli.kanban_db import _append_event
+    from hermes_cli.kanban_db_connect import write_txn
+
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM kanban_invocations WHERE invocation_id=?", (invocation_id,)).fetchone()
+        if row is None or row["state"] != "started":
+            raise ValueError("invocation is not started")
+        conn.execute("UPDATE kanban_invocations SET state='finished',verdict='UNRESOLVED' WHERE invocation_id=?",
+                     (invocation_id,))
+        _append_event(conn, row["task_id"], "governance_transport_unresolved",
+                      {"invocation_id": invocation_id}, run_id=row["run_id"])
+
+
 def charge_tx(conn, lineage_id, category):
     if category not in {"repair", "reaudit"}:
         raise ValueError("unknown budget category")
