@@ -2634,6 +2634,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "claim_review").allowed:
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4168,6 +4171,9 @@ def _insert_decomposed_child(
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Archive an inactive task; running tasks require verified reclaim first."""
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "archive").allowed:
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "

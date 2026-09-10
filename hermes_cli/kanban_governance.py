@@ -42,6 +42,7 @@ class WorkOrder:
     assignee: str
     parents: tuple[str, ...]
     budget_charge: str | None = None
+    needs_input: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,10 @@ def bind_created_tx(conn, task_id, parents):
         order = capability[1]
         binding = asdict(order.binding)
         source = action_key(order)
+        if order.needs_input:
+            from hermes_cli import kanban_db as kb
+            conn.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?", (task_id,))
+            kb._append_event(conn, task_id, "blocked", {"kind": "needs_input", "reason": order.needs_input})
     else:
         inherited = [store.binding(conn, parent) for parent in parents]
         inherited = [b for b in inherited if b]
@@ -243,6 +248,7 @@ def drain(conn, *, limit=64):
             try:
                 task_id = kb.create_task(conn, title=order.title, assignee=order.assignee,
                                          parents=order.parents, created_by="governance",
+                                         initial_status="blocked" if order.needs_input else "running",
                                          workspace_kind="dir", workspace_path=store.scope(conn, wf["workflow_id"])["workspace"])
             finally:
                 _issuance.reset(token)
@@ -252,10 +258,59 @@ def drain(conn, *, limit=64):
     return tuple(issued)
 
 
+def _observe_liveness_tx(conn, workflow_id, now):
+    from hermes_cli import kanban_db as kb
+
+    policy = store.scope(conn, workflow_id).get("liveness")
+    if not policy:
+        return
+    interval = policy["report_interval"]
+    if not isinstance(interval, int) or interval <= 0:
+        recovery_tx(conn, workflow_id, "invalid reporting interval")
+        return
+    rows = conn.execute("SELECT t.* FROM tasks t JOIN kanban_task_bindings b ON b.task_id=t.id "
+                        "WHERE b.workflow_id=?", (workflow_id,)).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        if store.binding(conn, task_id)["role"] == "recovery":
+            continue
+        latest = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='governance_status' "
+                              "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        previous = json.loads(latest[0]) if latest else None
+        if row["status"] in {"done", "archived"}:
+            state, parents = "resolved", []
+            if previous is None or previous["state"] == state:
+                continue
+        else:
+            if now < row["created_at"] + interval:
+                continue
+            parents = [p[0] for p in conn.execute("SELECT p.id FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                                                  "WHERE l.child_id=? AND p.status!='done'", (task_id,))]
+            state = "parents" if parents else "queue"
+            if row["status"] == "running":
+                heartbeat = row["last_heartbeat_at"] or row["started_at"] or row["created_at"]
+                state = "heartbeat_gap" if now - heartbeat > policy["heartbeat_gap"] else "active"
+            if row["status"] == "blocked":
+                state = "blocked"
+        checkpoint = row["created_at"] + ((now - row["created_at"]) // interval + 1) * interval
+        if previous and previous["state"] == state and previous["next_checkpoint"] == checkpoint:
+            continue
+        actions = {"parents": "inspect prerequisite tasks", "queue": "check routing and capacity",
+                   "active": "await next heartbeat; do not terminate", "heartbeat_gap": "diagnose worker identity",
+                   "blocked": "resolve operator-owned block", "resolved": "continue current governed chain"}
+        kb._append_event(conn, task_id, "governance_status",
+                         {"workflow_id": workflow_id, "state": state, "parents": parents,
+                          "impact": "workflow progress observation", "action": actions[state],
+                          "next_checkpoint": checkpoint}, run_id=row["current_run_id"])
+        if state != "resolved":
+            recovery_tx(conn, workflow_id, "report deadline:" + task_id + ":" + state)
+
+
 def reconcile(conn, *, now, limit=64):
     with write_txn(conn):
         for row in conn.execute("SELECT workflow_id FROM kanban_workflows LIMIT ?", (limit,)).fetchall():
             _reconcile_tx(conn, row[0])
+            _observe_liveness_tx(conn, row[0], now)
     drain(conn, limit=limit)
 
 
