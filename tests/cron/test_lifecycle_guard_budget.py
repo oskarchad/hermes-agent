@@ -219,6 +219,49 @@ def test_python_data_operands_do_not_spend_script_read_budget(monkeypatch, tmp_p
     assert data in reads
 
 
+def test_python_argv_data_and_script_positions_share_bounded_walk(monkeypatch, tmp_path):
+    data = tmp_path / "large.data"
+    with data.open("wb") as stream:
+        stream.truncate(lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1)
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text("hermes gateway stop\n", encoding="utf-8")
+
+    def classify(argv):
+        return guard(
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run(" + repr(argv) + ")\nPY",
+            cwd=str(tmp_path),
+        )
+
+    reads = []
+    original = lifecycle_guard._read_referenced_script
+
+    def spy(path, *, max_bytes=None):
+        reads.append(path)
+        return original(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(lifecycle_guard, "_read_referenced_script", spy)
+    assert classify(["printf", "%s", f"({data}) hermes gateway stop"]) is False
+    assert data not in reads
+    for argv in ([str(wrapper)], ["sh", str(wrapper)], ["sudo", "sh", str(wrapper)], ["sh", str(data)]):
+        assert classify(argv) is True
+    assert wrapper in reads and data in reads
+    # No subprocess-wide exemption: executable paths retain the shared limits.
+    benign = tmp_path / "benign.sh"
+    benign.write_text("echo ok\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_PATHS", 0)
+        assert classify(["sh", str(benign)]) is True
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_REFERENCED_SCRIPT_DEPTH", 1)
+        assert classify(["sh", str(benign)]) is True
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_REMOTE_READS", 0)
+        assert guard(
+            "python3 - <<'PY'\nsubprocess.run(['sh', '/remote/absent.sh'])\nPY",
+            read_remote_script=lambda path: pytest.fail("exhausted remote reader called"),
+        ) is True
+
+
 # --- scheduler entry point --------------------------------------------------
 
 

@@ -592,6 +592,31 @@ class TestTerminalToolGatewayLifecycleGuard:
             assert result is not None
             assert "Blocked" in json.loads(result)["error"]
 
+    @pytest.mark.parametrize("argv, blocked", [
+        (["printf", "%s", "hermes gateway stop"], False),
+        (["gh", "pr", "create", "--body", "Do not run hermes gateway stop"], False),
+        (["printf", "%s", "$(hermes gateway stop); launchctl submit"], False),
+        (["env", "printf", "%s", "hermes gateway stop"], False),
+        (["hermes", "gateway", "stop"], True),
+        (["systemctl", "--user", "stop", "hermes-gateway.service"], True),
+        (["launchctl", "submit", "-l", "neutral", "--", "helper"], True),
+        (["sudo", "hermes", "gateway", "stop"], True),
+        (["sh", "-c", "hermes gateway stop"], True),
+        (["env", "-S", "sh -c 'hermes gateway stop'"], True),
+    ])
+    def test_python_argv_execution_roles_reach_real_caller(self, monkeypatch, tmp_path, argv, blocked):
+        from tools.terminal_tool_guards import gateway_lifecycle_block
+
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        # Literal list/tuple and keyword args have the same execution/data contract.
+        for operand in (repr(argv), repr(tuple(argv))):
+            command = "python3 - <<'PY'\nimport subprocess\nsubprocess.run(args=" + operand + ")\nPY"
+            result = gateway_lifecycle_block(
+                command=command, env=self._make_fake_env(), env_type="local", cwd=str(tmp_path),
+                workdir=str(tmp_path), session_key="argv-role-regression",
+            )
+            assert (result is not None) is blocked
+
     def test_force_true_cannot_bypass_block(self, monkeypatch):
         import tools.terminal_tool as tt
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)

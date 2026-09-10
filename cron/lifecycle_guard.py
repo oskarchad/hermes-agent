@@ -448,9 +448,11 @@ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterat
         yield segment
 
 
-def _iter_command_segments(command: str) -> Iterator[list[str]]:
-    """Yield shell-tokenized command segments per logical line; a line shlex rejects (unbalanced
-    quotes) falls back to per-physical-line tokenization."""
+def _iter_command_segments(command: str | list[str]) -> Iterator[list[str]]:
+    """Yield shell segments or one already-decoded exec argv without reinterpreting data."""
+    if isinstance(command, list):
+        yield command
+        return
     for line in _split_logical_lines(command.replace("\\\n", "")):
         try:
             tokens = _shlex_tokens(line)
@@ -587,6 +589,28 @@ def _direct_lifecycle_scan(command: str) -> bool:
         _lifecycle_command_scan_with_data_exemption(command)
         or contains_launchctl_submit_command(command)
     )
+
+
+def _direct_argv_lifecycle_scan(argv: list[str]) -> bool:
+    """Apply lifecycle patterns only at the executable position, never inside argv data.
+
+    Shell-program operands and script paths are inspected separately by the
+    existing recursive walk, including for programs not named by these patterns.
+    """
+    index = _executed_command_index(argv)
+    if index is None:
+        return False
+    executable = _executable_name(argv[index])
+    if executable not in {"hermes", "launchctl", "systemctl", "kill", "pkill"}:
+        return False
+    arguments = argv[index + 1:]
+    if executable == "launchctl" and arguments and arguments[0].lower() in {"submit", "bootstrap"}:
+        return True
+    command = " ".join([executable, *arguments])
+    if _GATEWAY_LIFECYCLE_PATTERN.match(command):
+        return True
+    profile = _PROFILE_FLAG_LIFECYCLE_PATTERN.match(command)
+    return bool(profile and _named_profile_is_current(profile.group(1) or profile.group(2)))
 
 
 # --- path handling ----------------------------------------------------------------------------
@@ -732,7 +756,7 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
         yield from _resolved_or_nothing(executable, cwd)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
+def _iter_referenced_shell_scripts(command: str | list[str], *, cwd: Optional[str] = None) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
     original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
     a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
@@ -746,7 +770,7 @@ def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -
             yield from _references_at(segment, peeled, cwd)
 
 
-def _iter_shell_command_payloads(command: str) -> Iterator[str]:
+def _iter_shell_command_payloads(command: str | list[str]) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` (and ``su -c`` / ``env -S``) for recursive
     scanning."""
     for segment in _iter_command_segments(command):
@@ -882,7 +906,7 @@ def _read_script_for_scanning(script_path: str) -> str:
 
 # --- recursive walk ---------------------------------------------------------------------------
 
-def _python_process_payloads(source: str) -> Optional[tuple[list[str], str]]:
+def _python_process_payloads(source: str) -> Optional[tuple[list[str | list[str]], str]]:
     """Inspect literal process operands, never execute Python or infer aliases/dataflow.
 
     Called only for complete, quoted Python stdin bodies after the root text budget
@@ -934,7 +958,13 @@ def _python_process_payloads(source: str) -> Optional[tuple[list[str], str]]:
                 if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
                     return None
                 argv.append(item.value)
-            payloads.append(shlex.join(argv))
+            if argument.end_lineno is None or argument.end_col_offset is None:
+                return None
+            payloads.append(argv)
+            # The structured walk owns this literal operand now. Do not parse it
+            # again as shell source (parentheses/substitutions in argv are data).
+            data_spans.append((offsets[argument.lineno - 1] + argument.col_offset,
+                               offsets[argument.end_lineno - 1] + argument.end_col_offset))
         else:
             return None
     raw = source.encode("utf-8")
@@ -948,18 +978,21 @@ def _python_process_payloads(source: str) -> Optional[tuple[list[str], str]]:
 
 
 def _contains_unsafe_gateway_action(
-    command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
+    command: str | list[str], *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
 ) -> bool:
-    # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
-    if not budget.charge_text(command):
+    # Serialization is only for budget accounting, never for argv interpretation.
+    text = shlex.join(command) if isinstance(command, list) else command
+    if not budget.charge_text(text):
         return _budget_exhausted("text", depth)
-    if _direct_lifecycle_scan(command):
+    unsafe = (_direct_argv_lifecycle_scan(command) if isinstance(command, list)
+              else _direct_lifecycle_scan(command))
+    if unsafe:
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    def recurse(text: str, cwd: Optional[str]) -> bool:
+    def recurse(text: str | list[str], cwd: Optional[str]) -> bool:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script,
@@ -967,20 +1000,21 @@ def _contains_unsafe_gateway_action(
 
     from tools.shell_heredoc import split_python_heredoc_bodies
 
-    shell_source, python_bodies = split_python_heredoc_bodies(command)
-    reference_sources = [shell_source]
-    for source in python_bodies:
-        inspected = _python_process_payloads(source)
-        if inspected is None:
-            return True
-        payloads, reference_source = inspected
-        reference_sources.append(reference_source)
-        for payload in payloads:
-            if recurse(payload, cwd):
+    if isinstance(command, str):
+        shell_source, python_bodies = split_python_heredoc_bodies(command)
+        reference_sources = [shell_source]
+        for source in python_bodies:
+            inspected = _python_process_payloads(source)
+            if inspected is None:
                 return True
-    # Unknown Python constructs retain their old shell walk; only proven data
-    # operands are removed, and literal process operands get the recursive scan.
-    command = "\n".join(reference_sources)
+            payloads, reference_source = inspected
+            reference_sources.append(reference_source)
+            for payload in payloads:
+                if recurse(payload, cwd):
+                    return True
+        # Unknown Python constructs retain their old shell walk; only proven data
+        # and structured operands already owned by recursion are removed.
+        command = "\n".join(reference_sources)
     for payload in _iter_shell_command_payloads(command):
         if recurse(payload, cwd):
             return True
