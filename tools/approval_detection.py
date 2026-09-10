@@ -911,10 +911,13 @@ def _is_safe_python_data_code(code_str: str) -> bool:
 
     # Walk all nodes in AST to enforce strict node-level rules
     for node in ast.walk(tree):
-        # Disallow definitions and compound statements anywhere in the tree
+        # Disallow definitions, compound statements, assignment expressions (walrus), and comprehensions/generators
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             return False
         if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match)):
+            return False
+        # Disallow expression-level bindings: NamedExpr (walrus :=), comprehensions, generators
+        if isinstance(node, (ast.NamedExpr, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
             return False
 
         # Disallow dunder attributes entirely

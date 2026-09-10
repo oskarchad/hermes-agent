@@ -303,6 +303,8 @@ def test_safe_python_data_reading_carveout_does_not_require_approval(command):
         "python3 -c 'import json,pathlib; json.loads(\"{}\"); pathlib.Path(\"/tmp/report-target\").open(\"w\").close()'",
         "python3 -c 'import json,pathlib; p=pathlib.Path(\"/tmp/report-target\"); p.open(\"w\").write(\"test\")'",
         "python3 -c 'import sys\nif True:\n    from builtins import eval as print\nprint(sys.stdin.read())'",
+        "python3 -c 'import sys; (print := eval); print(sys.stdin.read())'",
+        "python3 -c 'import sys; [print(sys.stdin.read()) for print in [eval]]'",
         # F2 counterexamples from Gauge: attached code with safe trailing decoy, option argument ownership
         "python3 -c'import os; os.system(\"id\")' 'import json; json.loads(\"{}\")'",
         "python3 -W'import json; json.loads(\"{}\")' -c 'import os; os.system(\"id\")'",
