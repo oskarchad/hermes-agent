@@ -184,6 +184,41 @@ def test_line_budget_fails_closed_before_tokenizing_every_line(
     assert 0 < lexers < 10
 
 
+def test_python_data_operands_do_not_spend_script_read_budget(monkeypatch, tmp_path):
+    """A Python call argument is not a shell command after an opening parenthesis."""
+    data = tmp_path / "large.data"
+    with data.open("wb") as stream:
+        stream.truncate(lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1)
+    reads = []
+    original = lifecycle_guard._read_referenced_script
+
+    def spy(path, *, max_bytes=None):
+        reads.append(path)
+        return original(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(lifecycle_guard, "_read_referenced_script", spy)
+    command = (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        f"conn=connect(db_path=Path({str(data)!r}))\n"
+        f"prefix=Path({str(data)!r}).read_text()\n"
+        "PY"
+    )
+    # Classification only: never execute this input or open a real database.
+    assert guard(command, cwd=str(tmp_path)) is False
+    assert data not in reads
+    # UTF-8 AST columns are byte offsets; retain the command after the terminator.
+    unicode_command = command.replace("conn=", "é = 1; conn=") + "\n"
+    assert guard(unicode_command, cwd=str(tmp_path)) is False
+    assert data not in reads
+    # Unknown call operands and incomplete Python retain fail-closed behavior.
+    assert guard(command.replace("Path(", "unknown("), cwd=str(tmp_path)) is True
+    assert guard(command.replace("conn=", "conn=("), cwd=str(tmp_path)) is True
+    # The same bytes in an executable position must still fail closed.
+    assert guard(f"sh {data}", cwd=str(tmp_path)) is True
+    assert data in reads
+
+
 # --- scheduler entry point --------------------------------------------------
 
 

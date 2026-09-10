@@ -543,6 +543,55 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
+    @pytest.mark.parametrize("invocation", [
+        "data", "direct", "shell-c", "wrapper", "python-string", "python-argv",
+        "python-unknown-argv",
+    ])
+    def test_python_data_and_executable_operands_reach_real_caller(
+        self, monkeypatch, tmp_path, invocation
+    ):
+        import cron.lifecycle_guard as lifecycle_guard
+        from tools.terminal_tool_guards import gateway_lifecycle_block
+
+        data = tmp_path / "large.data"
+        with data.open("wb") as stream:
+            stream.truncate(lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1)
+        wrapper = tmp_path / "wrapper.sh"
+        wrapper.write_text("hermes gateway stop\n", encoding="utf-8")
+        command = {
+            "data": (
+                "python3 - <<'PY'\nfrom pathlib import Path\n"
+                f"conn=connect(db_path=Path({str(data)!r}))\nPY"
+            ),
+            "direct": "hermes gateway stop",
+            "shell-c": f"sh -c 'sh {wrapper}'",
+            "wrapper": f"sh {wrapper}",
+            "python-string": (
+                "python3 - <<'PY'\nimport os\n"
+                f"os.system('sh {wrapper}')\nPY"
+            ),
+            "python-unknown-argv": (
+                "python3 - <<'PY'\nimport subprocess\n"
+                "subprocess.run(command)\nPY"
+            ),
+            "python-argv": (
+                "python3 - <<'PY'\nimport subprocess\n"
+                "subprocess.run(['hermes', 'gateway', 'stop'])\nPY"
+            ),
+        }[invocation]
+        env = self._make_fake_env()
+        self._patch_env(monkeypatch, env, inside_gateway=True)
+        # Invoke the production caller, but never the terminal execution path.
+        result = gateway_lifecycle_block(
+            command=command, env=env, env_type="local", cwd=str(tmp_path),
+            workdir=str(tmp_path), session_key="operand-regression",
+        )
+        if invocation == "data":
+            assert result is None
+        else:
+            assert result is not None
+            assert "Blocked" in json.loads(result)["error"]
+
     def test_force_true_cannot_bypass_block(self, monkeypatch):
         import tools.terminal_tool as tt
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)

@@ -9,6 +9,7 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -881,6 +882,71 @@ def _read_script_for_scanning(script_path: str) -> str:
 
 # --- recursive walk ---------------------------------------------------------------------------
 
+def _python_process_payloads(source: str) -> Optional[tuple[list[str], str]]:
+    """Inspect literal process operands, never execute Python or infer aliases/dataflow.
+
+    Called only for complete, quoted Python stdin bodies after the root text budget
+    is charged. Unknown operands of recognized process calls fail closed; syntax
+    failure must not turn partial language parsing into a new allow.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    payloads = []
+    data_spans = []
+    lines = source.encode("utf-8").splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Path constructs a data value, not a shell command. Keep all unknown
+        # calls on the legacy reference path rather than granting a Python-wide
+        # exemption. Only literal operands are removed, never nested calls.
+        if isinstance(node.func, ast.Name) and node.func.id == "Path":
+            for argument in node.args:
+                if (isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+                        and argument.end_lineno is not None and argument.end_col_offset is not None):
+                    data_spans.append((offsets[argument.lineno - 1] + argument.col_offset,
+                                       offsets[argument.end_lineno - 1] + argument.end_col_offset))
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        owner = node.func.value
+        if not isinstance(owner, ast.Name):
+            continue
+        is_system = owner.id == "os" and node.func.attr == "system"
+        is_subprocess = owner.id == "subprocess" and node.func.attr in {
+            "run", "Popen", "call", "check_call", "check_output",
+        }
+        if not (is_system or is_subprocess):
+            continue
+        argument = node.args[0] if node.args else next(
+            (kw.value for kw in node.keywords if kw.arg == ("command" if is_system else "args")),
+            None,
+        )
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            payloads.append(argument.value)
+        elif is_subprocess and isinstance(argument, (ast.List, ast.Tuple)) and argument.elts:
+            argv = []
+            for item in argument.elts:
+                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                    return None
+                argv.append(item.value)
+            payloads.append(shlex.join(argv))
+        else:
+            return None
+    raw = source.encode("utf-8")
+    parts = []
+    previous = 0
+    for start, end in sorted(data_spans):
+        parts.extend((raw[previous:start], b"''", b"\n" * raw.count(b"\n", start, end)))
+        previous = end
+    parts.append(raw[previous:])
+    return payloads, b"".join(parts).decode("utf-8")
+
+
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
@@ -899,6 +965,22 @@ def _contains_unsafe_gateway_action(
             read_remote_script=read_remote_script,
         )
 
+    from tools.shell_heredoc import split_python_heredoc_bodies
+
+    shell_source, python_bodies = split_python_heredoc_bodies(command)
+    reference_sources = [shell_source]
+    for source in python_bodies:
+        inspected = _python_process_payloads(source)
+        if inspected is None:
+            return True
+        payloads, reference_source = inspected
+        reference_sources.append(reference_source)
+        for payload in payloads:
+            if recurse(payload, cwd):
+                return True
+    # Unknown Python constructs retain their old shell walk; only proven data
+    # operands are removed, and literal process operands get the recursive scan.
+    command = "\n".join(reference_sources)
     for payload in _iter_shell_command_payloads(command):
         if recurse(payload, cwd):
             return True
