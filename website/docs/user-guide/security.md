@@ -141,6 +141,50 @@ Like the rest of the approval config, changes take effect immediately (the confi
 Deny rules are a guardrail against an honest-but-wrong agent, the same threat model as the dangerous-pattern detector. They are not a sandbox against a deliberately adversarial process — for that, use an isolated backend (Docker, Modal) or an egress-restricted environment.
 :::
 
+### Command-Aware Deny (`approvals.deny_commands`)
+
+To block a command without blocking PR descriptions that mention it, opt in to
+`approvals.deny_commands` (default `[]`). Supported selectors are exactly
+`gh pr merge` and `git push main`:
+
+```yaml
+approvals:
+  deny_commands:
+    - 'gh pr merge'
+    - 'git push main'
+```
+
+These selectors recognize executable command positions, including binary paths,
+repository flags, compound commands, shell `-c` strings, `eval`, and active
+command substitutions (including inside double quotes). Single-quoted data and
+ordinary PR body text such as `Do not execute gh pr merge 6; release needs
+approval.` do not match. The same backend scope and unconditional precedence
+as `approvals.deny` apply: yolo, mode off, and permanent approvals cannot
+override it. Invalid types or unsupported selectors return an explicit blocked
+configuration error; malformed or over-limit command inspection fails closed.
+
+`git push main` matches an explicit destination `main` or `refs/heads/main`,
+including `HEAD:main`, `+feature:refs/heads/main`, `:main`, and `--delete origin main`.
+It does not match a source such as `main:feature`, a remote named `main`,
+`tag main`, option values, or a later PR command's `--base main`. Refs are
+case-sensitive; Git configuration/defaults, wildcard refspecs, and implicit
+pushes (`--all`, `--mirror`, or no explicit refspec) are not resolved by this
+selector. Keep separately required policy for those operations.
+
+Literal shell stdin is inspected as a program only when the shell consumes it
+as source. Unresolved source such as stdin FD duplication fails closed; unused
+FDs and a shell `-c` command's PR input remain data. Escaped ANSI-C PR body
+arguments remain data too; unsupported quoting in execution-relevant words
+and Git options with unknown operand ownership fail closed.
+
+Legacy `approvals.deny` glob semantics are unchanged. To migrate broad merge or
+git-main globs, replace only those rules with their selectors and retain unrelated deny entries;
+keeping the broad glob still blocks prose. The mtime-keyed config loader picks
+up the setting without a session restart on a runtime supporting this key.
+Before rolling back to a runtime without a selector, restore its old globs
+first, then remove the unsupported selector. This is a guardrail, not a shell interpreter: arbitrary variables,
+aliases, scripts on disk, and programs using other GitHub APIs are not resolved.
+
 ### Approval Timeout
 
 When a dangerous command prompt appears, the user has a configurable amount of time to respond. If no response is given within the timeout, the command is **denied** by default (fail-closed).
@@ -654,7 +698,7 @@ security:
 
 When a blocked URL is requested, the tool returns an error explaining the domain is blocked by policy. The blocklist is enforced across `web_search`, `web_extract`, `browser_navigate`, and all URL-capable tools.
 
-See [Website Blocklist](/user-guide/configuration#website-blocklist) in the configuration guide for full details.
+See [Website Blocklist](configuration.md#website-blocklist) in the configuration guide for full details.
 
 ### SSRF Protection
 

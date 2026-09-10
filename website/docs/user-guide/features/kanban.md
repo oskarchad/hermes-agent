@@ -6,7 +6,7 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 # Kanban — Multi-Agent Profile Collaboration
 
-> **Want a walkthrough?** Read the [Kanban tutorial](./kanban-tutorial) — four user stories (solo dev, fleet farming, role pipeline with retry, circuit breaker) with dashboard screenshots of each. This page is the reference; the tutorial is the narrative.
+> **Want a walkthrough?** Read the [Kanban tutorial](./kanban-tutorial.md) — four user stories (solo dev, fleet farming, role pipeline with retry, circuit breaker) with dashboard screenshots of each. This page is the reference; the tutorial is the narrative.
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
@@ -501,7 +501,7 @@ For the occasional quality-sensitive card, pin just that task back to a stronger
 
 ### Lifecycle plugin hooks
 
-Board transitions fire [plugin hooks](/user-guide/features/hooks#plugin-hooks): `kanban_task_claimed`, `kanban_task_completed`, and `kanban_task_blocked`, each carrying `task_id` and `profile_name`. Hooks fire **after** the board DB change commits, so callbacks always see durable state. Note the process split: `kanban_task_claimed` fires in the **dispatcher** process, while `kanban_task_completed`/`kanban_task_blocked` fire in the **worker** process — register the hook in the dispatcher profile to observe every transition centrally.
+Board transitions fire [plugin hooks](./hooks.md#plugin-hooks): `kanban_task_claimed`, `kanban_task_completed`, and `kanban_task_blocked`, each carrying `task_id` and `profile_name`. Hooks fire **after** the board DB change commits, so callbacks always see durable state. Note the process split: `kanban_task_claimed` fires in the **dispatcher** process, while `kanban_task_completed`/`kanban_task_blocked` fire in the **worker** process — register the hook in the dispatcher profile to observe every transition centrally.
 
 ```python
 def register(ctx):
@@ -525,7 +525,7 @@ hermes kanban create "Translate the docs site to French" \
 Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip it for cheap one-shot work — the per-turn judge overhead isn't worth it, and the dispatcher's existing retry/circuit-breaker already handles transient worker failures. The judge is only as good as your goal text, so write the body as **explicit acceptance criteria**.
 
 :::note Goal-mode cards borrow the `/goal` engine — they don't connect to it
-`--goal` runs the continuation loop *inside that one card's worker session*. It shares the engine with the [`/goal` slash command](./goals), not the state: setting a `/goal` in a chat session never creates, claims, or moves a kanban card, and a goal-mode card's loop is invisible to any chat session's `/goal status`. If you want this conversation to keep iterating, use [`/goal`](./goals); if you want work on the board, create a card.
+`--goal` runs the continuation loop *inside that one card's worker session*. It shares the engine with the [`/goal` slash command](./goals.md), not the state: setting a `/goal` in a chat session never creates, claims, or moves a kanban card, and a goal-mode card's loop is invisible to any chat session's `/goal status`. If you want this conversation to keep iterating, use [`/goal`](./goals.md); if you want work on the board, create a card.
 :::
 
 ### How the orchestrator behaves
@@ -559,7 +559,7 @@ For best results, pair it with a profile whose toolsets are restricted to board 
 
 ## Dashboard (GUI)
 
-The `/kanban` CLI and slash command are enough to run the board headlessly, but a visual board is often the right interface for humans-in-the-loop: triage, cross-profile supervision, reading comment threads, and dragging cards between columns. Hermes ships this as a **bundled dashboard plugin** at `plugins/kanban/` — not a core feature, not a separate service — following the model laid out in [Extending the Dashboard](./extending-the-dashboard).
+The `/kanban` CLI and slash command are enough to run the board headlessly, but a visual board is often the right interface for humans-in-the-loop: triage, cross-profile supervision, reading comment threads, and dragging cards between columns. Hermes ships this as a **bundled dashboard plugin** at `plugins/kanban/` — not a core feature, not a separate service — following the model laid out in [Extending the Dashboard](./extending-the-dashboard.md).
 
 Open it with:
 
@@ -588,6 +588,36 @@ hermes dashboard        # "Kanban" tab appears in the nav, after "Skills"
 - **Toolbar filters** — free-text search, tenant dropdown (defaults to `dashboard.kanban.default_tenant` from `config.yaml`), assignee dropdown, "show archived" toggle, "lanes by profile" toggle, and a **Nudge dispatcher** button so you don't have to wait for the next 60 s tick.
 
 Visually the target is the familiar Linear / Fusion layout: dark theme, column headers with counts, coloured status dots, pill chips for priority and tenant. The plugin reads only theme CSS vars (`--color-*`, `--radius`, `--font-mono`, ...), so it reskins automatically with whichever dashboard theme is active.
+
+### Explicit continuation after a PR checkpoint
+
+For an unclaimed `ready` task (or an intentional `done` reopen), an authenticated
+operator/Captain can call the plugin backend:
+
+```http
+POST /api/plugins/kanban/tasks/{task_id}/resume?board=default
+Content-Type: application/json
+
+{"actor":"otto","reason":"Continue the approved brief on the existing branch and PR"}
+```
+
+Use the dashboard's normal authenticated session. `actor` is a required audit
+label, not a credential or a role override; `reason` must also be non-blank.
+The operation records `promoted_manual` with `source=dashboard_resume`, keeps
+PR comments and run history, and authorizes at most one subsequent claim under
+the existing dispatcher guard. It does not start a worker itself or change the
+assignee. Ordinary edits, comments, and automatic promotion do not grant this
+continuation. Existing review/unblock/specify operations remain unchanged.
+
+The status change and continuation event commit together. Unsatisfied parents,
+an existing claim/run/PID, prior-worker teardown, auth failures and rate-limit
+cooldown still prevent resume. Reopening `done` invalidates dependent tasks
+through the existing lifecycle, with worker termination only after commit.
+A `409` response commits no continuation; when a PR comment and the request
+share a timestamp second, wait until a later second before an explicit retry
+(the guard cannot establish ordering across those tables). Other `409` reasons
+require resolving the reported gate, not automatic retries. Unknown tasks or
+boards return `404`; invalid request fields return `400`/`422`.
 
 ### Auto vs Manual orchestration
 
@@ -693,7 +723,7 @@ Each key is optional and falls back to the shown default.
 
 ### Security model
 
-The dashboard's HTTP auth middleware [explicitly skips `/api/plugins/`](./extending-the-dashboard#backend-api-routes) — plugin routes are unauthenticated by design because the dashboard binds to localhost by default. That means the kanban REST surface is reachable from any process on the host.
+The dashboard's HTTP auth middleware [explicitly skips `/api/plugins/`](./extending-the-dashboard.md#backend-api-routes) — plugin routes are unauthenticated by design because the dashboard binds to localhost by default. That means the kanban REST surface is reachable from any process on the host.
 
 The WebSocket takes one additional step: it requires the dashboard's ephemeral session token as a `?token=…` query parameter (browsers can't set `Authorization` on an upgrade request), matching the pattern used by the in-browser PTY bridge.
 
@@ -707,7 +737,7 @@ Tasks in `~/.hermes/kanban.db` are profile-agnostic on purpose (that's the coord
 
 ### Extending it
 
-The plugin uses the standard Hermes dashboard plugin contract — see [Extending the Dashboard](./extending-the-dashboard) for the full manifest reference, shell slots, page-scoped slots, and the Plugin SDK. Extra columns, custom card chrome, tenant-filtered layouts, or full `tab.override` replacements are all expressible without forking this plugin.
+The plugin uses the standard Hermes dashboard plugin contract — see [Extending the Dashboard](./extending-the-dashboard.md) for the full manifest reference, shell slots, page-scoped slots, and the Plugin SDK. Extra columns, custom card chrome, tenant-filtered layouts, or full `tab.override` replacements are all expressible without forking this plugin.
 
 To disable without removing: add `dashboard.plugins.kanban.enabled: false` to `config.yaml` (or delete `plugins/kanban/dashboard/manifest.json`).
 
