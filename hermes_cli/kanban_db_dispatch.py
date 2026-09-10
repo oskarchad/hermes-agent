@@ -299,7 +299,7 @@ def _signal_owned_worker(
         try:
             pgid = os.getpgid(int(pid))
             if pgid == int(pid):
-                os.killpg(pgid, sig)
+                os.killpg(pgid, sig)  # windows-footgun: ok
                 return "process_group"
         except (ProcessLookupError, PermissionError, OSError):
             pass
