@@ -2810,11 +2810,14 @@ def release_stale_claims(
             )
             if cur.rowcount != 1:
                 continue
-            _record_reclaim(
+            run_id = _record_reclaim(
                 conn, row["id"], termination,
                 error="claim_expired",
                 payload={
                     "claim_expires": row["claim_expires"],
+                    "last_heartbeat_at": hb,
+                    "worker_pid": row["worker_pid"],
+                    "host_local": host_local,
                     "reclaimed_at": now,
                     "prev_lock": row["claim_lock"],
                     "prev_pid": row["worker_pid"],
@@ -2822,6 +2825,19 @@ def release_stale_claims(
                 },
             )
             reclaimed += 1
+        # Observers see committed state; deferred and CAS-losing reclaims
+        # take the continue paths above and must remain silent.
+        if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
+            _fire_kanban_lifecycle_hook(
+                "on_kanban_worker_stale_claim",
+                row["id"],
+                board=get_current_board(),
+                assignee=row["assignee"],
+                run_id=run_id,
+                worker_pid=int(row["worker_pid"]),
+                heartbeat_stale=bool(heartbeat_stale),
+                retry_status=retry_status,
+            )
     return reclaimed
 
 
