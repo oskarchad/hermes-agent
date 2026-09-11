@@ -1245,6 +1245,21 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _dispatcher_claim_lock(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return a host-local claim identity unique to one board task."""
+    import hashlib
+    database = conn.execute("PRAGMA database_list").fetchall()
+    main_path = next(
+        (str(row["file"]) for row in database if row["name"] == "main"),
+        "",
+    )
+    board_identity = str(Path(main_path).resolve()) if main_path else get_current_board()
+    digest = hashlib.sha256(
+        f"{board_identity}\0{task_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{_claimer_id()}:{digest}"
+
+
 def _host_prefix() -> str:
     """``"<host>:"`` prefix shared by every claim lock issued from this host."""
     return f"{_claimer_id().split(':', 1)[0]}:"
@@ -2510,55 +2525,81 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
     return run_id
 
 
-def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
-    """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.
+_WorkerIdentity = tuple[str, Optional[int], Optional[int], Optional[str]]
 
-    A host-local worker that is still alive gets its claim *extended* instead
-    (a slow model can sit longer than the TTL inside one tool-free call, so no
-    heartbeat) — unless ``last_heartbeat_at`` is older than
-    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (wedged; ``_touch_activity``
-    keeps any genuinely active worker fresh). Safe to call often.
 
-    Reclaiming a live worker mid-flight produces the spawn- then-immediately-reclaim loop seen on slow
-    models that spend longer than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call (#23025):
-    no tool calls means no ``kanban_heartbeat``, even though the subprocess is healthy.
-    Backstop (#29747 gap 3): if the worker's PID is still alive but its ``last_heartbeat_at`` is stale by
-    more than ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has been making no observable
-    progress and we reclaim anyway — even if ``_pid_alive`` is still true. This catches the
-    wedged-in-a-logic-loop case where the process is technically running but accomplishing nothing.
-    ``_touch_activity`` (run_agent.py) bridges chunk-level liveness into ``last_heartbeat_at`` via #31752,
-    so any genuinely active worker keeps its heartbeat fresh as a side effect of normal API traffic.
-    ``enforce_max_runtime`` and ``detect_crashed_workers`` remain the upper bounds for genuinely wedged or
-    dead workers.
-    """
+def _worker_identity_guard(
+    task_id: str,
+    expected_identity: Optional[_WorkerIdentity],
+) -> tuple[str, tuple[Any, ...]]:
+    """Build a SQL CAS guard for one snapshotted running owner."""
+    if expected_identity is None:
+        return "", ()
+    expected_task, run_id, worker_pid, claim_lock = expected_identity
+    if expected_task != task_id:
+        return " AND 0", ()
+    return (
+        " AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
+        (run_id, worker_pid, claim_lock),
+    )
+
+
+def release_stale_claims(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> int:
+    """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed."""
     now = int(time.time())
     reclaimed = 0
-    host_prefix = _host_prefix()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?", (now,),
+        "  AND claim_expires < ?",
+        (now,),
     ).fetchall()
     for row in stale:
+        if row["worker_pid"] is None:
+            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
-        if host_local and row["worker_pid"] and _pid_alive(row["worker_pid"]) and not heartbeat_stale:
+        heartbeat_stale = (
+            hb is not None
+            and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        )
+        if (
+            host_local
+            and row["worker_pid"]
+            and _pid_alive(row["worker_pid"])
+            and not heartbeat_stale
+        ):
             _extend_live_stale_claim(conn, row, now)
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+        snapshot_run = row["current_run_id"]
+        expected_identity: _WorkerIdentity = (
+            row["id"], snapshot_run, row["worker_pid"], row["claim_lock"],
         )
-        # A live worker of ours must keep its claim (else a duplicate spawns beside it).
+        guard_sql, guard_params = _worker_identity_guard(row["id"], expected_identity)
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"],
+            row["claim_lock"],
+            signal_fn=signal_fn,
+            scope_expected=_worker_scope_expected(conn, row["id"], run_id=snapshot_run),
+            scope_unit=_worker_scope_unit(conn, row["id"], run_id=snapshot_run),
+        )
+        # Never release a claim while our own worker is still alive: that would
+        # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
+                expected_identity=expected_identity,
             )
             continue
         with write_txn(conn):
@@ -2567,32 +2608,38 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                "AND claim_expires IS NOT NULL AND claim_expires < ?" + guard_sql,
+                (retry_status, row["id"], row["claim_lock"], now, *guard_params),
             )
             if cur.rowcount != 1:
                 continue
             run_id = _record_reclaim(
                 conn, row["id"], termination,
-                error=f"stale_lock={row['claim_lock']}",
+                error="claim_expired",
                 payload={
-                    "stale_lock": row["claim_lock"],
-                    "worker_pid": _opt_int(row["worker_pid"]),
-                    "claim_expires": int(row["claim_expires"]),
-                    "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
-                    "now": now,
+                    "claim_expires": row["claim_expires"],
+                    "last_heartbeat_at": hb,
+                    "worker_pid": row["worker_pid"],
                     "host_local": host_local,
-                    "heartbeat_stale": bool(heartbeat_stale),
+                    "reclaimed_at": now,
+                    "prev_lock": row["claim_lock"],
+                    "prev_pid": row["worker_pid"],
                     "retry_status": retry_status,
                 },
             )
             reclaimed += 1
-        # Post-commit observer; every non-reclaim branch ``continue``d above.
+        # Observers see committed state; deferred and CAS-losing reclaims
+        # take the continue paths above and must remain silent.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
             _fire_kanban_lifecycle_hook(
-                "on_kanban_worker_stale_claim", row["id"], board=get_current_board(),
-                assignee=row["assignee"], run_id=run_id, worker_pid=_opt_int(row["worker_pid"]),
-                heartbeat_stale=bool(heartbeat_stale), retry_status=retry_status,
+                "on_kanban_worker_stale_claim",
+                row["id"],
+                board=get_current_board(),
+                assignee=row["assignee"],
+                run_id=run_id,
+                worker_pid=int(row["worker_pid"]),
+                heartbeat_stale=bool(heartbeat_stale),
+                retry_status=retry_status,
             )
     return reclaimed
 
@@ -2641,34 +2688,78 @@ def _extend_live_stale_claim(conn: sqlite3.Connection, row: sqlite3.Row, now: in
 
 
 def reclaim_task(
-    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    signal_fn=None,
 ) -> bool:
     """Operator reclaim regardless of TTL: release the claim, restore the source
-    phase, reset the failure counter. False when not running."""
+    phase, reset the failure counter. False when the task is not in a
+    reclaimable state (not running, or doesn't exist).
+    """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if not row:
         return False
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if row["claim_lock"] and not row["worker_pid"]:
+        # Pre-PID spawn window: the dispatcher claimed the card but has not yet
+        # recorded the worker PID. Refuse manual reclaim until the claim expires
+        # (or dispatch persists the PID) so an in-flight spawn cannot be
+        # orphaned beside a replacement.
+        return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(row["worker_pid"], prev_lock, signal_fn=signal_fn)
+    # Pin cleanup and the ownership release to the exact run snapshotted here:
+    # the dispatcher claim lock is stable per task, so a successor run can
+    # carry the same lock and must never be stopped or consumed in its place.
+    snapshot_run = row["current_run_id"]
+    expected_identity: _WorkerIdentity = (
+        task_id, snapshot_run, row["worker_pid"], prev_lock,
+    )
+    guard_sql, guard_params = _worker_identity_guard(task_id, expected_identity)
+    termination = _terminate_reclaimed_worker(
+        row["worker_pid"],
+        prev_lock,
+        signal_fn=signal_fn,
+        scope_expected=_worker_scope_expected(conn, task_id, run_id=snapshot_run),
+        scope_unit=_worker_scope_unit(conn, task_id, run_id=snapshot_run),
+    )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            prev_lock,
+            int(time.time()),
+            termination,
+            reason="manual_reclaim_cleanup_incomplete",
+            expected_identity=expected_identity,
+        )
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
+            "AND claim_lock IS ?" + guard_sql,
+            (retry_status, task_id, prev_lock, *guard_params),
         )
         if cur.rowcount != 1:
             return False
         _record_reclaim(
             conn, task_id, termination,
             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
-            payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
+            payload={
+                "manual": True,
+                "reason": reason,
+                "prev_lock": prev_lock,
+                "retry_status": retry_status,
+            },
         )
     # Operator intervention = fresh retry budget (own txn, runs after commit).
     _clear_failure_counter(conn, task_id)
@@ -3730,7 +3821,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
+            "WHERE id = ? AND status NOT IN ('archived', 'running')", (task_id,),
         )
         if cur.rowcount != 1:
             return False
@@ -3765,15 +3856,565 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def _running_worker_identity(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[_WorkerIdentity]:
+    row = conn.execute(
+        "SELECT id, current_run_id, worker_pid, claim_lock FROM tasks "
+        "WHERE id = ? AND status = 'running'",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return (
+        str(row["id"]),
+        int(row["current_run_id"]) if row["current_run_id"] is not None else None,
+        int(row["worker_pid"]) if row["worker_pid"] is not None else None,
+        str(row["claim_lock"]) if row["claim_lock"] is not None else None,
+    )
+
+
+def _worker_cleanup_verified(termination: dict) -> bool:
+    from hermes_cli.kanban_db_dispatch import _worker_cleanup_verified
+    return _worker_cleanup_verified(termination)
+
+
+def _prepare_running_worker_cleanup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+) -> tuple[bool, Optional[_WorkerIdentity]]:
+    """Stop one snapshotted running owner before a non-worker mutation."""
+    identity = _running_worker_identity(conn, task_id)
+    if identity is None:
+        return True, None
+    _, run_id, worker_pid, claim_lock = identity
+    if worker_pid is None:
+        return False, identity
+    termination = _terminate_reclaimed_worker(
+        worker_pid,
+        claim_lock,
+        scope_expected=_worker_scope_expected(conn, task_id, run_id),
+        scope_unit=_worker_scope_unit(conn, task_id, run_id),
+    )
+    if _worker_cleanup_verified(termination):
+        return True, identity
+    if termination.get("host_local") and termination.get("termination_attempted"):
+        _defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            claim_lock,
+            int(time.time()),
+            termination,
+            reason=reason,
+            expected_identity=identity,
+        )
+    return False, identity
+
+
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
+    """Hard-delete a task and cascade to all related rows."""
+    initial = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if initial is None:
+        return False
+    expected_status = str(initial["status"])
+    worker_identity: Optional[_WorkerIdentity] = None
+    if expected_status == "running":
+        cleanup_ok, worker_identity = _prepare_running_worker_cleanup(
+            conn,
+            task_id,
+            reason="delete_cleanup_incomplete",
+        )
+        if not cleanup_ok or worker_identity is None:
+            return False
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        if worker_identity is not None:
+            _, run_id, worker_pid, claim_lock = worker_identity
+            cur = conn.execute(
+                "DELETE FROM tasks WHERE id = ? AND status = 'running' "
+                "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
+                (task_id, run_id, worker_pid, claim_lock),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM tasks WHERE id = ? AND status = ?",
+                (task_id, expected_status),
+            )
         if cur.rowcount != 1:
             return False
-        _delete_task_relations(conn, task_id)
+        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
+
+
+def schedule_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
+    until ``unblock_task`` re-gates it."""
+    with write_txn(conn):
+        params: list[Any] = [task_id]
+        sql = """
+            UPDATE tasks
+               SET status       = 'scheduled',
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL
+             WHERE id = ?
+               AND status IN ('todo', 'ready', 'running', 'blocked')
+        """
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        if conn.execute(sql, params).rowcount != 1:
+            return False
+        run_id = _end_or_synthesize_run(
+            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
+        )
+        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        return True
+
+
+# --- Worker context builder (what a spawned worker sees) ---
+
+def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+    """Everything a worker should read about its task: header, body,
+    attachments, prior attempts, done-parent handoffs, the assignee's recent
+    work, comments. Lists are tail-capped and fields char-capped
+    (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
+    task = get_task(conn, task_id)
+    if not task:
+        raise ValueError(f"unknown task {task_id}")
+    # One clock reading so every relative age in this rendering agrees.
+    now = int(time.time())
+    lines: list[str] = []
+    _ctx_header(lines, task)
+    _ctx_attachments(lines, list_attachments(conn, task_id))
+    _ctx_prior_attempts(lines, conn, task_id, now)
+    _ctx_parent_results(lines, conn, task_id, now)
+    _ctx_role_history(lines, conn, task, now)
+    _ctx_comments(lines, list_comments(conn, task_id), now)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+    """Truncate to ``limit`` chars with a visible ellipsis."""
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _ctx_stamp(ts: int, now: int) -> str:
+    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
+    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    age = _relative_age(ts, now)
+    return f"{disp}, {age}" if age else disp
+
+
+def _ctx_metadata_line(metadata: Any) -> Optional[str]:
+    if not metadata:
+        return None
+    try:
+        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
+    except Exception:
+        return None
+
+
+def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
+    """Keep the newest ``cap`` items; describe the omitted head, if any."""
+    omitted = max(0, len(items) - cap)
+    if not omitted:
+        return items, None
+    return items[-cap:], (
+        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
+        f"omitted; showing most recent {cap})_"
+    )
+
+
+def _ctx_header(lines: list[str], task: Task) -> None:
+    lines.append(f"# Kanban task {task.id}: {task.title}")
+    lines.append("")
+    lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
+    lines.append(f"Status:   {task.status}")
+    if task.tenant:
+        lines.append(f"Tenant:   {task.tenant}")
+    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.max_runtime_seconds is not None:
+        terminal_timeout = _worker_terminal_timeout_env(
+            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
+        )
+        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
+        if effective_terminal_timeout:
+            lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+    if task.branch_name:
+        lines.append(f"Branch:   {task.branch_name}")
+    lines.append("")
+    if task.body and task.body.strip():
+        lines.append("## Body")
+        lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+
+def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
+    """Absolute on-disk paths so the worker's file tools read them directly
+    (remote terminal backends need the attachments dir mounted)."""
+    if not attachments:
+        return
+    lines.append("## Attachments")
+    lines.append(
+        "Files attached to this task. Read them with the file/terminal "
+        "tools at the absolute paths below:"
+    )
+    for att in attachments:
+        size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
+        size_str = f", {size_kb} KB" if size_kb else ""
+        ctype = f", {att.content_type}" if att.content_type else ""
+        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+    lines.append("")
+
+
+def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Closed runs on this task (the active run is this worker), newest
+    ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
+    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
+    if not shown:
+        return
+    first_shown_idx = len(all_prior) - len(shown) + 1
+    lines.append("## Prior attempts on this task")
+    if omitted_note:
+        lines.append(omitted_note)
+    for offset, run in enumerate(shown):
+        profile = run.profile or "(unknown)"
+        outcome = run.outcome or run.status
+        lines.append(
+            f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
+        )
+        if run.summary and run.summary.strip():
+            lines.append(_ctx_cap(run.summary))
+        if run.error and run.error.strip():
+            lines.append(f"_error_: {_ctx_cap(run.error)}")
+        meta_line = _ctx_metadata_line(run.metadata)
+        if meta_line:
+            lines.append(meta_line)
+        lines.append("")
+
+
+def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
+    falling back to ``task.result`` for pre-runs-table data. Stamped with a
+    relative age so the worker re-verifies stale upstream results."""
+    parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
+    ).fetchall()
+    wrote_header = False
+    for pid in (r["parent_id"] for r in parent_rows):
+        pt = get_task(conn, pid)
+        if not pt or pt.status != "done":
+            continue
+        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
+        runs.sort(key=lambda r: r.started_at, reverse=True)
+        run = runs[0] if runs else None
+        if not wrote_header:
+            lines.append("## Parent task results")
+            lines.append(
+                "_Handoffs from upstream tasks, captured when each parent "
+                "completed (see age below). These are point-in-time "
+                "snapshots, not live state — if a result drives your "
+                "current work and it's not recent, re-verify against the "
+                "source before acting on it as current._"
+            )
+            wrote_header = True
+        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
+        age = _relative_age(done_ts, now)
+        lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+        if run is not None and run.summary and run.summary.strip():
+            lines.append(_ctx_cap(run.summary))
+        elif pt.result:
+            lines.append(_ctx_cap(pt.result))
+        else:
+            lines.append("(no result recorded)")
+        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
+        if meta_line:
+            lines.append(meta_line)
+        lines.append("")
+
+
+def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
+    """The assignee's 5 most recent completed runs on OTHER tasks — implicit
+    role continuity without wiring anything into SOUL.md / MEMORY.md."""
+    if not task.assignee:
+        return
+    role_rows = conn.execute(
+        "SELECT t.id, t.title, r.summary, r.ended_at "
+        "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+        "WHERE r.profile = ? AND r.task_id != ? "
+        "  AND r.outcome = 'completed' "
+        "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
+    ).fetchall()
+    if not role_rows:
+        return
+    lines.append(f"## Recent work by @{task.assignee}")
+    for row in role_rows:
+        first = _first_line(row["summary"], 200) or "(no summary)"
+        lines.append(
+            f"- {row['id']} — {row['title']} ({_ctx_stamp(int(row['ended_at']), now)}): {first}"
+        )
+    lines.append("")
+
+
+def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
+    """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
+    worker" framing stops an operator-controlled HERMES_PROFILE like
+    "hermes-system" being read as a system directive above an
+    attacker-influenceable body (defense-in-depth)."""
+    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
+    if not shown:
+        return
+    lines.append("## Comment thread")
+    if omitted_note:
+        lines.append(omitted_note)
+    for c in shown:
+        # Render author with explicit "comment from worker" framing so operator-controlled HERMES_PROFILE
+        # values like "hermes-system" or "operator" can't be misread by the next worker as a system
+        # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
+        # author-forgery surface was already closed in #22435. See #22452.
+        safe_author = (c.author or "").replace("`", "")
+        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
+        lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+        lines.append("")
+
+
+# --- Stats + SLA helpers ---
+
+def board_stats(conn: sqlite3.Connection) -> dict:
+    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
+    by_status: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT status, COUNT(*) AS n FROM tasks "
+        "WHERE status != 'archived' GROUP BY status"
+    ):
+        by_status[row["status"]] = int(row["n"])
+
+    by_assignee = _counts_by_assignee(conn)
+
+    oldest_row = conn.execute(
+        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
+    ).fetchone()
+    now = int(time.time())
+    oldest_ready_age = (
+        (now - int(oldest_row["ts"]))
+        if oldest_row and oldest_row["ts"] is not None else None
+    )
+
+    cap_row = conn.execute(
+        "SELECT COUNT(*) AS n, MIN(created_at) AS oldest "
+        "FROM kanban_captain_inbox WHERE state != 'acked'"
+    ).fetchone()
+    cap_count = int(cap_row["n"]) if cap_row and cap_row["n"] is not None else 0
+    cap_oldest = (
+        (now - int(cap_row["oldest"]))
+        if cap_row and cap_row["oldest"] is not None else None
+    )
+
+    per_profile: list[dict] = []
+    for row in conn.execute(
+        "SELECT profile, COUNT(*) AS n, MIN(created_at) AS oldest "
+        "FROM kanban_captain_inbox WHERE state != 'acked' "
+        "GROUP BY profile ORDER BY n DESC, oldest ASC, profile ASC"
+    ):
+        per_profile.append({
+            "profile": row["profile"],
+            "count": int(row["n"]),
+            "oldest_age_seconds": (
+                now - int(row["oldest"]) if row["oldest"] is not None else None
+            ),
+        })
+    profiles_truncated = max(0, len(per_profile) - CAPTAIN_STATS_PROFILE_CAP)
+    by_profile = per_profile[:CAPTAIN_STATS_PROFILE_CAP]
+
+    return {
+        "by_status": by_status,
+        "by_assignee": by_assignee,
+        "oldest_ready_age_seconds": oldest_ready_age,
+        "captain_unreported": {
+            "count": cap_count,
+            "oldest_age_seconds": cap_oldest,
+            "by_profile": by_profile,
+            "profiles_truncated": profiles_truncated,
+        },
+        "now": now,
+    }
+
+
+def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    """``{assignee: {status: n}}`` over non-archived tasks."""
+    counts: dict[str, dict[str, int]] = {}
+    for row in conn.execute(
+        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
+        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "GROUP BY assignee, status"
+    ):
+        counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
+    return counts
+
+
+def _to_epoch(val) -> Optional[int]:
+    """Epoch seconds from int/float/numeric string/ISO-8601; None for empty/invalid."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    # ISO-8601 fallback (e.g. '2026-05-10T15:00:00Z')
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except (ValueError, OSError):
+        return None
+
+
+def task_age(task: Task) -> dict:
+    """Return age metrics for a single task. All values are seconds or None."""
+    now = int(time.time())
+    _c = _to_epoch(task.created_at)
+    _s = _to_epoch(task.started_at)
+    _co = _to_epoch(task.completed_at)
+    return {
+        "created_age_seconds": now - _c if _c is not None else None,
+        "started_age_seconds": now - _s if _s is not None else None,
+        "time_to_complete_seconds": _co - (_s or _c) if _co is not None else None,
+    }
+
+
+# --- Retention + garbage collection ---
+
+def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
+    """Delete events older than the cutoff on done/archived tasks only; returns the count."""
+    cutoff = int(time.time()) - int(older_than_seconds)
+    with write_txn(conn):
+        conn.execute(
+            "DELETE FROM kanban_captain_inbox "
+            "WHERE state = 'acked' AND updated_at < ?",
+            (cutoff,),
+        )
+        cur = conn.execute(
+            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND id NOT IN (SELECT event_id FROM kanban_captain_inbox "
+            "               WHERE state != 'acked')",
+            (cutoff,),
+        )
+        conn.execute(
+            "DELETE FROM kanban_captain_receivers WHERE last_seen < ?",
+            (cutoff,),
+        )
+    return int(cur.rowcount or 0)
+
+
+def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[str] = None) -> int:
+    """Delete worker log files older than the cutoff on one board; returns the count."""
+    log_dir = worker_logs_dir(board=board)
+    if not log_dir.exists():
+        return 0
+    cutoff = time.time() - older_than_seconds
+    removed = 0
+    for p in log_dir.iterdir():
+        with contextlib.suppress(OSError):
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+    return removed
+
+
+# --- Worker log accessor ---
+
+def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
+    """Worker log path (may not exist). The dispatcher always passes ``board``
+    explicitly to avoid resolution ambiguity."""
+    return worker_logs_dir(board=board) / f"{task_id}.log"
+
+
+def read_worker_log(
+    task_id: str, *, tail_bytes: Optional[int] = None, board: Optional[str] = None,
+) -> Optional[str]:
+    """Worker log text (last ``tail_bytes`` when set); None when the file is missing."""
+    path = worker_log_path(task_id, board=board)
+    if not path.exists():
+        return None
+    try:
+        if tail_bytes is None:
+            return path.read_text(encoding="utf-8", errors="replace")
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                # Skip the partial first line unless the window has no newline
+                # at all (readline() would eat everything).
+                probe = f.tell()
+                if not f.readline().endswith(b"\n") and f.tell() >= size:
+                    f.seek(probe)
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+# --- Assignee enumeration (known profiles + per-profile board stats) ---
+
+def list_profiles_on_disk() -> list[str]:
+    """Profiles with a ``config.yaml`` plus the implicit ``default``; reads paths
+    directly to avoid importing ``hermes_cli.profiles`` at startup."""
+    try:
+        from hermes_constants import get_default_hermes_root
+        default_root = get_default_hermes_root()
+        profiles_dir = default_root / "profiles"
+    except Exception:
+        return []
+
+    names: set[str] = set()
+    if default_root.exists():
+        names.add("default")
+    if profiles_dir.is_dir():
+        try:
+            names.update(e.name for e in profiles_dir.iterdir() if e.is_dir() and (e / "config.yaml").is_file())
+        except OSError:
+            pass
+    return sorted(names)
+
+
+def known_assignees(conn: sqlite3.Connection) -> list[dict]:
+    """``{"name", "on_disk", "counts"}`` for every on-disk profile or task
+    assignee, so a fresh profile appears in pickers before it has a task."""
+    on_disk = set(list_profiles_on_disk())
+    counts = _counts_by_assignee(conn)
+    return [
+        {"name": name, "on_disk": name in on_disk, "counts": counts.get(name, {})}
+        for name in sorted(on_disk | set(counts))
+    ]
+
+
+# --- Runs (attempt history on a task) ---
 
 
 def schedule_task(
@@ -4752,6 +5393,8 @@ def count_captain_pending(
 # ---------------------------------------------------------------------------
 
 
+
+
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
@@ -4774,6 +5417,14 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _terminate_reclaimed_worker,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    _worker_scope_expected,
+    _worker_scope_unit,
+    _kanban_worker_scope_unit,
+    _stop_kanban_worker_scope,
+    _systemd_worker_scope_inactive,
+    _systemd_worker_scope_required,
+    _systemd_worker_scope_unloaded,
+    _SpawnedWorkerPid,
 )
 
 
@@ -4850,6 +5501,20 @@ _PLUGIN_COMPAT_LAZY = {
     'worker_log_rotation_config': ('hermes_cli.kanban_db_dispatch', 'worker_log_rotation_config'),
     '_default_spawn': ('hermes_cli.kanban_db_dispatch', '_default_spawn'),
     '_SpawnedWorkerPid': ('hermes_cli.kanban_db_dispatch', '_SpawnedWorkerPid'),
+    '_systemd_worker_scope_required': ('hermes_cli.kanban_db_dispatch', '_systemd_worker_scope_required'),
+    '_kanban_worker_scope_unit': ('hermes_cli.kanban_db_dispatch', '_kanban_worker_scope_unit'),
+    '_stop_kanban_worker_scope': ('hermes_cli.kanban_db_dispatch', '_stop_kanban_worker_scope'),
+    '_systemd_worker_scope_state': ('hermes_cli.kanban_db_dispatch', '_systemd_worker_scope_state'),
+    '_systemd_worker_scope_inactive': ('hermes_cli.kanban_db_dispatch', '_systemd_worker_scope_inactive'),
+    '_systemd_worker_scope_unloaded': ('hermes_cli.kanban_db_dispatch', '_systemd_worker_scope_unloaded'),
+    '_worker_scope_expected': ('hermes_cli.kanban_db_dispatch', '_worker_scope_expected'),
+    '_worker_scope_unit': ('hermes_cli.kanban_db_dispatch', '_worker_scope_unit'),
+    '_set_worker_pid': ('hermes_cli.kanban_db_dispatch', '_set_worker_pid'),
+    '_resolve_hermes_argv': ('hermes_cli.kanban_db_dispatch', '_resolve_hermes_argv'),
+    '_classify_worker_exit': ('hermes_cli.kanban_db_dispatch', '_classify_worker_exit'),
+    '_terminate_reclaimed_worker': ('hermes_cli.kanban_db_dispatch', '_terminate_reclaimed_worker'),
+    '_handoff_worker_teardown_pending': ('hermes_cli.kanban_db_dispatch', '_handoff_worker_teardown_pending'),
+    '_retag_legacy_worker_sessions': ('hermes_cli.kanban_db_dispatch', '_retag_legacy_worker_sessions'),
 }
 
 
