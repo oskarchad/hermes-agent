@@ -52,25 +52,18 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-@pytest.fixture
-def quickstart_budget(monkeypatch):
-    """Sequencing tests need a fitting machine, not the CI host's RAM/GPU.
-
-    Keep catalog selection and engine preflight real; only hardware is input.
-    """
-    from hermes_cli.local_runtime.estimator import HardwareBudget
-
-    budget = HardwareBudget(usable_vram_bytes=64 << 30,
-                            total_device_bytes=64 << 30,
-                            ram_available_bytes=64 << 30)
-    monkeypatch.setattr("hermes_cli.local_runtime.hardware.probe_budget",
-                        lambda **kw: budget)
-
-
-def test_quickstart_runs_all_three_legs(client, quickstart_budget, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
+
+    # Supply the same supported backend to preflight and the stubbed install;
+    # host auto-detection may select CUDA without a published Linux archive.
+    from hermes_cli.config import load_config, save_config
+
+    config = load_config()
+    config.setdefault("local_runtime", {})["backend"] = "cpu"
+    save_config(config)
 
     # Leg 1: no runtime installed yet; install is the stubbed binaries call.
     monkeypatch.setattr(
@@ -100,7 +93,7 @@ def test_quickstart_runs_all_three_legs(client, quickstart_budget, monkeypatch, 
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 200
     body = r.json()
     assert body["needs_runtime"] is True
     assert body["needs_download"] is True
@@ -120,7 +113,7 @@ def test_quickstart_runs_all_three_legs(client, quickstart_budget, monkeypatch, 
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, quickstart_budget, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
@@ -151,7 +144,7 @@ def test_quickstart_skips_satisfied_legs(client, quickstart_budget, monkeypatch)
         lambda *a, **k: calls.append("assign"))
 
     r = client.post("/api/local-models/quickstart", json={})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 200
     body = r.json()
     assert body["needs_runtime"] is False
     assert body["needs_download"] is False
