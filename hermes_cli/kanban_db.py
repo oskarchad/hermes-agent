@@ -211,6 +211,23 @@ def effective_task_toolsets(requested: Optional[Iterable[str]]) -> Optional[list
 
 # --- Constants ---
 
+
+CAPTAIN_STATS_PROFILE_CAP = 20
+
+CAPTAIN_REPORT_KINDS: frozenset[str] = frozenset({
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "captain_signal",
+})
+
+CAPTAIN_SIGNAL_HEADERS: tuple[tuple[str, str], ...] = (
+    ("METHOD DELTA", "method_delta"),
+    ("DECISION REQUIRED", "decision_required"),
+    ("CAPTAIN NOTE", "captain_note"),
+)
+CAPTAIN_SIGNAL_CLASSES: frozenset[str] = frozenset(
+    cls for _, cls in CAPTAIN_SIGNAL_HEADERS
+)
+
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
@@ -1414,8 +1431,22 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
 
 
 def _normalize_captain_profile(profile: Optional[str]) -> str:
-    cleaned = (profile or "").strip()
-    return cleaned if cleaned else "default"
+    """Canonicalize a Captain owner profile.
+
+    Uses the same :func:`hermes_cli.profiles.normalize_profile_name` canonical
+    id used on disk and in ``-p`` argv, so mixed-case / title-cased inputs
+    (``Otto``, ``Default``) resolve to one owner (``otto``, ``default``) across
+    registration, materialization, lease/read, filters, and probes. An empty
+    profile maps to ``default``.
+    """
+    name = str(profile or "").strip()
+    if not name:
+        return "default"
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+        return normalize_profile_name(name)
+    except Exception:
+        return name.lower()
 
 
 def resolve_captain_profile() -> str:
@@ -1434,6 +1465,49 @@ def resolve_captain_profile() -> str:
     return "default"
 
 
+def _resolve_captain_ownership(
+    conn: sqlite3.Connection,
+    parents: tuple[str, ...],
+    *,
+    requested_profile: Optional[str],
+    requested_origin: Optional[str],
+    tenant: Optional[str],
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Resolve one immutable Captain owner for a root or descendant task."""
+    parent_rows: list[sqlite3.Row] = []
+    if parents:
+        placeholders = ",".join("?" * len(parents))
+        parent_rows = conn.execute(
+            "SELECT task_id, profile, origin_session_key, tenant "
+            "FROM kanban_captain_registry "
+            f"WHERE task_id IN ({placeholders}) ORDER BY task_id",
+            parents,
+        ).fetchall()
+    if parent_rows:
+        profiles = {str(row["profile"]) for row in parent_rows}
+        origins = {
+            str(row["origin_session_key"])
+            for row in parent_rows
+            if row["origin_session_key"]
+        }
+        tenants = {str(row["tenant"]) for row in parent_rows if row["tenant"]}
+        if len(profiles) != 1:
+            raise ValueError("parent tasks have conflicting Captain profiles")
+        if len(origins) > 1:
+            raise ValueError("parent tasks have conflicting Captain origins")
+        if len(tenants) > 1:
+            raise ValueError("parent tasks have conflicting Captain tenants")
+        inherited_tenant = next(iter(tenants), None)
+        return (
+            next(iter(profiles)),
+            next(iter(origins), None),
+            str(tenant) if tenant else inherited_tenant,
+        )
+
+    profile = requested_profile or resolve_captain_profile()
+    return _normalize_captain_profile(profile), requested_origin, tenant
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1449,6 +1523,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    captain_profile: Optional[str] = None,
+    captain_origin_session_key: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1501,6 +1577,13 @@ def create_task(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
     parents = tuple(p for p in parents if p)
+    captain_profile, captain_origin_session_key, tenant = _resolve_captain_ownership(
+        conn,
+        parents,
+        requested_profile=captain_profile,
+        requested_origin=captain_origin_session_key,
+        tenant=tenant,
+    )
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1593,8 +1676,13 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
-                captain_prof = resolve_captain_profile()
-                register_captain_owner(conn, task_id, profile=captain_prof, origin_session_key=None)
+            register_captain_owner(
+                conn,
+                task_id,
+                profile=captain_profile,
+                origin_session_key=captain_origin_session_key,
+                tenant=tenant,
+            )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -1923,7 +2011,14 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+def add_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    _materialize_captain_signal: bool = True,
+) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -1933,12 +2028,28 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         _require_task(conn, task_id)
+        normalized_author = author.strip()
+        normalized_body = body.strip()
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
+            "VALUES (?, ?, ?, ?)", (task_id, normalized_author, normalized_body, now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+        signal_class = (
+            _classify_captain_signal(normalized_body)
+            if _materialize_captain_signal
+            else None
+        )
+        if signal_class is not None:
+            materialize_captain_signal(
+                conn,
+                task_id=task_id,
+                comment_id=comment_id,
+                author=normalized_author,
+                signal_class=signal_class,
+            )
+        return comment_id
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -2082,6 +2193,68 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return [Event.from_row(r) for r in _task_rows(conn, "task_events", task_id, "created_at ASC, id ASC")]
 
 
+def _classify_captain_signal(body: str) -> Optional[str]:
+    """Recognize a strategic Captain signal header at the start of a comment."""
+    stripped = body.strip()
+    for header, signal_class in CAPTAIN_SIGNAL_HEADERS:
+        if stripped.startswith(header):
+            tail = stripped[len(header):]
+            if not tail or tail[0] in (":", "-", "—", " ", "\n", "\t"):
+                return signal_class
+    return None
+
+
+def materialize_captain_signal(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    comment_id: int,
+    author: str,
+    signal_class: str,
+) -> Optional[int]:
+    """Materialize one durable Captain report for an immutable comment source."""
+    if signal_class not in CAPTAIN_SIGNAL_CLASSES:
+        raise ValueError(f"unknown Captain signal class {signal_class!r}")
+    with write_txn(conn, allow_nested=True):
+        comment = conn.execute(
+            "SELECT 1 FROM task_comments WHERE id = ? AND task_id = ?",
+            (int(comment_id), task_id),
+        ).fetchone()
+        if comment is None:
+            raise ValueError(f"unknown comment {comment_id} for task {task_id}")
+        if conn.execute(
+            "SELECT 1 FROM kanban_captain_registry WHERE task_id = ?",
+            (task_id,),
+        ).fetchone() is None:
+            return None
+        existing = conn.execute(
+            "SELECT event_id FROM kanban_captain_inbox WHERE source_comment_id = ?",
+            (int(comment_id),),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["event_id"])
+        return _append_event(
+            conn,
+            task_id,
+            "captain_signal",
+            {
+                "author": author.strip(),
+                "comment_id": int(comment_id),
+                "signal_class": signal_class,
+            },
+            source_comment_id=int(comment_id),
+        )
+
+
+def get_comment(conn: sqlite3.Connection, comment_id: int) -> Optional[Comment]:
+    """Return one immutable comment source by its board-local id."""
+    row = conn.execute(
+        "SELECT id, task_id, author, body, created_at FROM task_comments WHERE id = ?",
+        (int(comment_id),),
+    ).fetchone()
+    return Comment.from_row(row) if row else None
+
+
 def _insert_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str, created_at: int,
 ) -> None:
@@ -2096,12 +2269,38 @@ def _insert_comment(
 def _append_event(
     conn: sqlite3.Connection, task_id: str, kind: str, payload: Optional[dict] = None, *,
     run_id: Optional[int] = None,
-) -> None:
+    source_comment_id: Optional[int] = None,
+) -> int:
     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
-    conn.execute(
+    now = int(time.time())
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
+        "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), now),
     )
+    event_id = int(cur.lastrowid)
+    if kind in CAPTAIN_REPORT_KINDS:
+        reg = conn.execute(
+            "SELECT profile, tenant FROM kanban_captain_registry WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if reg is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO kanban_captain_inbox "
+                "(event_id, profile, task_id, kind, source_comment_id, tenant, "
+                "state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    event_id,
+                    reg["profile"],
+                    task_id,
+                    kind,
+                    source_comment_id,
+                    reg["tenant"],
+                    now,
+                    now,
+                ),
+            )
+    return event_id
 
 
 def _end_run(
@@ -3835,6 +4034,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
+    captain_gc_task_if_settled(conn, task_id)
     return True
 
 
@@ -3954,6 +4154,9 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
+
+
+# --- Runs (attempt history on a task) ---
 
 
 def schedule_task(
@@ -4320,7 +4523,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
             (cutoff,),
         )
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
             "AND id NOT IN (SELECT event_id FROM kanban_captain_inbox "
             "               WHERE state != 'acked')",
@@ -4329,423 +4532,6 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
         conn.execute(
             "DELETE FROM kanban_captain_receivers WHERE last_seen < ?",
             (cutoff,),
-        )
-    return int(cur.rowcount or 0)
-
-
-def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[str] = None) -> int:
-    """Delete worker log files older than the cutoff on one board; returns the count."""
-    log_dir = worker_logs_dir(board=board)
-    if not log_dir.exists():
-        return 0
-    cutoff = time.time() - older_than_seconds
-    removed = 0
-    for p in log_dir.iterdir():
-        with contextlib.suppress(OSError):
-            if p.is_file() and p.stat().st_mtime < cutoff:
-                p.unlink()
-                removed += 1
-    return removed
-
-
-# --- Worker log accessor ---
-
-def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
-    """Worker log path (may not exist). The dispatcher always passes ``board``
-    explicitly to avoid resolution ambiguity."""
-    return worker_logs_dir(board=board) / f"{task_id}.log"
-
-
-def read_worker_log(
-    task_id: str, *, tail_bytes: Optional[int] = None, board: Optional[str] = None,
-) -> Optional[str]:
-    """Worker log text (last ``tail_bytes`` when set); None when the file is missing."""
-    path = worker_log_path(task_id, board=board)
-    if not path.exists():
-        return None
-    try:
-        if tail_bytes is None:
-            return path.read_text(encoding="utf-8", errors="replace")
-        size = path.stat().st_size
-        with open(path, "rb") as f:
-            if size > tail_bytes:
-                f.seek(size - tail_bytes)
-                # Skip the partial first line unless the window has no newline
-                # at all (readline() would eat everything).
-                probe = f.tell()
-                if not f.readline().endswith(b"\n") and f.tell() >= size:
-                    f.seek(probe)
-            return f.read().decode("utf-8", errors="replace")
-    except OSError:
-        return None
-
-
-# --- Assignee enumeration (known profiles + per-profile board stats) ---
-
-def list_profiles_on_disk() -> list[str]:
-    """Profiles with a ``config.yaml`` plus the implicit ``default``; reads paths
-    directly to avoid importing ``hermes_cli.profiles`` at startup."""
-    try:
-        from hermes_constants import get_default_hermes_root
-        default_root = get_default_hermes_root()
-        profiles_dir = default_root / "profiles"
-    except Exception:
-        return []
-
-    names: set[str] = set()
-    if default_root.exists():
-        names.add("default")
-    if profiles_dir.is_dir():
-        try:
-            names.update(e.name for e in profiles_dir.iterdir() if e.is_dir() and (e / "config.yaml").is_file())
-        except OSError:
-            pass
-    return sorted(names)
-
-
-def known_assignees(conn: sqlite3.Connection) -> list[dict]:
-    """``{"name", "on_disk", "counts"}`` for every on-disk profile or task
-    assignee, so a fresh profile appears in pickers before it has a task."""
-    on_disk = set(list_profiles_on_disk())
-    counts = _counts_by_assignee(conn)
-    return [
-        {"name": name, "on_disk": name in on_disk, "counts": counts.get(name, {})}
-        for name in sorted(on_disk | set(counts))
-    ]
-
-
-# --- Runs (attempt history on a task) ---
-
-
-def schedule_task(
-    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
-) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
-    with write_txn(conn):
-        params: list[Any] = [task_id]
-        sql = """
-            UPDATE tasks
-               SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
-             WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
-        """
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params.append(int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
-        )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
-        return True
-
-
-# --- Worker context builder (what a spawned worker sees) ---
-
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
-    """Everything a worker should read about its task: header, body,
-    attachments, prior attempts, done-parent handoffs, the assignee's recent
-    work, comments. Lists are tail-capped and fields char-capped
-    (``_CTX_MAX_*``) so the prompt stays bounded on pathological boards."""
-    task = get_task(conn, task_id)
-    if not task:
-        raise ValueError(f"unknown task {task_id}")
-    # One clock reading so every relative age in this rendering agrees.
-    now = int(time.time())
-    lines: list[str] = []
-    _ctx_header(lines, task)
-    _ctx_attachments(lines, list_attachments(conn, task_id))
-    _ctx_prior_attempts(lines, conn, task_id, now)
-    _ctx_parent_results(lines, conn, task_id, now)
-    _ctx_role_history(lines, conn, task, now)
-    _ctx_comments(lines, list_comments(conn, task_id), now)
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
-    """Truncate to ``limit`` chars with a visible ellipsis."""
-    if not s:
-        return ""
-    s = s.strip()
-    if len(s) <= limit:
-        return s
-    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
-
-
-def _ctx_stamp(ts: int, now: int) -> str:
-    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
-    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-    age = _relative_age(ts, now)
-    return f"{disp}, {age}" if age else disp
-
-
-def _ctx_metadata_line(metadata: Any) -> Optional[str]:
-    if not metadata:
-        return None
-    try:
-        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
-    except Exception:
-        return None
-
-
-def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
-    """Keep the newest ``cap`` items; describe the omitted head, if any."""
-    omitted = max(0, len(items) - cap)
-    if not omitted:
-        return items, None
-    return items[-cap:], (
-        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
-        f"omitted; showing most recent {cap})_"
-    )
-
-
-def _ctx_header(lines: list[str], task: Task) -> None:
-    lines.append(f"# Kanban task {task.id}: {task.title}")
-    lines.append("")
-    lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
-    lines.append(f"Status:   {task.status}")
-    if task.tenant:
-        lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
-    if task.max_runtime_seconds is not None:
-        terminal_timeout = _worker_terminal_timeout_env(
-            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
-        )
-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
-        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
-        if effective_terminal_timeout:
-            lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
-    if task.branch_name:
-        lines.append(f"Branch:   {task.branch_name}")
-    lines.append("")
-    if task.body and task.body.strip():
-        lines.append("## Body")
-        lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
-        lines.append("")
-
-
-def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
-    """Absolute on-disk paths so the worker's file tools read them directly
-    (remote terminal backends need the attachments dir mounted)."""
-    if not attachments:
-        return
-    lines.append("## Attachments")
-    lines.append(
-        "Files attached to this task. Read them with the file/terminal "
-        "tools at the absolute paths below:"
-    )
-    for att in attachments:
-        size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
-        size_str = f", {size_kb} KB" if size_kb else ""
-        ctype = f", {att.content_type}" if att.content_type else ""
-        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
-    lines.append("")
-
-
-def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Closed runs on this task (the active run is this worker), newest
-    ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
-    if not shown:
-        return
-    first_shown_idx = len(all_prior) - len(shown) + 1
-    lines.append("## Prior attempts on this task")
-    if omitted_note:
-        lines.append(omitted_note)
-    for offset, run in enumerate(shown):
-        profile = run.profile or "(unknown)"
-        outcome = run.outcome or run.status
-        lines.append(
-            f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
-        )
-        if run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
-        if run.error and run.error.strip():
-            lines.append(f"_error_: {_ctx_cap(run.error)}")
-        meta_line = _ctx_metadata_line(run.metadata)
-        if meta_line:
-            lines.append(meta_line)
-        lines.append("")
-
-
-def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
-    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
-    falling back to ``task.result`` for pre-runs-table data. Stamped with a
-    relative age so the worker re-verifies stale upstream results."""
-    parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
-    ).fetchall()
-    wrote_header = False
-    for pid in (r["parent_id"] for r in parent_rows):
-        pt = get_task(conn, pid)
-        if not pt or pt.status != "done":
-            continue
-        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
-        runs.sort(key=lambda r: r.started_at, reverse=True)
-        run = runs[0] if runs else None
-        if not wrote_header:
-            lines.append("## Parent task results")
-            lines.append(
-                "_Handoffs from upstream tasks, captured when each parent "
-                "completed (see age below). These are point-in-time "
-                "snapshots, not live state — if a result drives your "
-                "current work and it's not recent, re-verify against the "
-                "source before acting on it as current._"
-            )
-            wrote_header = True
-        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
-        age = _relative_age(done_ts, now)
-        lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
-        if run is not None and run.summary and run.summary.strip():
-            lines.append(_ctx_cap(run.summary))
-        elif pt.result:
-            lines.append(_ctx_cap(pt.result))
-        else:
-            lines.append("(no result recorded)")
-        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
-        if meta_line:
-            lines.append(meta_line)
-        lines.append("")
-
-
-def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
-    """The assignee's 5 most recent completed runs on OTHER tasks — implicit
-    role continuity without wiring anything into SOUL.md / MEMORY.md."""
-    if not task.assignee:
-        return
-    role_rows = conn.execute(
-        "SELECT t.id, t.title, r.summary, r.ended_at "
-        "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-        "WHERE r.profile = ? AND r.task_id != ? "
-        "  AND r.outcome = 'completed' "
-        "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
-    ).fetchall()
-    if not role_rows:
-        return
-    lines.append(f"## Recent work by @{task.assignee}")
-    for row in role_rows:
-        first = _first_line(row["summary"], 200) or "(no summary)"
-        lines.append(
-            f"- {row['id']} — {row['title']} ({_ctx_stamp(int(row['ended_at']), now)}): {first}"
-        )
-    lines.append("")
-
-
-def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
-    """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
-    worker" framing stops an operator-controlled HERMES_PROFILE like
-    "hermes-system" being read as a system directive above an
-    attacker-influenceable body (defense-in-depth)."""
-    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
-    if not shown:
-        return
-    lines.append("## Comment thread")
-    if omitted_note:
-        lines.append(omitted_note)
-    for c in shown:
-        # Render author with explicit "comment from worker" framing so operator-controlled HERMES_PROFILE
-        # values like "hermes-system" or "operator" can't be misread by the next worker as a system
-        # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
-        # author-forgery surface was already closed in #22435. See #22452.
-        safe_author = (c.author or "").replace("`", "")
-        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
-        lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
-        lines.append("")
-
-
-# --- Stats + SLA helpers ---
-
-def board_stats(conn: sqlite3.Connection) -> dict:
-    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
-    by_status: dict[str, int] = {}
-    for row in conn.execute(
-        "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
-    ):
-        by_status[row["status"]] = int(row["n"])
-
-    by_assignee = _counts_by_assignee(conn)
-
-    oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
-    ).fetchone()
-    now = int(time.time())
-    oldest_ready_age = (
-        (now - int(oldest_row["ts"]))
-        if oldest_row and oldest_row["ts"] is not None else None
-    )
-
-    return {
-        "by_status": by_status,
-        "by_assignee": by_assignee,
-        "oldest_ready_age_seconds": oldest_ready_age,
-        "now": now,
-    }
-
-
-def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
-    """``{assignee: {status: n}}`` over non-archived tasks."""
-    counts: dict[str, dict[str, int]] = {}
-    for row in conn.execute(
-        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
-        "GROUP BY assignee, status"
-    ):
-        counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
-    return counts
-
-
-def _to_epoch(val) -> Optional[int]:
-    """Epoch seconds from int/float/numeric string/ISO-8601; None for empty/invalid."""
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return int(val)
-    s = str(val).strip()
-    if not s:
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    # ISO-8601 fallback (e.g. '2026-05-10T15:00:00Z')
-    try:
-        from datetime import datetime
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return int(dt.timestamp())
-    except (ValueError, OSError):
-        return None
-
-
-def task_age(task: Task) -> dict:
-    """Return age metrics for a single task. All values are seconds or None."""
-    now = int(time.time())
-    _c = _to_epoch(task.created_at)
-    _s = _to_epoch(task.started_at)
-    _co = _to_epoch(task.completed_at)
-    return {
-        "created_age_seconds": now - _c if _c is not None else None,
-        "started_age_seconds": now - _s if _s is not None else None,
-        "time_to_complete_seconds": _co - (_s or _c) if _co is not None else None,
-    }
-
-
-# --- Retention + garbage collection ---
-
-def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion."""
-    cutoff = int(time.time()) - int(older_than_seconds)
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
         )
     return int(cur.rowcount or 0)
 
@@ -4916,25 +4702,6 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
 # materializes a ``pending`` inbox row. The poller leases -> acks a row so
 # exactly one same-profile session reports it, with the live origin session
 # owning delivery while present.
-
-
-def _normalize_captain_profile(profile: Optional[str]) -> str:
-    """Canonicalize a Captain owner profile.
-
-    Uses the same :func:`hermes_cli.profiles.normalize_profile_name` canonical
-    id used on disk and in ``-p`` argv, so mixed-case / title-cased inputs
-    (``Otto``, ``Default``) resolve to one owner (``otto``, ``default``) across
-    registration, materialization, lease/read, filters, and probes. An empty
-    profile maps to ``default``.
-    """
-    name = str(profile or "").strip()
-    if not name:
-        return "default"
-    try:
-        from hermes_cli.profiles import normalize_profile_name
-        return normalize_profile_name(name)
-    except Exception:
-        return name.lower()
 
 
 def register_captain_owner(
