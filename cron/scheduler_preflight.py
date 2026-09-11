@@ -208,12 +208,45 @@ class SharedRouteAdapters:
         return default
 
 
+def _blocked_config_result(job_id, job_name, reason, *, mandatory=False):
+    """Shared persisted alert-once result for both optional preflight and mandatory route checks."""
+    logger.warning(
+        "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
+        job_name, job_id, reason)
+    already_alerted = False
+    try:
+        from cron.jobs import mark_preflight_alerted
+        already_alerted = mark_preflight_alerted(job_id)
+    except Exception:
+        logger.debug("Job '%s': could not persist preflight alert marker", job_id, exc_info=True)
+    marker = BLOCKED_CONFIG_SILENT_MARKER if already_alerted else BLOCKED_CONFIG_MARKER
+    blocked_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_sched._hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"**Status:** BLOCKED (configuration)\n\n"
+        "Pre-dispatch validation found a configuration problem and "
+        "the agent was NOT run (no tokens spent).\n\n"
+        f"**Reason:** {reason}\n\n"
+        "The job will stay blocked (without re-alerting) until the "
+        "configuration is fixed; the next healthy run clears this "
+        "state."
+        + (" This route safety check cannot be disabled by cron.preflight." if mandatory else
+           " Set `cron.preflight: false` in config.yaml to disable this validation.")
+    )
+    return False, blocked_doc, "", f"{marker} {reason}"
+
+
 def _preflight_check_delivery(job: dict) -> Optional[str]:
     """Check delivery targets resolve to configured platforms. ``local``/``origin``/``all`` are
     never checked (no gateway-config load). Unknown platform always blocks; known platform blocks
     only if the gateway config loads AND reports it unconnected; config load failures fail OPEN.
     ``failure_deliver`` gets the same rules — a typo'd failure platform would otherwise only
     surface when a failure occurs (NS-788)."""
+    from cron.delivery_routes import check_explicit_delivery
+    route_error, covered = check_explicit_delivery(job)
+    if route_error:
+        return route_error
     deliver_value = _delivery._normalize_deliver_value(job.get("deliver", "local"))
     failure_deliver_value = _delivery._normalize_deliver_value(
         _delivery._delivery_lane_value(job, for_failure=True))
@@ -229,7 +262,10 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
             if _delivery.parse_bot_chat_deliver_token(part) is not None:
                 continue
-            platform_parts.append(part.split(":", 1)[0].strip())
+            p = part.split(":", 1)[0].strip()
+            if p.lower() in covered:
+                continue
+            platform_parts.append(p)
     if not platform_parts:
         return None
 

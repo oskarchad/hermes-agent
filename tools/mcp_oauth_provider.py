@@ -37,7 +37,7 @@ class HermesProviderMixin:
         self._hermes_token_user_agent = token_user_agent
 
     async def _perform_authorization(self):
-        info = self.context.client_info
+        info = getattr(self, "context", None) and self.context.client_info
         grants = getattr(info, "grant_types", None) or []
         if (getattr(self, "_hermes_oauth_flow", "browser") == "device"
                 or ("urn:ietf:params:oauth:grant-type:device_code" in grants and "authorization_code" not in grants)):
@@ -45,7 +45,13 @@ class HermesProviderMixin:
             raise OAuthNonInteractiveError(
                 "MCP device authorization requires `hermes mcp login <server> --flow device`; "
                 "background reconnects cannot start a device login")
-        return await super()._perform_authorization()
+        from mcp.client.auth import OAuthFlowError
+        try:
+            return await super()._perform_authorization()
+        except OAuthFlowError as exc:
+            if str(exc).startswith("State parameter mismatch:"):
+                raise OAuthFlowError("OAuth state parameter mismatch") from None
+            raise
 
     def _prepare_token_request(self, request):
         """Stamp the configured User-Agent onto a token/refresh request."""

@@ -1577,6 +1577,10 @@ DEFAULT_CONFIG = {
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
         "deny": [],
+        # Opt-in command-aware selectors that match executable commands rather than
+        # whole-text globs, preventing false-positive matches in quoted PR descriptions.
+        # Supported values: 'gh pr merge', 'git push main'.
+        "deny_commands": [],
         # /reload-mcp confirms before rebuilding the MCP tool set (it invalidates the prompt cache,
         # so the next message re-sends full input). "Always Approve" → false.
         "mcp_reload_confirm": True,

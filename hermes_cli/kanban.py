@@ -63,11 +63,10 @@ def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict
     return ({} if st is None else {"state_type": st, "state_name": sn}), 0
 
 
-def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``.
-    Omitted -> ``(None, None)`` so ``create_task`` can tell "default" from an explicit scratch."""
+def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
+    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``."""
     if not value:
-        return (None, None)
+        return ("scratch", None)
     v = value.strip()
     if v in {"scratch", "worktree"}:
         return (v, None)
@@ -192,7 +191,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: unknown action {action!r}", 2)
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError, PermissionError) as exc:
+        except (ValueError, RuntimeError) as exc:
             return _err(f"kanban: {exc}")
 
 
@@ -216,13 +215,12 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
     "gc",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
-    "set-default-workdir", "import",
+    "set-default-workdir",
 })
 
 
@@ -342,8 +340,6 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
-    from agent.delegation_context import is_dispatcher_owned_worker_context
-
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -368,14 +364,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
+            enabled_toolsets=getattr(args, "enabled_toolsets", None) or None,
             max_retries=max_retries, model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
-            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
-                             if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -597,6 +591,33 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_set_toolsets(args: argparse.Namespace) -> int:
+    if args.clear and args.toolsets:
+        return _err("kanban: --clear cannot be combined with toolset names", 2)
+    requested = None if args.clear else list(args.toolsets)
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.set_enabled_toolsets(conn, args.task_id, requested)
+            task = kb.get_task(conn, args.task_id) if ok else None
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok or task is None:
+        return _err(f"no such task: {args.task_id}")
+    if getattr(args, "json", False):
+        _print_json(_task_to_dict(task))
+    elif requested is None:
+        print(
+            f"Cleared toolset override on {args.task_id} "
+            "(worker inherits its profile toolsets)"
+        )
+    else:
+        print(
+            f"Set toolset override on {args.task_id}: "
+            + ",".join(task.effective_toolsets or ())
+        )
+    return 0
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
@@ -744,7 +765,6 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     """Attach a local file via the shared ``store_attachment_bytes`` path (same 25 MB cap and name
     sanitisation as the dashboard upload and agent tool)."""
     import mimetypes
-    _worker_run_id_for(args.task_id)
 
     src = Path(args.path).expanduser()
     if not src.is_file():
@@ -791,9 +811,6 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
-    if env_tid and env_tid != task_id:
-        raise ValueError(f"worker is scoped to task {env_tid}; refusing to mutate {task_id}")
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if os.environ.get("HERMES_KANBAN_TASK") != task_id or not raw:
         return None
@@ -939,8 +956,6 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
-    if os.environ.get("HERMES_KANBAN_TASK"):
-        return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
     ids, rc = _require_ids(args)
     if rc:
         return rc
@@ -1014,13 +1029,13 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     author = _profile_author()
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
-    dry_run = bool(args.dry_run)
+    dry_run, force = bool(args.dry_run), bool(args.force)
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
-            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
+            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, force=force, dry_run=dry_run)
+            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run, "forced": force,
                             "reason": reason, "error": err})
 
     failed = [r for r in results if not r["promoted"]]
@@ -1233,6 +1248,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "set-toolsets": _cmd_set_toolsets,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

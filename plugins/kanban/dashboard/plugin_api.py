@@ -29,7 +29,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
-from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
@@ -264,6 +263,7 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 # --- GET /board -------------------------------------------------------------
 
+@router.get("/board")
 def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
     include_archived: bool = Query(False),
@@ -315,27 +315,6 @@ def get_board(
             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
 
 
-_read_board = coalesced_read(get_board)
-
-
-@router.get("/board")
-async def get_board_endpoint(
-    tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
-    include_archived: bool = Query(False),
-    board: Optional[str] = _BOARD_Q,
-    workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
-    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
-):
-    # Resolve selection before keying so a board switch cannot join an older read.
-    return await _read_board(
-        tenant=tenant,
-        include_archived=include_archived,
-        board=board or kanban_db.get_current_board(),
-        workflow_template_id=workflow_template_id,
-        current_step_key=current_step_key,
-    )
-
-
 # --- GET /tasks/:id ---------------------------------------------------------
 
 @router.get("/tasks/{task_id}")
@@ -376,7 +355,7 @@ class CreateTaskBody(BaseModel):
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
-    workspace_kind: Optional[str] = None  # None = scratch, or the board project's worktree when scoped
+    workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
@@ -687,7 +666,27 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
     return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
 
 
-def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
+class ResumeTaskBody(BaseModel):
+    actor: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/tasks/{task_id}/resume")
+def resume_task(task_id: str, payload: ResumeTaskBody, board: Optional[str] = _BOARD_Q):
+    """Explicit operator continuation, protected by the dashboard's HTTP auth."""
+    if not payload.actor.strip() or not payload.reason.strip():
+        raise HTTPException(status_code=400, detail="actor and reason must be non-blank")
+    with _board_conn(board) as (board, conn):
+        _require_task(conn, task_id)
+        if not _set_status_direct(conn, task_id, "ready", resume=payload):
+            raise _conflict("Resume requires an unclaimed ready/done task with satisfied parents")
+        return {"task": _task_dict(_require_task(conn, task_id))}
+
+
+def _set_status_direct(
+    conn: sqlite3.Connection, task_id: str, new_status: str, *,
+    resume: Optional[ResumeTaskBody] = None,
+) -> bool:
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
@@ -698,6 +697,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             "SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if prev is None:
             return False
+        if resume is not None:
+            if (prev["status"] not in {"ready", "done"} or prev["current_run_id"] is not None
+                    or prev["claim_lock"] is not None or prev["worker_pid"] is not None):
+                return False
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
@@ -726,6 +729,17 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
+        if resume is not None:
+            # This endpoint, unlike an edit or automatic promotion, records an
+            # explicit continuation. Check the real consumer before committing:
+            # same-second PR ambiguity and all non-PR guards still fail closed.
+            kanban_db._append_event(conn, task_id, "promoted_manual", {
+                "actor": resume.actor.strip(), "reason": resume.reason.strip(),
+                "forced": False, "source": "dashboard_resume", "source_status": prev["status"],
+            })
+            guard = kbd.check_respawn_guard(conn, task_id)
+            if guard is not None:
+                raise _conflict(f"Resume refused: {guard}")
         if reopening_satisfied_parent:
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
             # back worker terminations to perform post-commit.

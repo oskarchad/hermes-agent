@@ -46,9 +46,10 @@ def _load_plugin_router():
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
+    """Isolated HOME/HERMES_HOME with an empty kanban DB."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
@@ -65,6 +66,85 @@ def client(kanban_home):
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("source_status", ["ready", "done"])
+def test_explicit_resume_reuses_checkpoint_once(client, monkeypatch, source_status):
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    task = client.post("/api/plugins/kanban/tasks", json={
+        "title": "existing writer", "assignee": "builder",
+    }).json()["task"]
+    tid = task["id"]
+    url = f"/api/plugins/kanban/tasks/{tid}"
+    with kbc.connect() as conn:
+        kb.add_comment(conn, tid, "builder", "https://github.com/example/project/pull/1")
+        if source_status == "done":
+            assert kb.complete_task(conn, tid, summary="checkpoint")
+        child = kb.create_task(conn, title="downstream", assignee="builder", parents=[tid])
+        now += 2
+        if source_status == "ready":
+            assert client.patch(url, json={"status": "ready", "body": "approved brief"}).status_code == 200
+        kb.add_comment(conn, tid, "operator", "continue please")
+        kb.recompute_ready(conn)
+        expected_guard = "recent_success" if source_status == "done" else "active_pr"
+        assert kbd.check_respawn_guard(conn, tid) == expected_guard
+        response = client.post(url + "/resume", json={"actor": "otto", "reason": "Continue approved brief"})
+        assert response.status_code == 200, response.text
+        assert response.json()["task"]["status"] == "ready"
+        assert kbd.check_respawn_guard(conn, tid) is None
+        assert kb.get_task(conn, child).status == "todo"
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.id == tid and claimed.assignee == "builder"
+        assert kb.claim_task(conn, tid) is None
+        assert client.post(url + "/resume", json={"actor": "otto", "reason": "Again"}).status_code == 409
+        assert kb.block_task(conn, tid, reason="dependency wait", kind="dependency")
+        kb.recompute_ready(conn)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        assert conn.execute("SELECT body FROM task_comments WHERE task_id = ? ORDER BY id", (tid,)).fetchone()[0].endswith("/pull/1")
+
+
+@pytest.mark.parametrize("gate", ["parent", "claim", "teardown", "auth", "cooldown", "blank_actor", "blank_reason", "same_second"])
+def test_resume_preserves_non_pr_gates(client, monkeypatch, gate):
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    tid = client.post("/api/plugins/kanban/tasks", json={
+        "title": "checkpoint", "assignee": "builder",
+    }).json()["task"]["id"]
+    with kbc.connect() as conn:
+        kb.add_comment(conn, tid, "builder", "https://github.com/example/project/pull/1")
+        if gate != "same_second":
+            now += 2
+        if gate == "parent":
+            parent = kb.create_task(conn, title="unfinished", assignee="builder")
+            kb.link_tasks(conn, parent, tid)
+        elif gate == "claim":
+            assert kb.claim_task(conn, tid) is not None
+        elif gate == "teardown":
+            monkeypatch.setattr(kbd, "_handoff_worker_teardown_pending", lambda *_: True)
+        elif gate in {"auth", "cooldown"}:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET last_failure_error = 'unauthorized' WHERE id = ?", (tid,))
+                if gate == "cooldown":
+                    conn.execute(
+                        "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at) "
+                        "VALUES (?, 'builder', 'ready', 'rate_limited', ?, ?)", (tid, now, now),
+                    )
+        before_task = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+        before = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
+        payload = {"actor": "otto", "reason": "Continue approved brief"}
+        if gate == "blank_actor":
+            payload["actor"] = "  "
+        if gate == "blank_reason":
+            payload["reason"] = "  "
+        response = client.post(f"/api/plugins/kanban/tasks/{tid}/resume", json=payload)
+        assert response.status_code in {400, 409, 422}, response.text
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] == before
+        assert dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()) == before_task
 
 
 def test_board_empty(client):

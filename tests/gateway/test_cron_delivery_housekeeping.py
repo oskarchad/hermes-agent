@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import cron.scheduler as scheduler
 from cron import scheduler_preflight as sched_preflight
 import gateway.run as gateway_run
+import gateway.run_cron_delivery as cron_delivery
 
 
 class _OneTickStopEvent:
@@ -145,7 +146,7 @@ def test_multiplex_housekeeping_uses_primary_routes_for_credentialless_satellite
         lambda adapters, _loop: calls.append(("drain", adapters)),
     )
 
-    gateway_run._drain_restart_safe_cron_deliveries(
+    cron_delivery._drain_restart_safe_cron_deliveries(
         root_adapters, object(), runner
     )
 

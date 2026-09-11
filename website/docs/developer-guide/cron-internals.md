@@ -14,6 +14,8 @@ The cron subsystem provides scheduled task execution — from simple one-shot de
 |------|---------|
 | `cron/jobs.py` | Job model, storage, atomic read/write to `jobs.json` |
 | `cron/scheduler.py` | Scheduler loop — due-job detection, execution, repeat tracking |
+| `cron/scheduler_worker.py` | Restart-safe subprocess launch and payload adoption |
+| `gateway/run_cron_delivery.py` | Live gateway drain of restart-safe delivery queues |
 | `tools/cronjob_tools.py` | Model-facing `cronjob` tool registration and handler |
 | `gateway/run.py` | Gateway integration — cron ticking in the long-running loop |
 | `hermes_cli/cron.py` | CLI `hermes cron` subcommands |
@@ -231,16 +233,6 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 
 This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
 
-On timeout or ownership cancellation, `cron.scheduler_script` uses the shared
-`agent.deadline.kill_process_tree` hard-kill path. On POSIX it briefly stops and
-rescans the live tree before signalling descendants and their parent, including
-children in separate sessions with no inherited output pipes. This closes the
-fork-after-snapshot race. The stop wait is bounded; discovery or permission
-failures still use best-effort group cleanup, not a sandbox guarantee. Any target
-stopped by cleanup is resumed if termination fails; already-stopped targets keep
-their original state. Explicit graceful signals do not suspend their recipients.
-Windows continues to use `taskkill /F /T`.
-
 ### Provider Recovery
 
 `run_job()` passes the user's configured fallback providers and credential pool into the `AIAgent` instance:
@@ -286,7 +278,45 @@ Platforms in the first group have explicit, validated target syntax — named ch
 
 For **Telegram topics**, use `telegram:<chat_id>:<thread_id>` (e.g., `telegram:-1001234567890:17585`). For **Slack threads**, the third segment is the parent message's `thread_ts` (e.g., `slack:C0123ABCD45:1700000000.000100`), so it only applies when replying under an existing message.
 
-**Bot Chat** (`bot-chat`, `bot-chat:<profile>`) is a machine-local pseudo-platform, not a gateway adapter. A mailbox-capable canonical live owner receives durable admission immediately (idle or busy); only that owner executes the incoming turn. `scheduler_delivery._deliver_to_bot_chat` resolves the target with `get_profile_dir` or the job's current `get_hermes_home`, derives the receipt ID from the source home, job ID, durable `execution_id`, and target home, and checks the receipt before discovering an owner. An existing receipt never permits CLI fallback. Without a mailbox owner it retains `hermes [-p <profile>] chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file <tmp>` and normal ownership fencing. Both lanes deliver a real inbound turn, not a transcript mirror. Queued/claimed receipts populate `last_delivery_queued` with receipt IDs. The delivery aggregator excludes admission notices from genuine errors and records execution `delivery_outcome=queued`; successful jobs use `last_status=delivery_queued`. Genuine errors on mixed targets take precedence as failed while retaining queued receipt metadata. The target profile’s durable receipt is authoritative for terminal completion. Queued is the historical admission outcome, not proof of delivery. Historical cron status does not automatically track later receipt completion. Bot-chat targets are excluded from `all` and credential preflight. Bot-chat-only external workers bypass the gateway delivery queue; mixed external-worker targets retain gateway handoff. `cron.bot_chat_delivery_timeout_seconds` (default 600) bounds only the legacy subprocess lane.
+**Bot Chat** (`bot-chat`, `bot-chat:<profile>`) is a machine-local pseudo-platform, not a gateway adapter: the scheduler delivers by running `hermes [-p <profile>] chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file <tmp>` — the same lane Bot Mode agent-to-agent messages use — so the output arrives as a real inbound turn in the profile's canonical Bot Chat and the bot runs a full agent turn on it (alternation-safe by construction; this is the chat command lane, not a transcript mirror). The bare token targets the job's own profile; the named form is validated against `~/.hermes/profiles/` at create time and again at fire time, and never resolves across machines. Bot-chat targets are excluded from the `all` routing token and from delivery preflight (no gateway credentials involved). The per-delivery subprocess timeout is `cron.bot_chat_delivery_timeout_seconds` (default 600).
+
+### Explicit cross-profile final-hop delivery
+
+In the **job-owning home's** `config.yaml`, an optional list binds an exact
+resolved target to an already-connected multiplex profile adapter:
+
+```yaml
+cron:
+  delivery_routes:
+    - platform: discord
+      chat_id: '1546483397059420210'
+      adapter_profile: otto
+```
+
+The gateway must already serve that profile through its existing multiplex
+allowlist. `cron/delivery_routes.py` supplies the same adapter selection to the
+ticker and `gateway/run_cron_delivery.py`. This is transport-only: no profile
+config or token inheritance, job move, new queue, thread creation, or session
+ownership transfer. Use literal string IDs; wildcard, duplicate, malformed and
+thread-specific mappings are rejected. A target containing a thread ID does not
+match a channel-only binding. Unbound targets retain own-adapter and
+satellite-to-primary routing. An absent/empty list preserves existing behavior.
+
+Before any job side effect, explicit routes require an enabled, connected,
+allowed adapter. The restart-safe worker handoff carries only secret-free
+route/gate evidence captured at dispatch, not an adapter or credentials. The
+worker validates this evidence against its owning-home mapping. This safety
+check also applies to script-only jobs and when optional `cron.preflight` is off.
+CLI/manual execution without live adapter evidence fails closed for bound routes.
+
+Final delivery resolves the current adapter and allowlist again. Dispatch intent
+is retained only in the attempt's existing delivery-queue payload (never the job
+registry), so removing/rebinding a route while a worker is running cannot fall
+through to another bot. A missing/disconnected/disallowed adapter or failed live
+send never retries with standalone credentials. Dispatch evidence is not final
+send authorization. No Discord/Slack API is contacted by the regression suite;
+it exercises real worker launch/adoption, preflight, durable queue and gateway
+drain in temporary homes, with an in-memory platform transport.
 
 ### Response Wrapping
 
@@ -327,6 +357,6 @@ hermes cron remove <job_id>         # Delete a job
 
 ## Related Docs
 
-- [Cron Feature Guide](/user-guide/features/cron)
+- [Cron Feature Guide](../user-guide/features/cron.md)
 - [Gateway Internals](./gateway-internals.md)
 - [Agent Loop Internals](./agent-loop.md)

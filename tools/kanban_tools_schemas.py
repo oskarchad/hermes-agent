@@ -447,6 +447,17 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "assignee's profile."
             ),
         },
+        "enabled_toolsets": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {"type": "string", "maxLength": 128},
+            "description": (
+                "Optional bounded task-level toolset allowlist. The "
+                "dispatcher adds mandatory lifecycle toolsets and passes "
+                "only the effective list to the worker. Omit to inherit "
+                "the assignee profile's normal CLI toolsets."
+            ),
+        },
         "goal_mode": _prop("boolean", (
                 "Run the dispatched worker in a goal loop. When true, "
                 "after each turn an auxiliary judge checks the worker's "
@@ -457,10 +468,6 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "blocks the task for human review). Use this for "
                 "open-ended cards where one shot rarely finishes the "
                 "work. Defaults to false (classic single-shot worker)."
-        )),
-        "completion_contract": _prop("string", (
-            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
-            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
