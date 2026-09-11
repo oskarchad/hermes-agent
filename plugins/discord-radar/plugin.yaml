@@ -1,0 +1,8 @@
+name: discord-radar
+version: 1.0.0
+description: "Discord Radar blocker observer and trusted bot ingress admission plugin"
+author: "NousResearch / Wrench"
+kind: backend
+capabilities: []
+hooks:
+  - pre_gateway_dispatch

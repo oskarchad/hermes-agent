@@ -444,28 +444,12 @@ class GatewayAuthorizationMixin:
                 adapter_group_allowed = self._adapter_extra_for_source(source).get("group_allowed_chats")
                 if adapter_group_allowed and _allows(_coerce_allow_set(adapter_group_allowed), source.chat_id):
                     return True
-        # Bots admitted by {PLATFORM}_ALLOW_BOTS or {PLATFORM}_ALLOWED_BOTS bypass the human allowlist (Slack Workflow Builder
+        # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (Slack Workflow Builder
         # posts arrive with user=None).
         if getattr(source, "is_bot", False):
             allow_bots_var = _ALLOW_BOTS_ENV.get(source.platform)
             if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
-            if source.platform == Platform.DISCORD:
-                allowed_bots_env = _platform_gate_env("DISCORD_ALLOWED_BOTS", "")
-                allowed_bot_ids = set()
-                if allowed_bots_env:
-                    allowed_bot_ids |= {part.strip() for part in allowed_bots_env.split(",") if part.strip()}
-                adapter = self._adapter_for_source(source)
-                if adapter is not None and hasattr(adapter, "_discord_allowed_bots"):
-                    with contextlib.suppress(Exception):
-                        allowed_bot_ids |= adapter._discord_allowed_bots()
-                else:
-                    adapter_extra = self._adapter_extra_for_source(source)
-                    raw_extra_bots = adapter_extra.get("allowed_bots")
-                    if raw_extra_bots:
-                        allowed_bot_ids |= _coerce_allow_set(raw_extra_bots)
-                if source.user_id and str(source.user_id) in allowed_bot_ids:
-                    return True
         return False
 
     def _legacy_telegram_chat_grant(self, source, group_user_allowlist: str) -> bool:

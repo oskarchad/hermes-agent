@@ -1,11 +1,12 @@
-"""Hook controls; full REST/provider/restart flow is in test_discord_blocker_hook_red.
-
-The former sender_fn/thread_reader fixtures bypassed the authoritative list,
-provider and receipt path; those cases now exercise network edges there.
-"""
+"""Hook controls and unit contracts for discord-radar plugin."""
 import json
+from pathlib import Path
+import pytest
 
-from cron.discord_blocker_hook import run_discord_blocker_hook
+from tests.plugins.conftest import load_discord_radar_module
+
+radar_mod = load_discord_radar_module()
+run_discord_blocker_hook = radar_mod.run_discord_blocker_hook
 
 
 def test_disabled_preserves_list_and_sidecar_without_network(tmp_path, monkeypatch):

@@ -1127,9 +1127,6 @@ class GatewaySlashCommandsMixin(
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
         signalling the event resumes them so the command executes inline (same flow as the CLI)."""
-        if getattr(event, "allow_gateway_control", True) is False or getattr(event.source, "is_bot", False):
-            logger.warning("Rejecting /approve from non-controlling/bot event (source=%s)", event.source)
-            return None
         from tools.approval import resolve_gateway_approval
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.approval_expired",
                                                               "gateway.approve.no_pending")
@@ -1153,9 +1150,6 @@ class GatewaySlashCommandsMixin(
         ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line reason that is relayed back to
         the agent so it can adapt instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
         """
-        if getattr(event, "allow_gateway_control", True) is False or getattr(event.source, "is_bot", False):
-            logger.warning("Rejecting /deny from non-controlling/bot event (source=%s)", event.source)
-            return ""
         from tools.approval import resolve_gateway_approval
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.deny.stale",
                                                               "gateway.deny.no_pending")

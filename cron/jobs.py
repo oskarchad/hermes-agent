@@ -1580,7 +1580,6 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
-    "post_run_hook": lambda v: v if (isinstance(v, (str, dict)) and v) else None,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
@@ -1697,7 +1696,6 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
-    post_run_hook: Optional[Union[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1761,7 +1759,6 @@ def create_job(
         "monitor_url": f["monitor_url"],
         "monitor_state": None,
         "context_from": f["context_from"],
-        "post_run_hook": f.get("post_run_hook"),
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {"times": repeat, "completed": 0},  # times None = forever

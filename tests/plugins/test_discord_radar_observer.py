@@ -1,6 +1,9 @@
-"""Evidence-only observer contracts. Discord payloads, never display-name authority."""
+"""Evidence-only observer contracts for discord-radar plugin. Discord payloads, never display-name authority."""
 import pytest
-from hermes_cli.discord_blocker_observer import DiscordBlockerObserver
+from tests.plugins.conftest import load_discord_radar_module
+
+radar_mod = load_discord_radar_module()
+DiscordBlockerObserver = radar_mod.DiscordBlockerObserver
 
 
 def state(content="**Zablokowane**\n☐ A — czeka → <#100>"):
@@ -39,14 +42,14 @@ def test_text_or_display_name_never_proves_action(text):
 
 
 def test_response_retains_source_time_and_delivery_correlation_without_settlement(monkeypatch):
-    monkeypatch.setattr("hermes_cli.discord_blocker_observer.time.time", lambda: 200)
+    monkeypatch.setattr("hermes_plugins.discord_radar.observer.time.time", lambda: 200)
     o = DiscordBlockerObserver(target_bot_id="777")
     o.evaluate(state(), lambda _: [message()], known)
     rec = o._history["A"]
     rec.pop("pending_suggestion")
     rec["delivery_receipt"] = {"id": "250", "author_id": o.observer_bot_id, "delivered_at": 150,
                                "revision": rec["revision"], "episode": rec["episode"]}
-    response = message("301", "777", "ACK; not executed", "2026-09-09T20:00:00Z")
+    response = message("301", "777", "ACK; not executed", 200)
     response["message_reference"] = {"message_id": "250", "channel_id": "100"}
     report = o.evaluate(state(), lambda _: [message(), response], known)
     assert not report.settled_topics and report.model_calls == 0
@@ -56,7 +59,7 @@ def test_response_retains_source_time_and_delivery_correlation_without_settlemen
 
 
 def test_known_analysis_persists_bounded_context_and_pending_not_sent(monkeypatch):
-    monkeypatch.setattr("hermes_cli.discord_blocker_observer.time.time", lambda: 150)
+    monkeypatch.setattr("hermes_plugins.discord_radar.observer.time.time", lambda: 150)
     contexts = []
     def evaluate(context):
         contexts.append(context)
@@ -77,7 +80,7 @@ def test_known_analysis_persists_bounded_context_and_pending_not_sent(monkeypatc
                                       {"status": "unknown", "reason": "unknown", "evidence_ids": []}])
 def test_unknown_or_invalid_never_suggests_and_failure_is_retryable(result, monkeypatch):
     clock = [150]
-    monkeypatch.setattr("hermes_cli.discord_blocker_observer.time.time", lambda: clock[0])
+    monkeypatch.setattr("hermes_plugins.discord_radar.observer.time.time", lambda: clock[0])
     o = DiscordBlockerObserver()
     r = o.evaluate(state(), lambda _: [message()], lambda _: result)
     assert not r.suggestions

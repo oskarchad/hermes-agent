@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
-from hermes_cli.discord_blocker_observer import (
+from .observer import (
     DiscordBlockerObserver, ObserverReport, MODEL, PROVIDER, RADAR_ID,
     author_id, timestamp, validate_analysis, validate_history,
 )

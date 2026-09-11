@@ -1,4 +1,4 @@
-"""Real store/scheduler/scoped resolver/hook/REST serializer, network edges only mocked."""
+"""Real store/scheduler/scoped resolver/hook/REST serializer, network edges only mocked for discord-radar."""
 import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -6,10 +6,12 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from cron.discord_blocker_hook import run_discord_blocker_hook
+from tests.plugins.conftest import load_discord_radar_module
 
-RADAR = "1547333242502520872"
-MODEL = "ag/gemini-3.8-flash-high"
+radar_mod = load_discord_radar_module()
+run_discord_blocker_hook = radar_mod.run_discord_blocker_hook
+RADAR_ID = radar_mod.RADAR_ID
+MODEL = radar_mod.MODEL
 
 
 @pytest.fixture
@@ -17,7 +19,7 @@ def pipeline(tmp_path, monkeypatch, request):
     from agent.secret_scope import set_multiplex_active
     from gateway.run import _profile_runtime_scope
     clock = [1800000000.0]
-    monkeypatch.setattr("hermes_cli.discord_blocker_observer.time.time", lambda: clock[0])
+    monkeypatch.setattr("hermes_plugins.discord_radar.observer.time.time", lambda: clock[0])
     home = tmp_path / "otto"
     home.mkdir()
     (home / "config.yaml").write_text("custom_providers:\n  - name: 9router\n    base_url: http://router.invalid/v1\n    key_env: NINEROUTER_API_KEY\n")
@@ -38,14 +40,14 @@ def pipeline(tmp_path, monkeypatch, request):
         method = req.get_method(); url = req.full_url
         env["calls"].append((method, url))
         if url.endswith("/users/@me"):
-            data = {"id": RADAR, "bot": True}
+            data = {"id": RADAR_ID, "bot": True}
         elif url.endswith("/channels/900/messages/901"):
             data = {"id": "901", "channel_id": "900", "author": {"id": "777"}, "content": env["list"]}
         elif method == "POST":
             env["posts"].append(json.loads(req.data))
             if env["fail_send"]:
                 raise OSError("send failed")
-            data = msg(max(300, *(int(m["id"]) for m in env["messages"])) + 1, RADAR, json.loads(req.data)["content"])
+            data = msg(max(300, *(int(m["id"]) for m in env["messages"])) + 1, RADAR_ID, json.loads(req.data)["content"])
             env["messages"].insert(0, data)
         elif "/messages?" in url:
             data = env["messages"].copy()
@@ -101,7 +103,7 @@ def test_real_pipeline_failed_send_restart_echo_ack_deadline(pipeline):
     e["fail_send"] = False; e["clock"][0] += 600
     assert not run(e).errors
     rec = history(e)["A"]
-    assert rec["delivery_receipt"]["delivered_at"] == e["clock"][0] and rec["delivery_receipt"]["author_id"] == RADAR
+    assert rec["delivery_receipt"]["delivered_at"] == e["clock"][0] and rec["delivery_receipt"]["author_id"] == RADAR_ID
     assert rec["cursor"] == "203"
     assert len(e["models"]) == 1 and len(e["posts"]) == 2
     for text in ["ACK", "Nie wykonano kanban_unblock", "Wznawiam przez kanban_unblock"]:
@@ -154,22 +156,6 @@ def test_unknown_error_and_corruption(pipeline):
     sidecar.write_text("{")
     assert run(e).errors and len(e["models"]) == 1
     assert sidecar.read_text() == "{"
-
-
-def test_scheduler_separate_hook_failure_ledger(pipeline):
-    from cron.jobs import create_job
-    from cron.executions import create_execution, get_execution, list_executions
-    from cron.scheduler import _finish_completed_run, _RunDelivery
-    e = pipeline
-    e["result"] = {}
-    job = create_job(prompt="list updater", schedule="every 10m", deliver="local", post_run_hook={
-        "target": "cron.discord_blocker_hook:run_discord_blocker_hook", "kwargs": {"state_file_path": str(e["path"]), "target_bot_id": "777"}})
-    execution = create_execution(job["id"], source="direct")
-    assert _finish_completed_run(_RunDelivery(job=job, success=True, error=None), None, execution["id"])
-    assert get_execution(execution["id"])["status"] == "completed"
-    rows = list_executions(job_id=job["id"])
-    hook = [r for r in rows if r["source"] == "post_run_hook:" + execution["id"]]
-    assert len(hook) == 1 and hook[0]["status"] == "failed"
 
 
 def test_disabled_and_dry_run_no_spend_or_state_mutation(pipeline):
@@ -240,7 +226,7 @@ def test_unknown_ack_echo_and_mixed_correction_restart(pipeline):
     assert run(e).model_calls == 1
     before = history(e)["A"]
     assert run(e).model_calls == 0
-    e["messages"].insert(0, e["msg"](400, RADAR, "observer echo"))
+    e["messages"].insert(0, e["msg"](400, RADAR_ID, "observer echo"))
     assert run(e).model_calls == 0
     e["messages"].insert(0, e["msg"](500, "777", "ACK"))
     assert run(e).model_calls == 0
