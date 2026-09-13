@@ -32,65 +32,11 @@ from toolsets import (
     get_toolset_names,
 )
 
+_log = logging.getLogger(__name__)
+
 MAX_TASK_ENABLED_TOOLSETS = 32
 MAX_TASK_TOOLSET_NAME_CHARS = 128
 MANDATORY_TASK_TOOLSETS = MANDATORY_KANBAN_TASK_TOOLSETS
-
-_log = logging.getLogger(__name__)
-
-
-# --- Shared micro-helpers (row access, JSON, env, git) ---
-
-def _row_get(row: Any, col: str, default: Any = None) -> Any:
-    """``row[col]`` tolerant of the column being absent from the SELECT / schema."""
-    if row is None or col not in row.keys():
-        return default
-    return row[col]
-
-
-def _json_or(value: Any, default: Any = None) -> Any:
-    """Decode a JSON text column; any decode failure or empty value yields ``default``."""
-    if not value:
-        return default
-    try:
-        return json.loads(value)
-    except Exception:
-        return default
-
-
-def _json_dict(value: Any) -> dict:
-    """Decode a JSON text column that must be an object; anything else yields ``{}``."""
-    parsed = _json_or(value, {})
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
-    """Integer env override: absent/empty/non-integer/below ``minimum`` falls back to ``default``."""
-    raw = os.environ.get(name, "").strip()
-    if raw:
-        try:
-            parsed = int(raw)
-        except ValueError:
-            return default
-        if parsed >= minimum:
-            return parsed
-    return default
-
-
-def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
-    """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(cwd), *args],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, check=False,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    return (result.stdout or "").strip() or None
-
 
 
 def _profile_home_for_task(assignee: Optional[str]) -> Optional[str]:
@@ -207,6 +153,59 @@ def effective_task_toolsets(requested: Optional[Iterable[str]]) -> Optional[list
         if name not in effective:
             effective.append(name)
     return effective
+
+
+# --- Shared micro-helpers (row access, JSON, env, git) ---
+
+def _row_get(row: Any, col: str, default: Any = None) -> Any:
+    """``row[col]`` tolerant of the column being absent from the SELECT / schema."""
+    if row is None or col not in row.keys():
+        return default
+    return row[col]
+
+
+def _json_or(value: Any, default: Any = None) -> Any:
+    """Decode a JSON text column; any decode failure or empty value yields ``default``."""
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def _json_dict(value: Any) -> dict:
+    """Decode a JSON text column that must be an object; anything else yields ``{}``."""
+    parsed = _json_or(value, {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    """Integer env override: absent/empty/non-integer/below ``minimum`` falls back to ``default``."""
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return default
+        if parsed >= minimum:
+            return parsed
+    return default
+
+
+def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
+    """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip() or None
 
 
 # --- Constants ---
@@ -858,7 +857,6 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
-    completion_contract: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -866,11 +864,7 @@ class Task:
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
         parsed_toolsets = _json_or(g("enabled_toolsets"))
-        enabled_toolsets_value = (
-            [str(s) for s in parsed_toolsets if s]
-            if isinstance(parsed_toolsets, list)
-            else None
-        )
+        enabled_toolsets_value = [str(s) for s in parsed_toolsets if s] if isinstance(parsed_toolsets, list) else None
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS if col != "enabled_toolsets"},
@@ -887,8 +881,6 @@ class Task:
         )
 
 
-
-
 # Columns every schema version has (KeyError if the SELECT omitted them).
 _TASK_REQUIRED_COLUMNS = (
     "id", "title", "body", "assignee", "status", "priority", "created_by", "created_at",
@@ -898,7 +890,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "enabled_toolsets", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "enabled_toolsets",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1048,8 +1040,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
     -- Optional bounded toolset allowlist requested for this task. ``None``
-    -- inherits the worker profile's toolsets; non-empty array restricts the
-    -- worker to those toolsets plus mandatory lifecycle surfaces.
+    -- preserves legacy profile inheritance.
     enabled_toolsets     TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
@@ -1188,7 +1179,6 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
-    last_ping_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -1240,7 +1230,6 @@ CREATE TABLE IF NOT EXISTS kanban_captain_receivers (
 CREATE INDEX IF NOT EXISTS idx_captain_inbox_profile ON kanban_captain_inbox(profile, state);
 CREATE INDEX IF NOT EXISTS idx_captain_registry_prof ON kanban_captain_registry(profile);
 CREATE INDEX IF NOT EXISTS idx_captain_receivers_seen ON kanban_captain_receivers(profile, last_seen);
-
 """
 
 
@@ -1430,25 +1419,6 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
-def _normalize_captain_profile(profile: Optional[str]) -> str:
-    """Canonicalize a Captain owner profile.
-
-    Uses the same :func:`hermes_cli.profiles.normalize_profile_name` canonical
-    id used on disk and in ``-p`` argv, so mixed-case / title-cased inputs
-    (``Otto``, ``Default``) resolve to one owner (``otto``, ``default``) across
-    registration, materialization, lease/read, filters, and probes. An empty
-    profile maps to ``default``.
-    """
-    name = str(profile or "").strip()
-    if not name:
-        return "default"
-    try:
-        from hermes_cli.profiles import normalize_profile_name
-        return normalize_profile_name(name)
-    except Exception:
-        return name.lower()
-
-
 def resolve_captain_profile() -> str:
     """Resolve the configured logical Captain for a newly rooted task tree."""
     try:
@@ -1498,6 +1468,8 @@ def _resolve_captain_ownership(
         if len(tenants) > 1:
             raise ValueError("parent tasks have conflicting Captain tenants")
         inherited_tenant = next(iter(tenants), None)
+        if tenant and inherited_tenant and str(tenant) != inherited_tenant:
+            raise ValueError("child tenant conflicts with parent Captain tenant")
         return (
             next(iter(profiles)),
             next(iter(origins), None),
@@ -1511,7 +1483,7 @@ def _resolve_captain_ownership(
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
-    workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
+    workspace_kind: str = "scratch", workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
@@ -1521,8 +1493,6 @@ def create_task(
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
-    creator_task_id: Optional[str] = None,
-    completion_contract: Optional[str] = None,
     captain_profile: Optional[str] = None,
     captain_origin_session_key: Optional[str] = None,
 ) -> str:
@@ -1534,17 +1504,9 @@ def create_task(
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
     SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
-    ``creator_task_id``: inherit durable session/subscriptions independently of
-    dependency edges; an explicit ``session_id`` still wins.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
-    ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
-    an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
     """
-    from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
-    from hermes_cli.kanban_pr_acceptance import validate_contract
-
-    completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1552,17 +1514,6 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
-    # A project-scoped board anchors every new task to its project's repo
-    # (deterministic worktree + branch) without each surface repeating it.
-    # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
-    # it must not be upgraded to a worktree in the board's repo (#106342).
-    if project_id is None and workspace_kind != "scratch":
-        try:
-            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
-        except Exception:
-            pass
-    if workspace_kind is None:
-        workspace_kind = "scratch"
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -1572,6 +1523,14 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+
+    # A project-scoped board anchors every new task to its project's repo
+    # (deterministic worktree + branch) without each surface repeating it.
+    if project_id is None:
+        try:
+            project_id = (_board_meta_for(board).get("project_id") or "").strip() or None
+        except Exception:
+            pass
 
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
@@ -1585,7 +1544,6 @@ def create_task(
         tenant=tenant,
     )
     skills_list = _normalize_task_skills(skills)
-
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
@@ -1618,7 +1576,7 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
-                task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
+                task_status = _initial_task_status(conn, parents, initial_status, triage)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
@@ -1636,8 +1594,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, enabled_toolsets, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1647,11 +1605,13 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         json.dumps(enabled_toolsets_list) if enabled_toolsets_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
-                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id,
                     ),
                 )
                 for pid in parents:
                     _link(conn, pid, task_id)
+                from hermes_cli.kanban_governance import bind_created_tx
+                bind_created_tx(conn, task_id, parents)
                 _append_event(
                     conn,
                     task_id,
@@ -1660,7 +1620,6 @@ def create_task(
                         "assignee": assignee,
                         "status": task_status,
                         "parents": list(parents),
-                        "creator_task_id": creator_task_id,
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
@@ -1668,13 +1627,13 @@ def create_task(
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "enabled_toolsets": enabled_toolsets_list,
+                        "effective_toolsets": effective_task_toolsets(enabled_toolsets_list),
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
                 )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
-                inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             register_captain_owner(
                 conn,
@@ -1692,6 +1651,30 @@ def create_task(
 
 def _board_meta_for(board: Optional[str]) -> dict:
     return read_board_metadata(board if board else get_current_board())
+
+
+def _initial_task_status(
+    conn: sqlite3.Connection, parents: tuple[str, ...], initial_status: str, triage: bool,
+) -> str:
+    """Status for a new task: ``blocked``/``triage`` when parked by the caller,
+    else ``ready`` unless a parent is not yet ``done`` (-> ``todo``). Parent ids
+    are validated in every mode (even triage) so link rows never dangle."""
+    if parents:
+        missing = _missing_task_ids(conn, parents)
+        if missing:
+            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+    if initial_status == "blocked":
+        return "blocked"
+    if triage:
+        return "triage"
+    if parents:
+        rows = conn.execute(
+            "SELECT status FROM tasks WHERE id IN "
+            "(" + ",".join("?" * len(parents)) + ")", parents,
+        ).fetchall()
+        if any(r["status"] != "done" for r in rows):
+            return "todo"
+    return "ready"
 
 
 def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -> Optional[str]:
@@ -1815,6 +1798,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "assign:" + (profile or "")).allowed:
+            return False
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -1884,6 +1870,50 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
     )
 
 
+def set_enabled_toolsets(
+    conn: sqlite3.Connection,
+    task_id: str,
+    enabled_toolsets: Optional[Iterable[str]],
+) -> bool:
+    """Set or clear a bounded task-level worker toolset allowlist."""
+    existing = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not existing:
+        return False
+    normalized = normalize_enabled_toolsets(
+        enabled_toolsets,
+        hermes_home=_profile_home_for_task(existing["assignee"]),
+    )
+    effective = effective_task_toolsets(normalized)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(
+                f"cannot set enabled toolsets on archived task {task_id}"
+            )
+        conn.execute(
+            "UPDATE tasks SET enabled_toolsets = ? WHERE id = ?",
+            (json.dumps(normalized) if normalized is not None else None, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "enabled_toolsets_set",
+            {
+                "inherit_profile": normalized is None,
+                "requested_count": len(normalized or ()),
+                "effective_count": len(effective or ()),
+            },
+        )
+    notify_task_updated(conn, task_id, ("enabled_toolsets",))
+    return True
+
+
 # --- Links ---
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
@@ -1895,6 +1925,8 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
+        from hermes_cli.kanban_governance import bind_linked_tx
+        bind_linked_tx(conn, parent_id, child_id)
         _link(conn, parent_id, child_id)
         # If child was ready but parent is not yet done, demote child to todo.
         if _task_status(conn, parent_id) != "done":
@@ -1923,32 +1955,6 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         ).fetchall()
         stack.extend(r["child_id"] for r in rows)
     return False
-
-
-def set_enabled_toolsets(
-    conn: sqlite3.Connection,
-    task_id: str,
-    toolsets: Optional[Iterable[str]],
-) -> bool:
-    """Set or clear a task's bounded toolset allowlist."""
-    normalized = normalize_enabled_toolsets(toolsets)
-    encoded = json.dumps(normalized) if normalized is not None else None
-    now = int(time.time())
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET enabled_toolsets = ? WHERE id = ?",
-            (encoded, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        _append_event(
-            conn,
-            task_id,
-            "toolsets_override_set",
-            {"enabled_toolsets": normalized},
-            run_id=None,
-        )
-        return True
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -2024,8 +2030,6 @@ def add_comment(
     if not author or not author.strip():
         raise ValueError("comment author is required")
     now = int(time.time())
-    # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
-    # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         _require_task(conn, task_id)
         normalized_author = author.strip()
@@ -2050,6 +2054,68 @@ def add_comment(
                 signal_class=signal_class,
             )
         return comment_id
+
+
+def _classify_captain_signal(body: str) -> Optional[str]:
+    """Recognize a strategic Captain signal header at the start of a comment."""
+    stripped = body.strip()
+    for header, signal_class in CAPTAIN_SIGNAL_HEADERS:
+        if stripped.startswith(header):
+            tail = stripped[len(header):]
+            if not tail or tail[0] in (":", "-", "—", " ", "\n", "\t"):
+                return signal_class
+    return None
+
+
+def materialize_captain_signal(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    comment_id: int,
+    author: str,
+    signal_class: str,
+) -> Optional[int]:
+    """Materialize one durable Captain report for an immutable comment source."""
+    if signal_class not in CAPTAIN_SIGNAL_CLASSES:
+        raise ValueError(f"unknown Captain signal class {signal_class!r}")
+    with write_txn(conn, allow_nested=True):
+        comment = conn.execute(
+            "SELECT 1 FROM task_comments WHERE id = ? AND task_id = ?",
+            (int(comment_id), task_id),
+        ).fetchone()
+        if comment is None:
+            raise ValueError(f"unknown comment {comment_id} for task {task_id}")
+        if conn.execute(
+            "SELECT 1 FROM kanban_captain_registry WHERE task_id = ?",
+            (task_id,),
+        ).fetchone() is None:
+            return None
+        existing = conn.execute(
+            "SELECT event_id FROM kanban_captain_inbox WHERE source_comment_id = ?",
+            (int(comment_id),),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["event_id"])
+        return _append_event(
+            conn,
+            task_id,
+            "captain_signal",
+            {
+                "author": author.strip(),
+                "comment_id": int(comment_id),
+                "signal_class": signal_class,
+            },
+            source_comment_id=int(comment_id),
+        )
+
+
+def get_comment(conn: sqlite3.Connection, comment_id: int) -> Optional[Comment]:
+    """Return one immutable comment source by its board-local id."""
+    row = conn.execute(
+        "SELECT id, task_id, author, body, created_at FROM task_comments WHERE id = ?",
+        (int(comment_id),),
+    ).fetchone()
+    return Comment.from_row(row) if row else None
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -2191,68 +2257,6 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return [Event.from_row(r) for r in _task_rows(conn, "task_events", task_id, "created_at ASC, id ASC")]
-
-
-def _classify_captain_signal(body: str) -> Optional[str]:
-    """Recognize a strategic Captain signal header at the start of a comment."""
-    stripped = body.strip()
-    for header, signal_class in CAPTAIN_SIGNAL_HEADERS:
-        if stripped.startswith(header):
-            tail = stripped[len(header):]
-            if not tail or tail[0] in (":", "-", "—", " ", "\n", "\t"):
-                return signal_class
-    return None
-
-
-def materialize_captain_signal(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    comment_id: int,
-    author: str,
-    signal_class: str,
-) -> Optional[int]:
-    """Materialize one durable Captain report for an immutable comment source."""
-    if signal_class not in CAPTAIN_SIGNAL_CLASSES:
-        raise ValueError(f"unknown Captain signal class {signal_class!r}")
-    with write_txn(conn, allow_nested=True):
-        comment = conn.execute(
-            "SELECT 1 FROM task_comments WHERE id = ? AND task_id = ?",
-            (int(comment_id), task_id),
-        ).fetchone()
-        if comment is None:
-            raise ValueError(f"unknown comment {comment_id} for task {task_id}")
-        if conn.execute(
-            "SELECT 1 FROM kanban_captain_registry WHERE task_id = ?",
-            (task_id,),
-        ).fetchone() is None:
-            return None
-        existing = conn.execute(
-            "SELECT event_id FROM kanban_captain_inbox WHERE source_comment_id = ?",
-            (int(comment_id),),
-        ).fetchone()
-        if existing is not None:
-            return int(existing["event_id"])
-        return _append_event(
-            conn,
-            task_id,
-            "captain_signal",
-            {
-                "author": author.strip(),
-                "comment_id": int(comment_id),
-                "signal_class": signal_class,
-            },
-            source_comment_id=int(comment_id),
-        )
-
-
-def get_comment(conn: sqlite3.Connection, comment_id: int) -> Optional[Comment]:
-    """Return one immutable comment source by its board-local id."""
-    row = conn.execute(
-        "SELECT id, task_id, author, body, created_at FROM task_comments WHERE id = ?",
-        (int(comment_id),),
-    ).fetchone()
-    return Comment.from_row(row) if row else None
 
 
 def _insert_comment(
@@ -2487,6 +2491,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                from hermes_cli.kanban_governance import evaluate_tx
+                if not evaluate_tx(conn, task_id, "promote").allowed:
+                    continue
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2591,6 +2598,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "claim").allowed:
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2624,6 +2634,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "claim_review").allowed:
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2722,6 +2735,7 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
     if run_id is not None:
         conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (expires, run_id))
     return run_id
+
 
 
 _WorkerIdentity = tuple[str, Optional[int], Optional[int], Optional[str]]
@@ -3073,21 +3087,18 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
-    from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
-    if acceptance is False:
-        return False
+    from hermes_cli import kanban_governance as governance
     with write_txn(conn):
+        if not governance.evaluate_tx(conn, task_id, "complete", expected_run_id=expected_run_id).allowed:
+            return False
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False
-        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         prior_status = _task_status(conn, task_id)
         sql = """
@@ -3132,6 +3143,8 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+        governance.record_transition_tx(conn, task_id, "complete", run_id)
+    governance.drain(conn)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
@@ -3541,6 +3554,10 @@ def request_review(
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        disposition = evaluate_tx(conn, task_id, "review", expected_run_id=expected_run_id)
+        if not disposition.allowed:
+            return _ret(False, disposition.reason)
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -3572,6 +3589,10 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        if reviewer is not None:
+            ownership = evaluate_tx(conn, task_id, "assign:" + reviewer)
+            if not ownership.allowed:
+                return _ret(False, ownership.reason)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -3705,11 +3726,11 @@ def request_changes(
 
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
+    force: bool = False, dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    Refused while a parent is unfinished unless ``force``; ``dry_run`` only
+    validates. Returns ``(ok, reason)``."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
@@ -3720,22 +3741,18 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
-    # No override: claim_task demotes ready -> todo on an undone parent whichever
-    # writer set 'ready', so a forced promotion would only report a success the
-    # first claim silently reverts (#106195). The dependency itself is the knob.
-    parents = conn.execute(
-        "SELECT t.id, t.status FROM tasks t "
-        "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ?", (task_id,),
-    ).fetchall()
-    unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
-    if unsatisfied:
-        return False, (
-            f"unsatisfied parent dependencies: {', '.join(unsatisfied)} "
-            f"(the ready -> running claim re-checks parents, so promotion cannot "
-            f"bypass them; complete the parents or drop the link with "
-            f"`hermes kanban unlink <parent_id> {task_id}`)"
-        )
+    if not force:
+        parents = conn.execute(
+            "SELECT t.id, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ?", (task_id,),
+        ).fetchall()
+        unsatisfied = [p["id"] for p in parents if p["status"] not in ("done", "archived")]
+        if unsatisfied:
+            return False, (
+                f"unsatisfied parent dependencies: "
+                f"{', '.join(unsatisfied)} (use --force to override)"
+            )
 
     if dry_run:
         return True, None
@@ -3747,7 +3764,9 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        _append_event(
+            conn, task_id, "promoted_manual", {"actor": actor, "reason": reason, "forced": force},
+        )
 
     return True, None
 
@@ -3787,6 +3806,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "unblock").allowed:
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3969,6 +3991,10 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        operation = "assign:" + assignee if assignee is not None else "specify"
+        if not evaluate_tx(conn, task_id, operation).allowed:
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -4015,12 +4041,167 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _validate_children_graph(children: list) -> None:
+    """DB-free shape check + Kahn's cycle check on the sibling graph (a cycle
+    would deadlock every involved child in ``todo`` forever)."""
+    for idx, child in enumerate(children):
+        if not isinstance(child, dict):
+            raise ValueError(f"child[{idx}] is not a dict")
+        title = child.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError(f"child[{idx}].title is required")
+        parents_idx = child.get("parents") or []
+        if not isinstance(parents_idx, list):
+            raise ValueError(f"child[{idx}].parents must be a list")
+        for p in parents_idx:
+            if not isinstance(p, int) or p < 0 or p >= len(children):
+                raise ValueError(f"child[{idx}].parents[{p}] is not a valid index into children")
+            if p == idx:
+                raise ValueError(f"child[{idx}] cannot list itself as a parent")
+
+    in_deg = [0] * len(children)
+    adj: list[list[int]] = [[] for _ in children]
+    for i, c in enumerate(children):
+        for p in (c.get("parents") or []):
+            adj[p].append(i)
+            in_deg[i] += 1
+    queue = [i for i in range(len(children)) if in_deg[i] == 0]
+    seen = 0
+    while queue:
+        seen += 1
+        for nb in adj[queue.pop()]:
+            in_deg[nb] -= 1
+            if in_deg[nb] == 0:
+                queue.append(nb)
+    if seen != len(children):
+        raise ValueError("cyclic dependency detected in decomposed children list")
+
+
+def decompose_triage_task(
+    conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
+    author: Optional[str] = None, auto_promote: bool = True,
+) -> Optional[list[str]]:
+    """Fan a triage task out into children and move the root to ``todo``; the root
+    waits on every child and wakes (``ready``) when all are done.
+
+    ``children``: dicts of ``title`` (required), ``body``, ``assignee``,
+    ``parents`` (indices into this list), optional workspace overrides.
+    Returns child ids in input order, or None when the root is missing / not
+    in triage. Atomic: a malformed entry aborts the whole fan-out.
+    """
+    if not children:
+        return None
+    if root_assignee is not None:
+        root_assignee = _canonical_assignee(root_assignee)
+    _validate_children_graph(children)
+
+    # ONE txn so the fan-out is atomic; helpers that open their own write_txn
+    # (create_task, link_tasks, add_comment) must not be called in here.
+    now = int(time.time())
     with write_txn(conn):
+        root_row = conn.execute(
+            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if root_row is None or root_row["status"] != "triage":
+            return None
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "decompose").allowed:
+            return None
+        child_ids = [
+            _insert_decomposed_child(conn, task_id, root_row, child, author, now)
+            for child in children
+        ]
+        # Sibling edges within the decomposed graph.
+        for idx, child in enumerate(children):
+            for p_idx in child.get("parents") or []:
+                parent_id, child_id = child_ids[p_idx], child_ids[idx]
+                _link(conn, parent_id, child_id)
+                _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
+        # Root waits for the whole graph: link it under EVERY child (simpler
+        # than computing leaves; cycle-free since the root is only ever a child).
+        for cid in child_ids:
+            _link(conn, cid, task_id)
+        # Flip the root triage -> todo, assignee -> orchestrator.
+        sets = ["status = 'todo'"]
+        params: list[Any] = []
+        if root_assignee is not None:
+            sets.append("assignee = ?")
+            params.append(root_assignee)
+        params.append(task_id)
+        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        if author and author.strip():
+            _insert_comment(
+                conn, task_id, author.strip(),
+                "Decomposed into " + ", ".join(child_ids)
+                + ". Root will wake when all children complete.",
+                now,
+            )
+        _append_event(
+            conn, task_id, "decomposed", {"child_ids": child_ids, "root_assignee": root_assignee},
+        )
+    # Outside the txn (own IMMEDIATE txn). ``auto_promote=False`` leaves the
+    # children in ``todo`` for manual-review-first workflows.
+    if auto_promote:
+        recompute_ready(conn)
+    return child_ids
+
+
+def _insert_decomposed_child(
+    conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
+    author: Optional[str], now: int,
+) -> str:
+    """Insert one decomposed child as ``todo`` (linked under the root later so
+    the dispatcher only ever sees a coherent graph); returns its id.
+
+    Workspace: per-child override wins, else inherit the root's kind. Path
+    inherits only when kinds match (a 'dir' child must not point at the
+    root's worktree) and NEVER for worktrees — siblings dispatch concurrently
+    and one shared checkout would put them all on the first sibling's branch
+    with no lock; leaving it unset makes dispatch materialize a fresh
+    ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+    """
+    root_ws_kind = root_row["workspace_kind"] or "scratch"
+    child_ws_kind = child.get("workspace_kind") or root_ws_kind
+    if child.get("workspace_path"):
+        child_ws_path = child.get("workspace_path")
+    elif child_ws_kind == "worktree":
+        child_ws_path = None
+    elif child_ws_kind == root_ws_kind:
+        child_ws_path = root_row["workspace_path"]
+    else:
+        child_ws_path = None
+    new_id = _new_task_id()
+    body = child.get("body")
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, body, assignee, status, workspace_kind, "
+        " workspace_path, tenant, created_at, created_by) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        (
+            new_id, child["title"].strip(), body if isinstance(body, str) else None,
+            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
+            root_row["tenant"], now, (author or "decomposer"),
+        ),
+    )
+    _append_event(
+        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
+    )
+    _inherit_notify_subs(conn, new_id, (root_id,), created_at=now)
+    return new_id
+
+
+def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Archive an inactive task; running tasks require verified reclaim first."""
+    with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "archive").allowed:
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status NOT IN ('archived', 'running')", (task_id,),
+            "WHERE id = ? AND status NOT IN ('archived', 'running')",
+            (task_id,),
         )
         if cur.rowcount != 1:
             return False
@@ -4054,6 +4235,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
+
 
 
 def _running_worker_identity(
@@ -4154,9 +4336,6 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
-
-
-# --- Runs (attempt history on a task) ---
 
 
 def schedule_task(
@@ -4523,7 +4702,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
             (cutoff,),
         )
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
             "AND id NOT IN (SELECT event_id FROM kanban_captain_inbox "
             "               WHERE state != 'acked')",
@@ -4702,6 +4881,25 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
 # materializes a ``pending`` inbox row. The poller leases -> acks a row so
 # exactly one same-profile session reports it, with the live origin session
 # owning delivery while present.
+
+
+def _normalize_captain_profile(profile: Optional[str]) -> str:
+    """Canonicalize a Captain owner profile.
+
+    Uses the same :func:`hermes_cli.profiles.normalize_profile_name` canonical
+    id used on disk and in ``-p`` argv, so mixed-case / title-cased inputs
+    (``Otto``, ``Default``) resolve to one owner (``otto``, ``default``) across
+    registration, materialization, lease/read, filters, and probes. An empty
+    profile maps to ``default``.
+    """
+    name = str(profile or "").strip()
+    if not name:
+        return "default"
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+        return normalize_profile_name(name)
+    except Exception:
+        return name.lower()
 
 
 def register_captain_owner(
@@ -5160,8 +5358,6 @@ def count_captain_pending(
 # ---------------------------------------------------------------------------
 
 
-
-
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
@@ -5281,6 +5477,7 @@ _PLUGIN_COMPAT_LAZY = {
     '_classify_worker_exit': ('hermes_cli.kanban_db_dispatch', '_classify_worker_exit'),
     '_terminate_reclaimed_worker': ('hermes_cli.kanban_db_dispatch', '_terminate_reclaimed_worker'),
     '_handoff_worker_teardown_pending': ('hermes_cli.kanban_db_dispatch', '_handoff_worker_teardown_pending'),
+    '_dispatcher_claim_lock': ('hermes_cli.kanban_db_connect', '_dispatcher_claim_lock'),
     '_retag_legacy_worker_sessions': ('hermes_cli.kanban_db_dispatch', '_retag_legacy_worker_sessions'),
 }
 

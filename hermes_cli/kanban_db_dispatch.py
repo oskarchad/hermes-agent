@@ -2147,6 +2147,9 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    if not dry_run:
+        from hermes_cli.kanban_governance import reconcile
+        reconcile(conn, now=int(time.time()))
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
@@ -2922,17 +2925,12 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
     # doesn't set the env var.
     env["HERMES_PROFILE"] = profile_arg
-    # This is the grant boundary: the dispatcher assigned this new worker's task.
-    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
-    env.pop(DELEGATED_CHILD_ENV_MARKER, None)
     # `--cli` is the highest-precedence TUI override; dropping HERMES_TUI covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     scoped_cmd = _restart_safe_worker_argv(task, cmd)
-    from tools.process_registry import systemd_user_bus_env
-    env = systemd_user_bus_env(env)
     worker_scoped = scoped_cmd is not cmd
     cmd = scoped_cmd
     log_f = _open_worker_log(task, board)
