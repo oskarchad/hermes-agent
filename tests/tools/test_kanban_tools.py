@@ -1230,3 +1230,38 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_create_with_contract_and_creator_origin_and_show_readback(worker_env):
+    """Verify create_task preserves creator_task_id and completion_contract,
+    and kanban_show returns completion_contract without error."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    out = kt._handle_create({
+        "title": "task with contract",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "completion_contract": "acme/repo",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    task_id = d["task_id"]
+
+    show_out = kt._handle_show({"task_id": task_id})
+    show_d = json.loads(show_out)
+    assert "task" in show_d, show_d
+    assert show_d["task"]["id"] == task_id
+    assert show_d["task"]["completion_contract"] == "acme/repo"
+
+    conn = kbc.connect()
+    try:
+        t = kb.get_task(conn, task_id)
+        assert t is not None
+        assert t.completion_contract == "acme/repo"
+        assert t.status == "todo"
+        assert t.status != "blocked"
+    finally:
+        conn.close()
+
