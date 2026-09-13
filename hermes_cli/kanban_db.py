@@ -1610,6 +1610,8 @@ def create_task(
                 )
                 for pid in parents:
                     _link(conn, pid, task_id)
+                from hermes_cli.kanban_governance import bind_created_tx
+                bind_created_tx(conn, task_id, parents)
                 _append_event(
                     conn,
                     task_id,
@@ -1796,6 +1798,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "assign:" + (profile or "")).allowed:
+            return False
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -1920,6 +1925,8 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
+        from hermes_cli.kanban_governance import bind_linked_tx
+        bind_linked_tx(conn, parent_id, child_id)
         _link(conn, parent_id, child_id)
         # If child was ready but parent is not yet done, demote child to todo.
         if _task_status(conn, parent_id) != "done":
@@ -2484,6 +2491,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                from hermes_cli.kanban_governance import evaluate_tx
+                if not evaluate_tx(conn, task_id, "promote").allowed:
+                    continue
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
                     # At the breaker limit, no auto-recovery (else block ->
@@ -2588,6 +2598,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "claim").allowed:
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2621,6 +2634,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "claim_review").allowed:
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -3076,7 +3092,10 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    from hermes_cli import kanban_governance as governance
     with write_txn(conn):
+        if not governance.evaluate_tx(conn, task_id, "complete", expected_run_id=expected_run_id).allowed:
+            return False
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
@@ -3124,6 +3143,8 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+        governance.record_transition_tx(conn, task_id, "complete", run_id)
+    governance.drain(conn)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
@@ -3533,6 +3554,10 @@ def request_review(
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        disposition = evaluate_tx(conn, task_id, "review", expected_run_id=expected_run_id)
+        if not disposition.allowed:
+            return _ret(False, disposition.reason)
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -3564,6 +3589,10 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        if reviewer is not None:
+            ownership = evaluate_tx(conn, task_id, "assign:" + reviewer)
+            if not ownership.allowed:
+                return _ret(False, ownership.reason)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -3777,6 +3806,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "unblock").allowed:
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3959,6 +3991,10 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        operation = "assign:" + assignee if assignee is not None else "specify"
+        if not evaluate_tx(conn, task_id, operation).allowed:
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -4069,6 +4105,9 @@ def decompose_triage_task(
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "decompose").allowed:
+            return None
         child_ids = [
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)
             for child in children
@@ -4155,6 +4194,9 @@ def _insert_decomposed_child(
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Archive an inactive task; running tasks require verified reclaim first."""
     with write_txn(conn):
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "archive").allowed:
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "

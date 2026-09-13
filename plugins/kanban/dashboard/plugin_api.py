@@ -701,6 +701,11 @@ def _set_status_direct(
             if (prev["status"] not in {"ready", "done"} or prev["current_run_id"] is not None
                     or prev["claim_lock"] is not None or prev["worker_pid"] is not None):
                 return False
+
+        from hermes_cli import kanban_governance as governance
+
+        if not governance.evaluate_tx(conn, task_id, "status:" + new_status).allowed:
+            return False
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
