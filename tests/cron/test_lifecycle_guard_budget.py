@@ -184,6 +184,156 @@ def test_line_budget_fails_closed_before_tokenizing_every_line(
     assert 0 < lexers < 10
 
 
+def test_python_data_operands_do_not_spend_script_read_budget(monkeypatch, tmp_path):
+    """A Python call argument is not a shell command after an opening parenthesis."""
+    data = tmp_path / "large.data"
+    with data.open("wb") as stream:
+        stream.truncate(lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1)
+    reads = []
+    original = lifecycle_guard._read_referenced_script
+
+    def spy(path, *, max_bytes=None):
+        reads.append(path)
+        return original(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(lifecycle_guard, "_read_referenced_script", spy)
+    command = (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        f"conn=connect(db_path=Path({str(data)!r}))\n"
+        f"prefix=Path({str(data)!r}).read_text()\n"
+        "PY"
+    )
+    # Classification only: never execute this input or open a real database.
+    assert guard(command, cwd=str(tmp_path)) is False
+    assert data not in reads
+    # UTF-8 AST columns are byte offsets; retain the command after the terminator.
+    unicode_command = command.replace("conn=", "é = 1; conn=") + "\n"
+    assert guard(unicode_command, cwd=str(tmp_path)) is False
+    assert data not in reads
+    # Unknown call operands and incomplete Python retain fail-closed behavior.
+    assert guard(command.replace("Path(", "unknown("), cwd=str(tmp_path)) is True
+    assert guard(command.replace("conn=", "conn=("), cwd=str(tmp_path)) is True
+    # The same bytes in an executable position must still fail closed.
+    assert guard(f"sh {data}", cwd=str(tmp_path)) is True
+    assert data in reads
+
+
+def test_python_argv_data_and_script_positions_share_bounded_walk(monkeypatch, tmp_path):
+    data = tmp_path / "large.data"
+    with data.open("wb") as stream:
+        stream.truncate(lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1)
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text("hermes gateway stop\n", encoding="utf-8")
+
+    def classify(argv):
+        return guard(
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run(" + repr(argv) + ")\nPY",
+            cwd=str(tmp_path),
+        )
+
+    reads = []
+    original = lifecycle_guard._read_referenced_script
+
+    def spy(path, *, max_bytes=None):
+        reads.append(path)
+        return original(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(lifecycle_guard, "_read_referenced_script", spy)
+    assert classify(["printf", "%s", f"({data}) hermes gateway stop"]) is False
+    assert data not in reads
+    for argv in ([str(wrapper)], ["sh", str(wrapper)], ["sudo", "sh", str(wrapper)], ["sh", str(data)]):
+        assert classify(argv) is True
+    assert wrapper in reads and data in reads
+    # No subprocess-wide exemption: executable paths retain the shared limits.
+    benign = tmp_path / "benign.sh"
+    benign.write_text("echo ok\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_PATHS", 0)
+        assert classify(["sh", str(benign)]) is True
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_REFERENCED_SCRIPT_DEPTH", 1)
+        assert classify(["sh", str(benign)]) is True
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_REMOTE_READS", 0)
+        assert guard(
+            "python3 - <<'PY'\nsubprocess.run(['sh', '/remote/absent.sh'])\nPY",
+            read_remote_script=lambda path: pytest.fail("exhausted remote reader called"),
+        ) is True
+
+
+@pytest.mark.parametrize("argv", [
+    ["python3", "-c", "print('ok')"],
+    ["python3.12", "-I", "-cprint('ok')"],
+    ["python3", "benign.py"],
+    ["node", "--eval=console.log('ok')"],
+    ["perl", "-e", "print 'ok'"],
+    ["ruby", "-e", "puts 'ok'"],
+    ["php", "-r", "print('ok');"],
+    ["pwsh", "-command", "Write-Output ok"],
+    ["osascript", "-e", 'return "ok"'],
+    ["xargs", "printf"],
+    ["eval", "printf ok"],
+    ["env", "--split-string=printf ok"],
+    ["timeout", "10", "env", "-Sprintf ok"],
+    ["timeout", "10", "su", "--command=printf ok", "nobody"],
+    ["sudo", "runuser", "-c", "printf ok", "nobody"],
+    ["sh", "-lc", "printf ok"],
+    ["sh", "--command=printf ok"],
+    ["sh", "-c"],
+    ["source"],
+    ["env"],
+    ["timeout", "10"],
+    ["env"] * (lifecycle_guard._MAX_PREFIX_PEELS + 1) + ["printf", "ok"],
+])
+def test_python_argv_unowned_execution_is_refusal_not_detection(argv, tmp_path, caplog):
+    from tools import process_registry
+    from tools.terminal_tool_guards import gateway_lifecycle_block
+    from unittest.mock import patch
+
+    command = "python3 - <<'PY'\nsubprocess.run(" + repr(argv) + ")\nPY"
+    # Innocuous, unsupported execution is still refused, not certified as data.
+    with caplog.at_level("WARNING", logger=lifecycle_guard.logger.name):
+        assert guard(command, cwd=str(tmp_path)) is True
+    assert "incomplete process argv inspection" in caplog.text
+    assert "falling back to direct-scan verdict" not in caplog.text
+    with patch.object(process_registry, "_is_supervised_gateway_process", return_value=True):
+        assert gateway_lifecycle_block(
+            command=command, env=object(), env_type="local", cwd=str(tmp_path),
+            workdir=str(tmp_path), session_key="coverage-refusal",
+        ) is not None
+    # The new boundary applies only inside the complete quoted Python stdin lane.
+    assert guard("python3 -c \"print('ok')\"", cwd=str(tmp_path)) is False
+    assert guard("python3 - <<'PY'\nsubprocess.run(['sh', '-c', 'printf ok'])\nPY",
+                 cwd=str(tmp_path)) is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["su", "report-user", "--command=printf ok"],
+    ["runuser", "report-user", "-c", "printf ok"],
+    ["su", "report-user"],
+    ["runuser", "-u", "report-user", "--", "printf", "ok"],
+    ["nsenter", "--root", "printf", "ok"],
+    ["nsenter", "-S", "printf", "ok"],
+    ["ionice", "-p", "123", "456"],
+])
+@pytest.mark.parametrize("prefix", [[], ["timeout", "10"], ["env", "nice", "-n", "2"]])
+def test_python_argv_unsupported_wrapper_grammar_refuses_before_peeling(
+    argv, prefix, tmp_path, caplog,
+):
+    import shlex
+
+    argv = prefix + argv
+    command = "python3 - <<'PY'\nsubprocess.run(" + repr(argv) + ")\nPY"
+    with caplog.at_level("WARNING", logger=lifecycle_guard.logger.name):
+        assert guard(command, cwd=str(tmp_path)) is True
+    assert "incomplete process argv inspection (unsupported wrapper grammar)" in caplog.text
+    assert "falling back to direct-scan verdict" not in caplog.text
+    # Benign unsupported invocations are not detected lifecycle actions, and
+    # legacy string callers do not acquire the new literal-argv refusal policy.
+    assert guard(shlex.join(argv), cwd=str(tmp_path)) is False
+
+
 # --- scheduler entry point --------------------------------------------------
 
 
