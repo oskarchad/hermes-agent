@@ -175,6 +175,8 @@ def evaluate_tx(conn, task_id, operation, *, expected_run_id=None):
     if binding["role"] == "recovery":
         return TransitionDisposition(True, "independent recovery")
     wf_id = binding["workflow_id"]
+    if operation == "decompose":
+        return recovery_tx(conn, wf_id, "decomposition requires trusted issuance")
     if operation.startswith("assign:"):
         source = conn.execute(
             "SELECT d.payload_json FROM kanban_task_bindings b "
@@ -220,11 +222,27 @@ def _reconcile_tx(conn, workflow_id):
         reserve_tx(conn, order)
 
 
+def _next_batch_tx(conn, lane, limit):
+    table, key, condition = {
+        "workflows": ("kanban_workflows", "workflow_id", "1"),
+        "dispositions": ("kanban_dispositions", "action_key", "state='pending'"),
+    }[lane]
+    cursor = conn.execute("SELECT last_rowid FROM kanban_governance_cursors WHERE lane=?", (lane,)).fetchone()
+    after = cursor[0] if cursor else 0
+    rows = conn.execute(f"SELECT {key},rowid FROM {table} WHERE {condition} "
+                        "ORDER BY (rowid > ?) DESC, rowid LIMIT ?", (after, limit)).fetchall()
+    if rows:
+        conn.execute("INSERT INTO kanban_governance_cursors VALUES (?,?) "
+                     "ON CONFLICT(lane) DO UPDATE SET last_rowid=excluded.last_rowid", (lane, rows[-1][1]))
+    return rows
+
+
 def drain(conn, *, limit=64):
     from hermes_cli import kanban_db as kb
 
     issued = []
-    rows = conn.execute("SELECT action_key FROM kanban_dispositions WHERE state='pending' LIMIT ?", (limit,)).fetchall()
+    with write_txn(conn):
+        rows = _next_batch_tx(conn, "dispositions", limit)
     for row in rows:
         with write_txn(conn):
             current = conn.execute("SELECT * FROM kanban_dispositions WHERE action_key=?", (row[0],)).fetchone()
@@ -308,7 +326,7 @@ def _observe_liveness_tx(conn, workflow_id, now):
 
 def reconcile(conn, *, now, limit=64):
     with write_txn(conn):
-        for row in conn.execute("SELECT workflow_id FROM kanban_workflows LIMIT ?", (limit,)).fetchall():
+        for row in _next_batch_tx(conn, "workflows", limit):
             _reconcile_tx(conn, row[0])
             _observe_liveness_tx(conn, row[0], now)
     drain(conn, limit=limit)

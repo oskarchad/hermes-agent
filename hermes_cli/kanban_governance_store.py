@@ -7,6 +7,8 @@ from pathlib import Path
 
 
 _SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS kanban_governance_cursors (
+        lane TEXT PRIMARY KEY, last_rowid INTEGER NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS kanban_workflows (
         workflow_id TEXT PRIMARY KEY, intake_kind TEXT NOT NULL, contract TEXT,
         decision_id TEXT NOT NULL, lineage_id TEXT NOT NULL,

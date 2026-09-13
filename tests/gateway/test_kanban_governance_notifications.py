@@ -65,3 +65,8 @@ def test_governance_notice_delivery_retries_cursor_not_work(tmp_path, monkeypatc
     (tmp_path / "notifications.json").write_text(json.dumps({"messages": sink.messages,
         "failure_observed": failure_observed, "remaining_failures": failures, "task_id": task}))
     conn.close()
+
+
+def test_tc04_notifies_action_without_deadline_kill(tmp_path, monkeypatch):
+    test_governance_notice_delivery_retries_cursor_not_work(tmp_path, monkeypatch)
+

@@ -3573,6 +3573,10 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        if reviewer is not None:
+            ownership = evaluate_tx(conn, task_id, "assign:" + reviewer)
+            if not ownership.allowed:
+                return _ret(False, ownership.reason)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -4084,6 +4088,9 @@ def decompose_triage_task(
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
+            return None
+        from hermes_cli.kanban_governance import evaluate_tx
+        if not evaluate_tx(conn, task_id, "decompose").allowed:
             return None
         child_ids = [
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)

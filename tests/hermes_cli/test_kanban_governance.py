@@ -58,6 +58,37 @@ def test_concurrent_issue_and_archive_replay_keep_identity_and_charge(tmp_path, 
     conn.close()
 
 
+@pytest.mark.parametrize("lane", ["workflows", "dispositions"])
+def test_bounded_scans_progress_past_stuck_prefix_after_reconnect(tmp_path, monkeypatch, lane):
+    path = tmp_path / "board.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
+    scope = {"workspace": str(tmp_path)}
+    conn = connect(path)
+    with write_txn(conn):
+        for number in range(4):
+            workflow = f"fixture-{number}"
+            conn.execute("INSERT INTO kanban_workflows VALUES (?,?,?,?,?,?,?,1,?,?)",
+                         (workflow, "fixture", "fixture/v1", "decision", workflow, "simulation", "active",
+                          store.canonical_bytes(scope).decode(), store.digest(scope)))
+            if lane == "dispositions":
+                order = g.WorkOrder(g.Binding(workflow, "fixture/v1", "stage", workflow, store.digest(number),
+                                              "producer", "simulation"), "produce", "fixture work", "bob", ())
+                g.reserve_tx(conn, order)
+    for _ in range(8):
+        # Missing validators intentionally keep normal dispositions pending. A
+        # restarted bounded scanner must still issue independent recovery.
+        if lane == "workflows":
+            g.reconcile(conn, now=0, limit=2)
+        else:
+            g.drain(conn, limit=2)
+        conn.close()
+        conn = connect(path)
+    recovered = {row[0] for row in conn.execute(
+        "SELECT workflow_id FROM kanban_dispositions WHERE kind='recovery' AND state='applied'")}
+    assert recovered == {f"fixture-{number}" for number in range(4)}
+    conn.close()
+
+
 @pytest.mark.parametrize("fault", ["path", "symlink", "modified"])
 def test_content_objects_reject_escape_and_mutation(tmp_path, fault):
     conn = connect(tmp_path / "board.db")
