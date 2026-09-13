@@ -303,6 +303,7 @@ def _touch_captain_receivers(session: dict) -> None:
     if not session_key or session.get("_finalized"):
         return
     from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as kbc
 
     captain_profile = _session_captain_profile(session)
     try:
@@ -325,7 +326,7 @@ def _touch_captain_receivers(session: dict) -> None:
         seen_db_paths.add(resolved)
         conn = None
         try:
-            conn = _kb.connect(board=slug)
+            conn = kbc.connect(board=slug)
             _kb.touch_captain_receiver(
                 conn,
                 profile=captain_profile,
@@ -548,6 +549,8 @@ def _collect_kanban_notifications(
         return []
     try:
         from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_db_connect as kbc
+        from hermes_cli import kanban_db_notify as kbn
     except Exception:
         return []
     captain_profile = _session_captain_profile(session)
@@ -583,7 +586,7 @@ def _collect_kanban_notifications(
         # everything else is not actionable here.
         open_writable = False
         try:
-            open_writable = _kb.count_notify_subs(
+            open_writable = kbn.count_notify_subs(
                 board=slug,
                 platform="tui",
                 chat_id=session_key,
@@ -602,13 +605,13 @@ def _collect_kanban_notifications(
         if not open_writable:
             continue
         try:
-            conn = _kb.connect(board=slug)
+            conn = kbc.connect(board=slug)
         except Exception:
             continue
         try:
             claimed_event_ids: set = set()
             try:
-                subs = _kb.list_notify_subs(conn)
+                subs = kbn.list_notify_subs(conn)
             except Exception:
                 subs = []
             # Once this poll has leased its one Captain event, leave ordinary
@@ -619,7 +622,7 @@ def _collect_kanban_notifications(
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                old_cursor, claimed_cursor, events = _kb.claim_unseen_events_for_sub(
+                old_cursor, claimed_cursor, events = kbn.claim_unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -699,7 +702,7 @@ def _collect_kanban_notifications(
                     and getattr(task, "status", "") == "archived"
                 ):
                     try:
-                        _kb.remove_notify_sub(
+                        kbn.remove_notify_sub(
                             conn,
                             task_id=sub["task_id"],
                             platform=sub["platform"],
@@ -742,11 +745,12 @@ def _renew_kanban_notification_claims(
 ) -> None:
     """Renew every Captain token and fail closed if any ownership fence is lost."""
     from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as kbc
 
     for record in claim_records:
         if record.get("route") != "captain":
             continue
-        conn = _kb.connect(board=record["board"])
+        conn = kbc.connect(board=record["board"])
         try:
             expected = max(1, int(record.get("expected_count") or 1))
             renewed = _kb.renew_captain_reports(
@@ -778,6 +782,8 @@ def _settle_kanban_notification_claims(
     caller cannot emit a success frame for a settlement it did not commit.
     """
     from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
 
     errors: list[Exception] = []
     failed_captain_records: list[dict] = []
@@ -785,7 +791,7 @@ def _settle_kanban_notification_claims(
         if record.get("route") == "captain":
             conn = None
             try:
-                conn = _kb.connect(board=record["board"])
+                conn = kbc.connect(board=record["board"])
                 expected = max(1, int(record.get("expected_count") or 1))
                 owner = record.get("owner")
                 if not owner:
@@ -845,9 +851,9 @@ def _settle_kanban_notification_claims(
         sub = record["sub"]
         conn = None
         try:
-            conn = _kb.connect(board=record["board"])
+            conn = kbc.connect(board=record["board"])
             if accepted:
-                _kb.remove_notify_sub(
+                kbn.remove_notify_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -855,7 +861,7 @@ def _settle_kanban_notification_claims(
                     thread_id=sub.get("thread_id") or "",
                 )
             else:
-                _kb.rewind_notify_cursor(
+                kbn.rewind_notify_cursor(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -877,7 +883,7 @@ def _settle_kanban_notification_claims(
         for record in failed_captain_records:
             conn = None
             try:
-                conn = _kb.connect(board=record["board"])
+                conn = kbc.connect(board=record["board"])
                 _kb.release_captain_reports(
                     conn,
                     token=record["token"],
