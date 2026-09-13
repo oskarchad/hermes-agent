@@ -1264,4 +1264,3 @@ def test_create_with_contract_and_creator_origin_and_show_readback(worker_env):
         assert t.status != "blocked"
     finally:
         conn.close()
-
