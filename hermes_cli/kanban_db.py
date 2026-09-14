@@ -4155,19 +4155,30 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if not cleanup_ok or worker_identity is None:
             return False
     with write_txn(conn):
-        _delete_task_relations(conn, task_id)
+        current = conn.execute(
+            "SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
         if worker_identity is not None:
             _, run_id, worker_pid, claim_lock = worker_identity
-            cur = conn.execute(
-                "DELETE FROM tasks WHERE id = ? AND status = 'running' "
-                "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
-                (task_id, run_id, worker_pid, claim_lock),
-            )
+            cur_run_id = int(current["current_run_id"]) if current["current_run_id"] is not None else None
+            cur_worker_pid = int(current["worker_pid"]) if current["worker_pid"] is not None else None
+            cur_claim_lock = str(current["claim_lock"]) if current["claim_lock"] is not None else None
+            if (
+                str(current["status"]) != "running"
+                or cur_run_id != run_id
+                or cur_worker_pid != worker_pid
+                or cur_claim_lock != claim_lock
+            ):
+                return False
         else:
-            cur = conn.execute(
-                "DELETE FROM tasks WHERE id = ? AND status = ?",
-                (task_id, expected_status),
-            )
+            if str(current["status"]) != expected_status:
+                return False
+
+        _delete_task_relations(conn, task_id)
+        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
     recompute_ready(conn)
