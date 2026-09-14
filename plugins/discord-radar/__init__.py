@@ -31,6 +31,7 @@ from .observer import (
     validate_history,
 )
 from .hook import run_discord_blocker_hook, gemini_evaluator
+from . import cli
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,13 @@ def make_pre_gateway_dispatch_hook(ctx):
 
 
 def register(ctx) -> None:
-    """Register discord-radar plugin hooks and tools."""
+    """Register discord-radar plugin hooks, CLI commands and tools."""
     hook = make_pre_gateway_dispatch_hook(ctx)
     ctx.register_hook("pre_gateway_dispatch", hook)
+    ctx.register_cli_command(
+        name="radar-observer",
+        help="Run Discord Radar blocker observer cycle",
+        setup_fn=cli.register_cli,
+        handler_fn=cli.radar_observer_command,
+    )
     logger.info("discord-radar plugin registered successfully")
