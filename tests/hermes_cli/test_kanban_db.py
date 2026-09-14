@@ -490,6 +490,109 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_runs(conn, t)) == 0
 
 
+def test_delete_task_and_archived_task_clean_legacy_governance_foreign_keys(kanban_home):
+    """F1: Legacy governance tables reference tasks(id) and task_runs(id) without
+    ON DELETE CASCADE. delete_task and delete_archived_task must clean those
+    dependent rows atomically without failing with sqlite3.IntegrityError, while
+    preserving unrelated governance rows."""
+    with kbc.connect() as conn:
+        # Create legacy governance schema
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kanban_workflows ("
+            "workflow_id TEXT PRIMARY KEY, intake_kind TEXT NOT NULL, contract TEXT, "
+            "decision_id TEXT NOT NULL, lineage_id TEXT NOT NULL, evidence_mode TEXT NOT NULL, "
+            "state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, scope_json TEXT NOT NULL, "
+            "intake_sha256 TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kanban_task_bindings ("
+            "task_id TEXT PRIMARY KEY REFERENCES tasks(id), "
+            "workflow_id TEXT NOT NULL REFERENCES kanban_workflows(workflow_id), "
+            "binding_json TEXT NOT NULL, source_action TEXT, issued_revision INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kanban_dispositions ("
+            "action_key TEXT PRIMARY KEY, "
+            "workflow_id TEXT NOT NULL REFERENCES kanban_workflows(workflow_id), "
+            "kind TEXT NOT NULL, target_key TEXT NOT NULL, payload_json TEXT NOT NULL, "
+            "task_id TEXT REFERENCES tasks(id), "
+            "state TEXT NOT NULL, UNIQUE(workflow_id, kind, target_key))"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kanban_invocations ("
+            "invocation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), "
+            "run_id INTEGER NOT NULL REFERENCES task_runs(id), "
+            "workflow_id TEXT NOT NULL REFERENCES kanban_workflows(workflow_id), "
+            "binding_json TEXT NOT NULL, profile TEXT NOT NULL, claim_lock TEXT NOT NULL, "
+            "evidence_mode TEXT NOT NULL, request_sha256 TEXT NOT NULL, artifacts_json TEXT NOT NULL, "
+            "response_sha256 TEXT, runner_version TEXT NOT NULL, verdict TEXT, "
+            "state TEXT NOT NULL, UNIQUE(task_id, run_id))"
+        )
+        conn.execute(
+            "INSERT INTO kanban_workflows VALUES ('wf1', 'k', 'c', 'd', 'l', 'real', 'active', 1, '{}', 'sha')"
+        )
+        conn.execute(
+            "INSERT INTO kanban_workflows VALUES ('wf_other', 'k', 'c', 'd', 'l', 'real', 'active', 1, '{}', 'sha')"
+        )
+
+        # 1. Test delete_task on ready task with legacy governance rows
+        t1 = kb.create_task(conn, title="task-1", assignee="alice")
+        conn.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'done', 100)", (t1,))
+        run1 = conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (t1,)).fetchone()[0]
+
+        # Populate legacy governance referencing t1
+        conn.execute("INSERT INTO kanban_task_bindings VALUES (?, 'wf1', '{}', 'act', 1)", (t1,))
+        conn.execute("INSERT INTO kanban_dispositions VALUES ('act1', 'wf1', 'kind1', 'tgt1', '{}', ?, 'pending')", (t1,))
+        conn.execute("INSERT INTO kanban_invocations VALUES ('inv1', ?, ?, 'wf1', '{}', 'prof', 'lock', 'real', 'req', 'art', 'resp', 'v1', 'PASS', 'finished')", (t1, run1))
+
+        # Populate unrelated task and governance rows as preservation controls
+        t_unrelated = kb.create_task(conn, title="unrelated", assignee="bob")
+        conn.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'done', 100)", (t_unrelated,))
+        run_unrelated = conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (t_unrelated,)).fetchone()[0]
+        conn.execute("INSERT INTO kanban_task_bindings VALUES (?, 'wf_other', '{}', 'act', 1)", (t_unrelated,))
+        conn.execute("INSERT INTO kanban_dispositions VALUES ('act_unrelated', 'wf_other', 'kind1', 'tgt2', '{}', ?, 'pending')", (t_unrelated,))
+        conn.execute("INSERT INTO kanban_invocations VALUES ('inv_unrelated', ?, ?, 'wf_other', '{}', 'prof', 'lock', 'real', 'req', 'art', 'resp', 'v1', 'PASS', 'finished')", (t_unrelated, run_unrelated))
+        # Disposition with NULL task_id
+        conn.execute("INSERT INTO kanban_dispositions VALUES ('act_null_task', 'wf_other', 'kind2', 'tgt3', '{}', NULL, 'pending')")
+        conn.commit()
+
+        # Delete t1
+        assert kb.delete_task(conn, t1) is True
+        assert kb.get_task(conn, t1) is None
+
+        # Verify t1 governance rows were deleted
+        assert conn.execute("SELECT COUNT(*) FROM kanban_task_bindings WHERE task_id = ?", (t1,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_dispositions WHERE task_id = ?", (t1,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_invocations WHERE task_id = ?", (t1,)).fetchone()[0] == 0
+
+        # Verify unrelated governance rows remain intact
+        assert conn.execute("SELECT COUNT(*) FROM kanban_task_bindings WHERE task_id = ?", (t_unrelated,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM kanban_dispositions WHERE task_id = ?", (t_unrelated,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM kanban_invocations WHERE task_id = ?", (t_unrelated,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM kanban_dispositions WHERE action_key = 'act_null_task'").fetchone()[0] == 1
+
+        # 2. Test delete_archived_task on archived task with legacy governance rows
+        t2 = kb.create_task(conn, title="task-2", assignee="alice")
+        conn.execute("INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'done', 100)", (t2,))
+        run2 = conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (t2,)).fetchone()[0]
+        kb.complete_task(conn, t2, result="done")
+        assert kb.archive_task(conn, t2) is True
+
+        conn.execute("INSERT INTO kanban_task_bindings VALUES (?, 'wf1', '{}', 'act', 1)", (t2,))
+        conn.execute("INSERT INTO kanban_dispositions VALUES ('act2', 'wf1', 'kind1', 'tgt4', '{}', ?, 'applied')", (t2,))
+        conn.execute("INSERT INTO kanban_invocations VALUES ('inv2', ?, ?, 'wf1', '{}', 'prof', 'lock', 'real', 'req', 'art', 'resp', 'v1', 'PASS', 'finished')", (t2, run2))
+        conn.commit()
+
+        assert kb.delete_archived_task(conn, t2) is True
+        assert kb.get_task(conn, t2) is None
+        assert conn.execute("SELECT COUNT(*) FROM kanban_task_bindings WHERE task_id = ?", (t2,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_dispositions WHERE task_id = ?", (t2,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_invocations WHERE task_id = ?", (t2,)).fetchone()[0] == 0
+
+        # Unrelated rows still remain
+        assert conn.execute("SELECT COUNT(*) FROM kanban_task_bindings WHERE task_id = ?", (t_unrelated,)).fetchone()[0] == 1
+
+
 
 
 # ---------------------------------------------------------------------------

@@ -559,6 +559,37 @@ def test_delete_task(client):
     assert r.status_code == 404
 
 
+def test_delete_task_via_api_with_legacy_governance_rows(client):
+    """F1: DELETE /tasks/:id endpoint succeeds even if legacy governance rows exist."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "governed-api-task"}).json()["task"]
+    tid = t["id"]
+
+    with kbc.connect() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kanban_workflows ("
+            "workflow_id TEXT PRIMARY KEY, intake_kind TEXT NOT NULL, contract TEXT, "
+            "decision_id TEXT NOT NULL, lineage_id TEXT NOT NULL, evidence_mode TEXT NOT NULL, "
+            "state TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, scope_json TEXT NOT NULL, "
+            "intake_sha256 TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kanban_task_bindings ("
+            "task_id TEXT PRIMARY KEY REFERENCES tasks(id), "
+            "workflow_id TEXT NOT NULL REFERENCES kanban_workflows(workflow_id), "
+            "binding_json TEXT NOT NULL, source_action TEXT, issued_revision INTEGER NOT NULL)"
+        )
+        conn.execute("INSERT OR IGNORE INTO kanban_workflows VALUES ('wf1', 'k', 'c', 'd', 'l', 'real', 'active', 1, '{}', 'sha')")
+        conn.execute("INSERT INTO kanban_task_bindings VALUES (?, 'wf1', '{}', 'act', 1)", (tid,))
+        conn.commit()
+
+    r = client.delete(f"/api/plugins/kanban/tasks/{tid}")
+    assert r.status_code == 200
+    assert r.json()["deleted"] is True
+
+    with kbc.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM kanban_task_bindings WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+
+
 # ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------

@@ -104,13 +104,31 @@ through `apps/desktop/DESIGN.md`, `docs/kanban/multi-gateway.md`, and
 - Keep rationale: this is a one-line upstream-seam fix with no parallel
   terminal implementation.
 
+## 6. Lifecycle guard Python data and executable operands (PR17)
+
+- Upstream base: keeps string-level lifecycle scanning and executable discovery.
+- Retained delta: distinguishes literal Python `Path(...)` data operands in quoted
+  stdin heredocs from shell script references so large data files do not trip
+  script read budgets; inspects literal process operands (`os.system`,
+  `subprocess.run` with string or argv list) through recursive lifecycle
+  scanning; refuses unowned execution operands and unsupported wrapper grammars;
+  separates Python stdin bodies in heredoc handling.
+- Runtime paths: `cron/lifecycle_guard.py`, `tools/shell_heredoc.py`.
+- Custom/seam tests: `tests/cron/test_lifecycle_guard_budget.py`,
+  `tests/hermes_cli/test_gateway_restart_loop.py`.
+- Keep rationale: verified independent security fix from PR17
+  (`fae208e53980c93f5e5f9529daeaf1b1e531c73b`, review `t_ffe18c77`), preventing
+  false positives on Python data reading while strictly preserving lifecycle
+  guards without restoring PDP audit guardian global governance.
+
 ## Deliberately dropped
 
 The candidate does not replay custom copies of watcher wake behavior,
 delegation schema/registry, base TUI/session lifecycle, updater control socket
 or package/image gates, update-branch strategy, terminal/plugin registry, MCP
-transport/reconnect, cron fixes, browser/model/provider/messaging/security
-behavior, or other functionality already present in the frozen upstream.
+transport/reconnect, PDP audit guardian global governance,
+browser/model/provider/messaging/security behavior, or other functionality
+already present in the frozen upstream.
 
 ## Verification boundary
 

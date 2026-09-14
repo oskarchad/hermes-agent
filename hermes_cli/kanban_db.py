@@ -4038,8 +4038,30 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+def _delete_legacy_governance_relations(conn: sqlite3.Connection, task_id: str) -> None:
+    """Delete legacy governance rows referencing task_id or its runs if tables exist."""
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+        "('kanban_invocations', 'kanban_dispositions', 'kanban_task_bindings')"
+    ).fetchall()
+    existing = {r[0] for r in rows}
+    if not existing:
+        return
+    if "kanban_invocations" in existing:
+        conn.execute(
+            "DELETE FROM kanban_invocations WHERE task_id = ? "
+            "OR run_id IN (SELECT id FROM task_runs WHERE task_id = ?)",
+            (task_id, task_id),
+        )
+    if "kanban_dispositions" in existing:
+        conn.execute("DELETE FROM kanban_dispositions WHERE task_id = ?", (task_id,))
+    if "kanban_task_bindings" in existing:
+        conn.execute("DELETE FROM kanban_task_bindings WHERE task_id = ?", (task_id,))
+
+
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    _delete_legacy_governance_relations(conn, task_id)
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
@@ -4133,6 +4155,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if not cleanup_ok or worker_identity is None:
             return False
     with write_txn(conn):
+        _delete_task_relations(conn, task_id)
         if worker_identity is not None:
             _, run_id, worker_pid, claim_lock = worker_identity
             cur = conn.execute(
@@ -4147,11 +4170,6 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
             )
         if cur.rowcount != 1:
             return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
