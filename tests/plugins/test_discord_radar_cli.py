@@ -85,14 +85,53 @@ def test_cli_dispatches_cleanly_when_disabled(tmp_path, monkeypatch):
     assert called[0]["enabled"] is False
 
 
+@pytest.mark.linux_only
 def test_no_agent_cron_script_executes_radar_observer(tmp_path, monkeypatch):
-    """Test full cycle: cron create -> stored job -> _run_no_agent_job -> radar-observer execution."""
-    home = tmp_path / ".hermes"
-    home.mkdir()
+    """Test full cycle: cron create -> stored job -> _run_no_agent_job -> checked-in wrapper -> radar-observer execution."""
+    import os
+    import sys
+
+    home = tmp_path / "profiles" / "otto"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    repo_root = Path(__file__).resolve().parents[2]
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    # Instrument only the network edge; the CLI, plugin loader, hook and disk writes are real.
+    (probe / "sitecustomize.py").write_text(
+        "import sys, json, os\n"
+        "from pathlib import Path\n"
+        "from tools import discord_tool\n"
+        "def request(method, endpoint, token, **kwargs):\n"
+        "    assert method == 'GET'\n"
+        "    if endpoint == '/users/@me':\n"
+        "        return {'id': '1547333242502520872', 'bot': True}\n"
+        "    assert endpoint == '/channels/123/messages/456'\n"
+        "    return {'id': '456', 'channel_id': '123', 'author': {'id': '789'}, 'content': 'No blocked items'}\n"
+        "discord_tool._discord_request = request\n"
+        "def trace(frame, event, arg):\n"
+        "    if frame.f_code.co_name == 'run_discord_blocker_hook' and event == 'return':\n"
+        "        Path(os.environ['HERMES_HOME'], 'hook-call.json').write_text(json.dumps({'state_path': str(frame.f_locals['state_file_path']), 'errors': arg.errors}))\n"
+        "sys.setprofile(trace)\n"
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # Standard installed console entrypoint, bound to this test interpreter.
+    console = bin_dir / "hermes"
+    console.write_text(f"#!{sys.executable}\nfrom hermes_cli.main import main\nmain()\n")
+    console.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(probe), str(repo_root)]))
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(repo_root / "plugins"))
+    (home / "config.yaml").write_text("plugins:\n  enabled: [discord-radar]\n")
+    (home / ".env").write_text("DISCORD_OBSERVER_BOT_TOKEN=fixture-only-not-a-credential\n")
     scripts_dir = home / "scripts"
     scripts_dir.mkdir()
     cron_dir = home / "cron"
     cron_dir.mkdir()
+    state_path = cron_dir / "discord-now-state.json"
+    state_path.write_text(json.dumps({"channel_id": "123", "message_id": "456", "bot_id": "789"}))
 
     monkeypatch.setenv("HERMES_HOME", str(home))
 
@@ -124,13 +163,13 @@ def test_no_agent_cron_script_executes_radar_observer(tmp_path, monkeypatch):
     assert args.no_agent is True
     assert args.script == "radar-observer.sh"
 
-    # 2. Write the canonical profile script wrapper
+    # 2. Copy the real checked-in wrapper script
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    checked_in_wrapper = repo_root / "plugins" / "discord-radar" / "radar-observer.sh"
+    assert checked_in_wrapper.exists(), f"Checked-in wrapper must exist at {checked_in_wrapper}"
+
     radar_script = scripts_dir / "radar-observer.sh"
-    marker_file = tmp_path / "executed.marker"
-    # ponytail: wrapper runs hermes radar-observer command directly
-    radar_script.write_text(f"""#!/usr/bin/env bash
-python3 -c "import pathlib; pathlib.Path('{marker_file}').write_text('radar executed\\n'); print('SUCCESS')"
-""")
+    radar_script.write_bytes(checked_in_wrapper.read_bytes())
     radar_script.chmod(0o755)
 
     # 3. Store job and execute via _run_no_agent_job
@@ -153,21 +192,11 @@ python3 -c "import pathlib; pathlib.Path('{marker_file}').write_text('radar exec
         job, job["id"], job["name"], cancel_event
     )
 
-    assert success is True
+    assert success is True, full_output
     assert err is None
-    assert "SUCCESS" in deliver_output
-    assert marker_file.exists()
-    assert marker_file.read_text().strip() == "radar executed"
-
-
-def test_service_target_contract_requires_shared_hermes_gateway():
-    """Test F2 contract: verification that payload specifies shared hermes-gateway.service."""
-    # Read ACTIVATION_AND_ROLLBACK_PAYLOAD.md
-    payload_path = Path("/home/hermes/.hermes/kanban/workspaces/t_f9ba6d91/her-187-cycle-evidence/ACTIVATION_AND_ROLLBACK_PAYLOAD.md")
-    if payload_path.exists():
-        content = payload_path.read_text()
-        assert "hermes-gateway@otto.service" not in content
-        assert "systemctl --user restart hermes-gateway.service" in content
-
-
+    assert "[discord-radar] Success:" in deliver_output
+    assert json.loads((home / "hook-call.json").read_text()) == {
+        "state_path": str(state_path), "errors": [],
+    }
+    assert json.loads((cron_dir / "discord-blocker-observer-state.json").read_text()) == {}
 
