@@ -20,11 +20,34 @@ def github(tmp_path, monkeypatch):
             state["requests"].append(self.path)
             sha = state["head"]
             if self.path == "/graphql":
-                value = {"data": {"repository": {"pullRequest": {
-                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                protection = None if state.get("no_protection") else {
+                    "branchProtectionRule": {"requiredStatusChecks": [
+                        {"context": "required", "app": {"databaseId": 1}}]}
+                }
+                value = {"data": {"repository": {
+                    "isPrivate": True,
+                    "pullRequest": {
+                        "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                        "baseRef": protection,
+                        "statusCheckRollup": {"state": "SUCCESS" if state["conclusion"] == "success" else "FAILURE"}
+                    }}}}
             elif "/rules/branches/" in self.path:
+                if state.get("rules_fault") == "plan_403":
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps([{"message": "Upgrade to GitHub Pro or make this repository public to enable this feature.", "status": "403"}]).encode())
+                    return
+                elif state.get("rules_fault") == "auth_403":
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps([{"message": "Resource not accessible by integration", "status": "403"}]).encode())
+                    return
+                elif state.get("rules_fault") == "server_500":
+                    self.send_response(500)
+                    self.end_headers()
+                    return
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
@@ -60,9 +83,15 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n"
+                  "    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n"
+                  "    body = e.read().decode()\n"
+                  "    sys.stdout.write(body)\n"
+                  "    sys.stderr.write(f'gh: {body} (HTTP {e.code})\\n')\n"
+                  "    sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -107,6 +136,30 @@ def test_pr_completion_requires_current_required_evidence(github):
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
+
+        # Plan-related 403 on rules API allows completion if branch protection / checks pass.
+        github.update(conclusion="success", head="a" * 40, rules_fault="plan_403")
+        tid = kb.create_task(conn, title="plan_403", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "done"
+
+        # Plan-related 403 where branch protection is also absent: required checks inferred from active check runs.
+        github.update(conclusion="success", head="a" * 40, rules_fault="plan_403", no_protection=True)
+        tid = kb.create_task(conn, title="plan_403_no_prot", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "done"
+        github.pop("no_protection", None)
+
+        # Invariant: non-plan 403 (e.g. auth/permission) or 500 on rules API fails closed.
+        for fault in ("auth_403", "server_500"):
+            github.update(conclusion="success", head="a" * 40, rules_fault=fault)
+            tid = kb.create_task(conn, title=fault, completion_contract="acme/repo")
+            assert not kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            t = kb.get_task(conn, tid)
+            assert t is not None and t.status != "done"
+        github.pop("rules_fault", None)
 
 
 @pytest.mark.linux_only
