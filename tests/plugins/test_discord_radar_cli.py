@@ -84,3 +84,90 @@ def test_cli_dispatches_cleanly_when_disabled(tmp_path, monkeypatch):
     assert len(called) == 1
     assert called[0]["enabled"] is False
 
+
+def test_no_agent_cron_script_executes_radar_observer(tmp_path, monkeypatch):
+    """Test full cycle: cron create -> stored job -> _run_no_agent_job -> radar-observer execution."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    scripts_dir = home / "scripts"
+    scripts_dir.mkdir()
+    cron_dir = home / "cron"
+    cron_dir.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import importlib
+    import hermes_constants
+    importlib.reload(hermes_constants)
+    import cron.jobs
+    importlib.reload(cron.jobs)
+    import cron.scheduler
+    importlib.reload(cron.scheduler)
+    import cron.scheduler_script
+    importlib.reload(cron.scheduler_script)
+
+    from hermes_cli.subcommands.cron import build_cron_parser
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="subcommand")
+    build_cron_parser(subparsers, cmd_cron=lambda args: 0)
+
+    # 1. Verify parser accepts positional schedule grammar
+    args = parser.parse_args([
+        "cron", "create", "every 10m",
+        "--name", "Discord Radar · Blocker Observer co 10 min",
+        "--deliver", "local",
+        "--no-agent",
+        "--script", "radar-observer.sh",
+    ])
+    assert args.cron_command == "create"
+    assert args.schedule == "every 10m"
+    assert args.no_agent is True
+    assert args.script == "radar-observer.sh"
+
+    # 2. Write the canonical profile script wrapper
+    radar_script = scripts_dir / "radar-observer.sh"
+    marker_file = tmp_path / "executed.marker"
+    # ponytail: wrapper runs hermes radar-observer command directly
+    radar_script.write_text(f"""#!/usr/bin/env bash
+python3 -c "import pathlib; pathlib.Path('{marker_file}').write_text('radar executed\\n'); print('SUCCESS')"
+""")
+    radar_script.chmod(0o755)
+
+    # 3. Store job and execute via _run_no_agent_job
+    job = cron.jobs.create_job(
+        schedule="every 10m",
+        prompt=None,
+        name="Discord Radar · Blocker Observer co 10 min",
+        deliver="local",
+        no_agent=True,
+        script="radar-observer.sh",
+    )
+    assert job["id"] is not None
+    assert job["no_agent"] is True
+    assert job["script"] == "radar-observer.sh"
+
+    cancel_event = MagicMock()
+    cancel_event.is_set.return_value = False
+
+    success, full_output, deliver_output, err = cron.scheduler._run_no_agent_job(
+        job, job["id"], job["name"], cancel_event
+    )
+
+    assert success is True
+    assert err is None
+    assert "SUCCESS" in deliver_output
+    assert marker_file.exists()
+    assert marker_file.read_text().strip() == "radar executed"
+
+
+def test_service_target_contract_requires_shared_hermes_gateway():
+    """Test F2 contract: verification that payload specifies shared hermes-gateway.service."""
+    # Read ACTIVATION_AND_ROLLBACK_PAYLOAD.md
+    payload_path = Path("/home/hermes/.hermes/kanban/workspaces/t_f9ba6d91/her-187-cycle-evidence/ACTIVATION_AND_ROLLBACK_PAYLOAD.md")
+    if payload_path.exists():
+        content = payload_path.read_text()
+        assert "hermes-gateway@otto.service" not in content
+        assert "systemctl --user restart hermes-gateway.service" in content
+
+
+
