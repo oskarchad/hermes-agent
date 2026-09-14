@@ -98,7 +98,7 @@ def _run(path, target_bot_id, observer_bot_id, dry_run):
     observer = DiscordBlockerObserver(target_bot_id=target_bot_id, observer_bot_id=observer_bot_id)
     if sidecar.exists():
         try:
-            saved = json.loads(sidecar.read_text())
+            saved = json.loads(sidecar.read_text(encoding="utf-8"))
             if not isinstance(saved, dict) or any(not isinstance(v, dict) for v in saved.values()):
                 raise ValueError("Invalid state")
             if any(v.get("version") != 3 for v in saved.values()):
@@ -110,7 +110,7 @@ def _run(path, target_bot_id, observer_bot_id, dry_run):
             report.errors.append("observer_state_corrupt")
             return report
     try:
-        state = json.loads(path.read_text())
+        state = json.loads(path.read_text(encoding="utf-8"))
         token = get_secret("DISCORD_OBSERVER_BOT_TOKEN")
         if not token:
             raise ValueError("Missing scoped Radar token")
