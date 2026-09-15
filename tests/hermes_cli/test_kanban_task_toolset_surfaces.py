@@ -8,6 +8,7 @@ import pytest
 
 from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 from tools import kanban_tools
 
 
@@ -74,7 +75,7 @@ def test_cli_set_toolsets_updates_and_clears_override(
     kanban_home: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="edit", assignee="patch")
 
     set_args = _parse_kanban(
@@ -117,7 +118,7 @@ def test_kanban_create_tool_roundtrips_enabled_toolsets(
     )
 
     assert result["ok"] is True
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, result["task_id"])
     assert task is not None
     assert task.enabled_toolsets == ["terminal", "web"]

@@ -5,6 +5,7 @@ import json
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 def _captain_owner(conn, task_id: str):
@@ -16,7 +17,7 @@ def _captain_owner(conn, task_id: str):
 
 
 def test_connect_installs_captain_persistence_schema(tmp_path):
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = kbc.connect(tmp_path / "kanban.db")
     try:
         names = {
             str(row["name"])
@@ -54,7 +55,7 @@ def test_root_creation_registers_configured_orchestrator_as_captain(
     monkeypatch.setattr(profiles, "profile_exists", lambda name: name.lower() == "otto")
     monkeypatch.setenv("HERMES_SESSION_KEY", "otto-origin")
 
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = kbc.connect(tmp_path / "kanban.db")
     try:
         task_id = kb.create_task(
             conn,
@@ -87,7 +88,7 @@ def test_child_creation_inherits_parent_captain_owner_and_origin(
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
     monkeypatch.setenv("HERMES_SESSION_KEY", "root-origin")
 
-    conn = kb.connect(tmp_path / "kanban.db")
+    conn = kbc.connect(tmp_path / "kanban.db")
     try:
         parent_id = kb.create_task(
             conn,
@@ -126,7 +127,7 @@ def test_child_creation_inherits_parent_captain_owner_and_origin(
 def test_recognized_comment_signal_materializes_only_reference_metadata(
     tmp_path, header, signal_class
 ):
-    conn = kb.connect(tmp_path / f"{signal_class}.db")
+    conn = kbc.connect(tmp_path / f"{signal_class}.db")
     try:
         task_id = kb.create_task(conn, title="signal target", assignee="worker")
         comment_id = kb.add_comment(
@@ -180,7 +181,7 @@ def test_recognized_comment_signal_materializes_only_reference_metadata(
     ],
 )
 def test_ordinary_comment_stays_on_existing_comment_path(tmp_path, body):
-    conn = kb.connect(tmp_path / "ordinary.db")
+    conn = kbc.connect(tmp_path / "ordinary.db")
     try:
         task_id = kb.create_task(conn, title="ordinary", assignee="worker")
         kb.add_comment(conn, task_id, author="wrench", body=body)
@@ -205,7 +206,7 @@ def test_captain_signal_materialization_is_idempotent_by_source_comment(tmp_path
     materialize = getattr(kb, "materialize_captain_signal", None)
     assert callable(materialize)
 
-    conn = kb.connect(tmp_path / "dedupe.db")
+    conn = kbc.connect(tmp_path / "dedupe.db")
     try:
         task_id = kb.create_task(conn, title="dedupe", assignee="worker")
         comment_id = kb.add_comment(
@@ -249,7 +250,7 @@ def test_root_creation_does_not_infer_captain_origin_from_process_env(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("HERMES_SESSION_KEY", "wrench-process-session")
-    conn = kb.connect(tmp_path / "no-inferred-origin.db")
+    conn = kbc.connect(tmp_path / "no-inferred-origin.db")
     try:
         task_id = kb.create_task(
             conn,
@@ -270,7 +271,7 @@ def test_captain_signal_delivery_reads_bounded_redacted_authoritative_comment(
 ):
     from tui_gateway import server
 
-    conn = kb.connect(tmp_path / "delivery.db")
+    conn = kbc.connect(tmp_path / "delivery.db")
     try:
         task_id = kb.create_task(conn, title="decision target", assignee="worker")
         secret = "«redacted:sk-…»"
@@ -318,7 +319,7 @@ def test_captain_ack_and_reply_commit_atomically_once(tmp_path):
     settle_with_reply = getattr(kb, "ack_captain_reports_with_reply", None)
     assert callable(settle_with_reply)
 
-    conn = kb.connect(tmp_path / "reply.db")
+    conn = kbc.connect(tmp_path / "reply.db")
     try:
         task_id = kb.create_task(conn, title="reply target", assignee="worker")
         kb.add_comment(
@@ -373,7 +374,7 @@ def test_captain_ack_and_reply_commit_atomically_once(tmp_path):
 
 
 def test_captain_reply_settlement_rejects_a_mismatched_signal_task(tmp_path):
-    conn = kb.connect(tmp_path / "reply-mismatch.db")
+    conn = kbc.connect(tmp_path / "reply-mismatch.db")
     try:
         task_id = kb.create_task(conn, title="reply mismatch", assignee="worker")
         kb.add_comment(
@@ -426,7 +427,7 @@ def test_gateway_settlement_posts_persisted_otto_reply_on_signal_task_once(
     from tui_gateway import server
 
     db_path = tmp_path / "gateway-reply.db"
-    conn = kb.connect(db_path)
+    conn = kbc.connect(db_path)
     try:
         task_id = kb.create_task(
             conn,
@@ -455,8 +456,8 @@ def test_gateway_settlement_posts_persisted_otto_reply_on_signal_task_once(
     finally:
         conn.close()
 
-    real_connect = kb.connect
-    monkeypatch.setattr(kb, "connect", lambda *args, **kwargs: real_connect(db_path))
+    real_connect = kbc.connect
+    monkeypatch.setattr(kbc, "connect", lambda *args, **kwargs: real_connect(db_path))
     monkeypatch.setattr(
         server,
         "_persisted_captain_report",

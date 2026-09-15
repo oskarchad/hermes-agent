@@ -9,6 +9,7 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -22,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
+
+
+class _IncompleteProcessArgv(ValueError):
+    """A recognized execution operand has no owner in the bounded argv walk."""
 
 
 # Shell-level command shapes that target the gateway lifecycle; each branch is anchored on a
@@ -153,6 +158,12 @@ _TRANSPARENT_COMMAND_PREFIXES = frozenset({
     # Privilege and namespace wrappers: options, then the command they run.
     "pkexec", "su", "runuser", "setpriv", "systemd-run", "nsenter", "unshare",
 })
+
+# These recognized wrappers are not options-then-command in every supported
+# mode: su/runuser have a user operand, nsenter has optional option values, and
+# ionice has variadic process targets. Do not infer argv coverage by peeling
+# them; legacy string discovery keeps its existing best-effort behavior.
+_UNSUPPORTED_ARGV_WRAPPERS = frozenset({"su", "runuser", "nsenter", "ionice"})
 
 # Wrapper options that consume the NEXT token, so a value is never mistaken for the command.
 _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
@@ -447,9 +458,11 @@ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterat
         yield segment
 
 
-def _iter_command_segments(command: str) -> Iterator[list[str]]:
-    """Yield shell-tokenized command segments per logical line; a line shlex rejects (unbalanced
-    quotes) falls back to per-physical-line tokenization."""
+def _iter_command_segments(command: str | list[str]) -> Iterator[list[str]]:
+    """Yield shell segments or one already-decoded exec argv without reinterpreting data."""
+    if isinstance(command, list):
+        yield command
+        return
     for line in _split_logical_lines(command.replace("\\\n", "")):
         try:
             tokens = _shlex_tokens(line)
@@ -470,15 +483,22 @@ def _executable_name(token: str) -> str:
     return Path(token).name or token
 
 
-def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
-    """Index of the command a wrapper chain actually executes. Unchanged if not a wrapper; may be
-    ``len(segment)`` when a wrapper has no operand — callers must bounds-check."""
+def _peel_transparent_prefixes(
+    segment: list[str], index: int, *, require_coverage: bool = False,
+) -> int:
+    """Find the wrapper endpoint; literal argv also requires owned option operands.
+
+    Legacy string callers keep best-effort discovery. The argv consumer cannot
+    use an empty discovery result as proof that a masked operand was inspected.
+    """
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(segment):
-            return index
+            break
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
             return index
+        if require_coverage and name in _UNSUPPORTED_ARGV_WRAPPERS:
+            raise _IncompleteProcessArgv("unsupported wrapper grammar")
         value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
         index += 1
         while index < len(segment):
@@ -487,9 +507,17 @@ def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
                 # POSIX end-of-options: the command starts at the next token.
                 index += 1
                 break
+            if require_coverage and any(
+                token == option or token.startswith(option + "=")
+                or (len(option) == 2 and token.startswith(option))
+                for option in _STRING_COMMAND_OPTIONS.get(name, ())
+            ):
+                raise _IncompleteProcessArgv("wrapper command string")
             if token in value_options:
                 index += 2
                 continue
+            if require_coverage and token.startswith("-"):
+                raise _IncompleteProcessArgv("unsupported wrapper option")
             if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
                 index += 1
                 continue
@@ -497,6 +525,10 @@ def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
         for _ in range(_TRANSPARENT_PREFIX_OPERANDS.get(name, 0)):
             if index < len(segment) and not segment[index].startswith("-"):
                 index += 1
+    if require_coverage and (
+        index >= len(segment) or _executable_name(segment[index]) in _TRANSPARENT_COMMAND_PREFIXES
+    ):
+        raise _IncompleteProcessArgv("wrapper endpoint unresolved")
     return index
 
 
@@ -586,6 +618,32 @@ def _direct_lifecycle_scan(command: str) -> bool:
         _lifecycle_command_scan_with_data_exemption(command)
         or contains_launchctl_submit_command(command)
     )
+
+
+def _direct_argv_lifecycle_scan(argv: list[str]) -> bool:
+    """Apply lifecycle patterns only at the executable position, never inside argv data.
+
+    Shell-program operands and script paths are inspected separately by the
+    existing recursive walk, including for programs not named by these patterns.
+    """
+    from tools.approval_detection import _interpreter_family
+
+    index = _command_token_index(argv)
+    if index is None:
+        raise _IncompleteProcessArgv("missing executable")
+    index = _peel_transparent_prefixes(argv, index, require_coverage=True)
+    executable = _executable_name(argv[index])
+    # These recognized interpreters have no program-source owner here. Refuse
+    # the invocation, including innocuous forms, rather than interpreting a new
+    # language. osascript is the other heredoc interpreter; eval/xargs are the
+    # execution consumers already recognized by _PIPE_TO_INTERPRETER.
+    if _interpreter_family(executable) or executable in {"osascript", "eval", "xargs"}:
+        raise _IncompleteProcessArgv("non-shell interpreter")
+    if executable not in {"hermes", "launchctl", "systemctl", "kill", "pkill"}:
+        # Only executable-reference coverage for arbitrary programs, not a
+        # claim that their arguments are safe or cannot carry another language.
+        return False
+    return _direct_lifecycle_scan(" ".join([executable, *argv[index + 1:]]))
 
 
 # --- path handling ----------------------------------------------------------------------------
@@ -692,8 +750,10 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield token[len(prefix):]
 
 
-def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
-    """Yield the scripts the token at *index* executes, if any."""
+def _references_at(
+    segment: list[str], index: int, cwd: Optional[str], *, require_coverage: bool = False,
+) -> Iterator[Path]:
+    """Yield owned script operands; masked argv must not silently lose shell source."""
     if index >= len(segment):
         return
     executable = segment[index]
@@ -702,6 +762,8 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
     if executable_name in {".", "source"}:
         if len(segment) > index + 1:
             yield from _resolved_or_nothing(segment[index + 1], cwd)
+        elif require_coverage:
+            raise _IncompleteProcessArgv("missing sourced script")
         return
 
     if executable_name in _SHELL_EXECUTABLES:
@@ -713,14 +775,20 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
                 arg_index += 1
                 break
             if argument in _SHELL_COMMAND_FLAGS:
-                break
+                if require_coverage and arg_index + 1 >= len(arguments):
+                    raise _IncompleteProcessArgv("missing shell program")
+                break  # _iter_shell_command_payloads owns this exact flag's source.
             if argument in _SHELL_OPTIONS_WITH_VALUES:
                 arg_index += 2
                 continue
+            if require_coverage and argument.startswith(("-", "+")):
+                raise _IncompleteProcessArgv("unsupported shell option")
             if argument.startswith("-"):
                 arg_index += 1
                 continue
             break
+        if require_coverage and arg_index >= len(arguments):
+            raise _IncompleteProcessArgv("unresolved shell stdin")
         if arg_index < len(arguments) and arguments[arg_index] not in _SHELL_COMMAND_FLAGS:
             yield from _resolved_or_nothing(arguments[arg_index], cwd)
         return
@@ -731,7 +799,7 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
         yield from _resolved_or_nothing(executable, cwd)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
+def _iter_referenced_shell_scripts(command: str | list[str], *, cwd: Optional[str] = None) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
     original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
     a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
@@ -739,13 +807,13 @@ def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
+        yield from _references_at(segment, index, cwd, require_coverage=isinstance(command, list))
         peeled = _peel_transparent_prefixes(segment, index)
         if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+            yield from _references_at(segment, peeled, cwd, require_coverage=isinstance(command, list))
 
 
-def _iter_shell_command_payloads(command: str) -> Iterator[str]:
+def _iter_shell_command_payloads(command: str | list[str]) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` (and ``su -c`` / ``env -S``) for recursive
     scanning."""
     for segment in _iter_command_segments(command):
@@ -881,24 +949,119 @@ def _read_script_for_scanning(script_path: str) -> str:
 
 # --- recursive walk ---------------------------------------------------------------------------
 
+def _python_process_payloads(source: str) -> Optional[tuple[list[str | list[str]], str]]:
+    """Inspect literal process operands, never execute Python or infer aliases/dataflow.
+
+    Called only for complete, quoted Python stdin bodies after the root text budget
+    is charged. Unknown operands of recognized process calls fail closed; syntax
+    failure must not turn partial language parsing into a new allow.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    payloads = []
+    data_spans = []
+    lines = source.encode("utf-8").splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Path constructs a data value, not a shell command. Keep all unknown
+        # calls on the legacy reference path rather than granting a Python-wide
+        # exemption. Only literal operands are removed, never nested calls.
+        if isinstance(node.func, ast.Name) and node.func.id == "Path":
+            for argument in node.args:
+                if (isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+                        and argument.end_lineno is not None and argument.end_col_offset is not None):
+                    data_spans.append((offsets[argument.lineno - 1] + argument.col_offset,
+                                       offsets[argument.end_lineno - 1] + argument.end_col_offset))
+        if not isinstance(node.func, ast.Attribute):
+            continue
+        owner = node.func.value
+        if not isinstance(owner, ast.Name):
+            continue
+        is_system = owner.id == "os" and node.func.attr == "system"
+        is_subprocess = owner.id == "subprocess" and node.func.attr in {
+            "run", "Popen", "call", "check_call", "check_output",
+        }
+        if not (is_system or is_subprocess):
+            continue
+        argument = node.args[0] if node.args else next(
+            (kw.value for kw in node.keywords if kw.arg == ("command" if is_system else "args")),
+            None,
+        )
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            payloads.append(argument.value)
+        elif is_subprocess and isinstance(argument, (ast.List, ast.Tuple)) and argument.elts:
+            argv = []
+            for item in argument.elts:
+                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+                    return None
+                argv.append(item.value)
+            if argument.end_lineno is None or argument.end_col_offset is None:
+                return None
+            payloads.append(argv)
+            # Keep data out of shell re-tokenization. This is not a coverage
+            # verdict: the consumer must finish inspection or explicitly refuse.
+            data_spans.append((offsets[argument.lineno - 1] + argument.col_offset,
+                               offsets[argument.end_lineno - 1] + argument.end_col_offset))
+        else:
+            return None
+    raw = source.encode("utf-8")
+    parts = []
+    previous = 0
+    for start, end in sorted(data_spans):
+        parts.extend((raw[previous:start], b"''", b"\n" * raw.count(b"\n", start, end)))
+        previous = end
+    parts.append(raw[previous:])
+    return payloads, b"".join(parts).decode("utf-8")
+
+
 def _contains_unsafe_gateway_action(
-    command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
+    command: str | list[str], *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
 ) -> bool:
-    # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
-    if not budget.charge_text(command):
+    # Serialization is only for budget accounting, never for argv interpretation.
+    text = shlex.join(command) if isinstance(command, list) else command
+    if not budget.charge_text(text):
         return _budget_exhausted("text", depth)
-    if _direct_lifecycle_scan(command):
+    unsafe = (_direct_argv_lifecycle_scan(command) if isinstance(command, list)
+              else _direct_lifecycle_scan(command))
+    if unsafe:
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    def recurse(text: str, cwd: Optional[str]) -> bool:
+    def recurse(text: str | list[str], cwd: Optional[str]) -> bool:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script,
         )
 
+    from tools.shell_heredoc import split_python_heredoc_bodies
+
+    if isinstance(command, str):
+        shell_source, python_bodies = split_python_heredoc_bodies(command)
+        reference_sources = [shell_source]
+        for source in python_bodies:
+            inspected = _python_process_payloads(source)
+            if inspected is None:
+                return True
+            payloads, reference_source = inspected
+            try:
+                for payload in payloads:
+                    if recurse(payload, cwd):
+                        return True
+            except _IncompleteProcessArgv as exc:
+                logger.warning("lifecycle guard incomplete process argv inspection (%s); refusing", exc)
+                return True
+            reference_sources.append(reference_source)
+        # Unknown Python constructs retain their old shell walk; only proven data
+        # and structured operands already owned by recursion are removed.
+        command = "\n".join(reference_sources)
     for payload in _iter_shell_command_payloads(command):
         if recurse(payload, cwd):
             return True

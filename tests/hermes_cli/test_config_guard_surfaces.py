@@ -62,12 +62,15 @@ class TestCronRunJobGuard:
         job.update(overrides)
         return job
 
-    def test_run_job_fails_closed_on_corrupt_config(self, tmp_path):
+    def test_run_job_fails_closed_on_corrupt_config(self, tmp_path, monkeypatch):
         from cron.scheduler import run_job
 
         _write_corrupt_config(tmp_path)
+        monkeypatch.setattr("cron.delivery_routes.configured_routes", lambda: [])
 
-        success, output_doc, final_response, error = run_job(self._job())
+        success, output_doc, final_response, error = run_job(
+            self._job(deliver="none")
+        )
 
         assert success is False
         assert error is not None

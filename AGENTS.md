@@ -406,6 +406,7 @@ extract, not to regex around it.
 
 For retained runtime changes, read the [ADR index](docs/ADR.md). Approval policy
 changes also follow [ADR 0003](docs/0003-command-aware-approval-deny.md).
+Contributor attribution follows the [contributor guide](contributors/README.md).
 
 | Area | Read | Covers |
 |---|---|---|

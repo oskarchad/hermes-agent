@@ -18,6 +18,8 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 import tui_gateway.server as server
 from tui_gateway.server import _collect_kanban_notifications
 
@@ -48,7 +50,7 @@ def _profile_for(session):
 
 
 def _inbox_states():
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         rows = conn.execute(
             "SELECT state, COUNT(*) AS n FROM kanban_captain_inbox GROUP BY state"
@@ -61,7 +63,7 @@ def _inbox_states():
 def test_captain_gc_rechecks_eligibility_after_concurrent_reopen():
     """A writer queued behind reopen must not purge the reopened task."""
     profile = _profile_for(_session("gc-race"))
-    seed = kb.connect()
+    seed = kbc.connect()
     try:
         tid = kb.create_task(seed, title="gc race", assignee="worker")
         kb.register_captain_owner(
@@ -72,13 +74,13 @@ def test_captain_gc_rechecks_eligibility_after_concurrent_reopen():
     finally:
         seed.close()
 
-    reopen = kb.connect()
+    reopen = kbc.connect()
     begin_attempted = threading.Event()
     outcome = {}
     failures = []
 
     def run_gc():
-        conn = kb.connect()
+        conn = kbc.connect()
         try:
             conn.set_trace_callback(
                 lambda sql: begin_attempted.set()
@@ -116,7 +118,7 @@ def test_captain_gc_rechecks_eligibility_after_concurrent_reopen():
 
     assert failures == []
     assert outcome == {"purged": False}
-    check = kb.connect()
+    check = kbc.connect()
     try:
         task = kb.get_task(check, tid)
         assert task is not None and task.status == "ready"
@@ -142,7 +144,7 @@ def test_live_origin_owns_report_sibling_gets_none():
     profile = _profile_for(origin)
     assert _profile_for(sibling) == profile  # same profile
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap1", assignee="worker")
         kb.register_captain_owner(
@@ -171,7 +173,7 @@ def test_live_origin_owns_report_sibling_gets_none():
 # ── requirement 2: origin gone → another same-profile session claims once ──
 def test_origin_gone_sibling_claims_exactly_once():
     profile = _profile_for(_session(ORIGIN_KEY))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap2", assignee="worker")
         kb.register_captain_owner(
@@ -207,7 +209,7 @@ def test_origin_gone_sibling_claims_exactly_once():
 
 # ── requirement 3: different profile cannot claim ──────────────────────────
 def test_different_profile_cannot_claim():
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn,
@@ -230,7 +232,7 @@ def test_different_profile_cannot_claim():
 # ── requirement 4: restart between lease and ack → expired lease reclaimed ──
 def test_expired_lease_is_reclaimed_and_acked_once():
     profile = _profile_for(_session("live-r"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap4", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -250,7 +252,7 @@ def test_expired_lease_is_reclaimed_and_acked_once():
     assert _collect_kanban_notifications(s, claim_records=[]) == []
 
     # Simulate a process restart past the lease expiry.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute(
@@ -276,7 +278,7 @@ def test_live_owner_renews_lease_past_original_expiry(monkeypatch):
     clock = [1_000]
     monkeypatch.setattr(server.time, "time", lambda: clock[0])
     profile = _profile_for(_session("slow-owner"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="slow-turn", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -316,7 +318,7 @@ def test_expired_owner_cannot_ack_before_a_contender_reclaims(monkeypatch):
     clock = [1_000]
     monkeypatch.setattr(server.time, "time", lambda: clock[0])
     profile = _profile_for(_session("expired-owner"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="expired-owner", assignee="worker")
         kb.register_captain_owner(
@@ -334,7 +336,7 @@ def test_expired_owner_cannot_ack_before_a_contender_reclaims(monkeypatch):
     with pytest.raises(RuntimeError, match="expected 1 row"):
         server._settle_kanban_notification_claims(claims, accepted=True)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         state = conn.execute(
             "SELECT state FROM kanban_captain_inbox WHERE task_id = ?", (tid,)
@@ -362,7 +364,7 @@ def test_captain_lease_renewer_stops_and_propagates_fence_loss(monkeypatch):
 
 def test_ack_exception_releases_claim_for_retry(monkeypatch):
     profile = _profile_for(_session("ack-error"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="ack-error", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -390,7 +392,7 @@ def test_ack_exception_releases_claim_for_retry(monkeypatch):
 
 def test_zero_row_ack_is_failure_and_releases_claim_for_retry(monkeypatch):
     profile = _profile_for(_session("zero-ack"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="zero-ack", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -418,7 +420,7 @@ def test_partial_multi_board_ack_releases_only_unsettled_token(monkeypatch):
     claims = []
     tokens = []
     for board in (kb.DEFAULT_BOARD, second_board):
-        conn = kb.connect(board=board)
+        conn = kbc.connect(board=board)
         try:
             tid = kb.create_task(conn, title=board, assignee="worker")
             kb.register_captain_owner(
@@ -464,8 +466,8 @@ def test_partial_multi_board_ack_releases_only_unsettled_token(monkeypatch):
     with pytest.raises(RuntimeError, match="second board locked"):
         server._settle_kanban_notification_claims(claims, accepted=True)
 
-    first = kb.connect(board=kb.DEFAULT_BOARD)
-    second = kb.connect(board=second_board)
+    first = kbc.connect(board=kb.DEFAULT_BOARD)
+    second = kbc.connect(board=second_board)
     try:
         assert first.execute(
             "SELECT state FROM kanban_captain_inbox WHERE lease_token = ?",
@@ -485,7 +487,7 @@ def test_captain_delivery_uses_one_event_per_turn_across_boards():
     second_board = "captain-one-event-second"
     kb.create_board(second_board)
     for board in (kb.DEFAULT_BOARD, second_board):
-        conn = kb.connect(board=board)
+        conn = kbc.connect(board=board)
         try:
             tid = kb.create_task(conn, title=board, assignee="worker")
             kb.register_captain_owner(
@@ -525,7 +527,7 @@ def test_captain_turn_does_not_batch_an_ordinary_subscription_event():
     second_board = "captain-ordinary-second"
     kb.create_board(second_board)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         captain_tid = kb.create_task(conn, title="captain", assignee="worker")
         kb.register_captain_owner(
@@ -535,10 +537,10 @@ def test_captain_turn_does_not_batch_an_ordinary_subscription_event():
     finally:
         conn.close()
 
-    conn = kb.connect(board=second_board)
+    conn = kbc.connect(board=second_board)
     try:
         ordinary_tid = kb.create_task(conn, title="ordinary", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn,
             task_id=ordinary_tid,
             platform="tui",
@@ -564,7 +566,7 @@ def test_captain_turn_does_not_batch_an_ordinary_subscription_event():
 # ── requirement 5: synthetic turn rejection releases and retries ───────────
 def test_dispatch_failure_releases_then_accepted_retry_no_replay():
     profile = _profile_for(_session("live-f"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap5", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -597,10 +599,10 @@ def test_no_duplicate_across_exact_origin_and_captain_routes():
     _register_live("sid-o", origin)
     profile = _profile_for(origin)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap6", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="tui", chat_id=ORIGIN_KEY,
             notifier_profile=profile,
         )
@@ -620,16 +622,16 @@ def test_no_duplicate_across_exact_origin_and_captain_routes():
     assert _collect_kanban_notifications(origin, claim_records=[]) == []
     # Captain row acked; the exact-origin sub is retained (done is reversible).
     assert _inbox_states() == {"acked": 1}
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
-        assert len(kb.list_notify_subs(conn, task_id=tid)) == 1
+        assert len(kbn.list_notify_subs(conn, task_id=tid)) == 1
     finally:
         conn.close()
 
 
 # ── requirement 7: unattached orchestrator card → inbox, no invented sub ───
 def test_unattached_orchestrator_registers_without_notify_sub():
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn,
@@ -637,7 +639,7 @@ def test_unattached_orchestrator_registers_without_notify_sub():
             assignee="worker",
             captain_profile="orchestrator",
         )
-        assert kb.list_notify_subs(conn, task_id=tid) == []
+        assert kbn.list_notify_subs(conn, task_id=tid) == []
         kb.complete_task(conn, tid, summary="cron done")
         rows = conn.execute(
             "SELECT i.profile, i.state, r.origin_session_key "
@@ -651,7 +653,7 @@ def test_unattached_orchestrator_registers_without_notify_sub():
         assert rows[0]["state"] == "pending"
         assert rows[0]["origin_session_key"] is None
         # No guessed platform/chat destination was invented.
-        assert kb.list_notify_subs(conn, task_id=tid) == []
+        assert kbn.list_notify_subs(conn, task_id=tid) == []
     finally:
         conn.close()
 
@@ -659,7 +661,7 @@ def test_unattached_orchestrator_registers_without_notify_sub():
 # ── requirement 8: reopen/new completion → new event, no acked replay ──────
 def test_reopen_creates_new_report_without_replaying_acked():
     profile = _profile_for(_session("live-re"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap8", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -676,7 +678,7 @@ def test_reopen_creates_new_report_without_replaying_acked():
     server._settle_kanban_notification_claims(c1, accepted=True)
     assert _collect_kanban_notifications(s, claim_records=[]) == []
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
@@ -700,7 +702,7 @@ def test_reopen_creates_new_report_without_replaying_acked():
 
 # ── migration / backward compatibility ─────────────────────────────────────
 def test_missing_captain_tables_are_recreated_on_connect():
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         with kb.write_txn(conn):
             conn.execute("DROP TABLE kanban_captain_inbox")
@@ -711,7 +713,7 @@ def test_missing_captain_tables_are_recreated_on_connect():
     # Force the next connect to re-run the idempotent schema init (as a fresh
     # process would after an upgrade).
     kb._INITIALIZED_PATHS.clear()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         names = {
             r[0]
@@ -731,7 +733,7 @@ def test_missing_captain_tables_are_recreated_on_connect():
 # ── archive cleanup must not drop an unreported pending completion ──────────
 def test_archive_keeps_pending_then_purges_after_accepted_report():
     profile = _profile_for(_session("live-arc"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap-arc", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -758,7 +760,7 @@ def test_archive_keeps_pending_then_purges_after_accepted_report():
     assert "before archive" in texts[0]
     server._settle_kanban_notification_claims(claims, accepted=True)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert conn.execute(
             "SELECT COUNT(*) FROM kanban_captain_inbox WHERE task_id = ?", (tid,)
@@ -772,7 +774,7 @@ def test_archive_keeps_pending_then_purges_after_accepted_report():
 
 def test_archive_with_no_unreported_work_purges_directly():
     profile = _profile_for(_session("live-arc2"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap-arc2", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -786,7 +788,7 @@ def test_archive_with_no_unreported_work_purges_directly():
     assert len(_collect_kanban_notifications(s, claim_records=claims)) == 1
     server._settle_kanban_notification_claims(claims, accepted=True)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.archive_task(conn, tid)
         assert conn.execute(
@@ -802,7 +804,7 @@ def test_archive_with_no_unreported_work_purges_directly():
 # ── bounded / privacy-safe formatting ──────────────────────────────────────
 def test_captain_report_is_bounded_and_privacy_safe():
     profile = _profile_for(_session("live-p"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="cap-priv", assignee="worker",
@@ -827,7 +829,7 @@ def test_captain_report_is_bounded_and_privacy_safe():
 def test_captain_report_omits_raw_error_and_force_redacts_secrets():
     profile = _profile_for(_session("live-secret"))
     fake_secret = "sk-" + "A" * 48
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap-secret", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -854,7 +856,7 @@ def test_captain_report_omits_raw_error_and_force_redacts_secrets():
 
 def test_event_gc_preserves_unreported_captain_source_until_ack():
     profile = _profile_for(_session("live-gc"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap-gc", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -886,7 +888,7 @@ def test_event_gc_preserves_unreported_captain_source_until_ack():
     assert "survives event gc" in texts[0]
     server._settle_kanban_notification_claims(claims, accepted=True)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.gc_events(conn, older_than_seconds=60) >= 1
         assert conn.execute(
@@ -898,7 +900,7 @@ def test_event_gc_preserves_unreported_captain_source_until_ack():
 
 # ── stats diagnostics for unreported Captain rows ──────────────────────────
 def test_board_stats_reports_unreported_captain_backlog():
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         stats0 = kb.board_stats(conn)
         assert stats0["captain_unreported"]["count"] == 0
@@ -918,7 +920,7 @@ def test_board_stats_reports_unreported_captain_backlog():
 
 # ── repair 1: canonical profile normalization (mixed case) ─────────────────
 def test_captain_profile_is_canonically_normalized_mixed_case():
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="cap-norm", assignee="worker", captain_profile="Otto"
@@ -943,7 +945,7 @@ def test_captain_profile_is_canonically_normalized_mixed_case():
 
 def test_mixed_case_profile_session_claims_its_own_rows():
     """A session whose profile differs only in case still claims its reports."""
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="cap-norm2", assignee="worker", captain_profile="otto"
@@ -972,7 +974,7 @@ def test_mixed_case_profile_session_claims_its_own_rows():
 
 # ── repair 2: bounded per-profile stats breakdown ──────────────────────────
 def test_board_stats_captain_per_profile_breakdown():
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         for i, prof in enumerate(["alpha", "beta", "beta"]):
             tid = kb.create_task(
@@ -1000,7 +1002,7 @@ def test_board_stats_captain_per_profile_breakdown():
 
 
 def test_board_stats_captain_per_profile_truncates_at_20():
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         for i in range(23):
             tid = kb.create_task(
@@ -1023,7 +1025,7 @@ def test_board_stats_captain_per_profile_truncates_at_20():
 # ── repair 3: no ack without a settlement handshake ────────────────────────
 def test_collector_without_claim_records_never_consumes_pending():
     profile = _profile_for(_session("live-none"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap-none", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -1039,7 +1041,7 @@ def test_collector_without_claim_records_never_consumes_pending():
     assert _inbox_states() == {"pending": 1}
 
     # Direct helper call with claim_records=None is likewise inert.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         server._collect_captain_reports(
             conn, kb.DEFAULT_BOARD, s, profile, set(), None, []
@@ -1086,7 +1088,7 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     }
     profile = _profile_for(session)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap-loop", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -1150,7 +1152,7 @@ def test_poller_keeps_lease_when_failed_turn_could_not_rollback_input(monkeypatc
         "running": False,
     }
     profile = _profile_for(session)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap-rollback", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -1189,7 +1191,7 @@ def test_poller_defers_captain_claim_for_codex_app_server(monkeypatch):
     }
     profile = _profile_for(session)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cap-codex", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -1252,7 +1254,7 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
     db.create_session(session_id=fallback_session_id, source="tui", model="test")
     profile = _profile_for(_session(first_session_id))
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="captain-reconcile", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -1384,7 +1386,7 @@ def test_reconciliation_ack_failures_do_not_stop_poller_or_receiver_heartbeats(
     }
     _register_live("surviving-runtime", session)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="captain-survives", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -1462,10 +1464,10 @@ def test_cross_process_live_origin_wins_shared_captain_claim():
     sibling = _session(SIBLING_KEY)
     profile = _profile_for(origin)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="cross-process", assignee="worker")
-        kb.add_notify_sub(
+        kbn.add_notify_sub(
             conn, task_id=tid, platform="tui", chat_id=ORIGIN_KEY,
             notifier_profile=profile,
         )
@@ -1512,7 +1514,7 @@ def test_busy_origin_heartbeat_stays_fresh_before_any_event(monkeypatch):
         "running": True,
     }
     profile = _profile_for(origin)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="idle-before-event", assignee="worker")
         kb.register_captain_owner(
@@ -1530,7 +1532,7 @@ def test_busy_origin_heartbeat_stays_fresh_before_any_event(monkeypatch):
     monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
     server._notification_poller_loop(_StopAfterOnePoll(), "sid-origin", origin)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.captain_receiver_is_live(
             conn,
@@ -1547,7 +1549,7 @@ def test_lease_rechecks_origin_liveness_atomically_after_candidate_read(monkeypa
     origin = _session(ORIGIN_KEY)
     sibling = _session(SIBLING_KEY)
     profile = _profile_for(origin)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="atomic-origin", assignee="worker")
         kb.register_captain_owner(
@@ -1590,7 +1592,7 @@ def test_lease_rechecks_origin_liveness_atomically_after_candidate_read(monkeypa
 
 def test_tenant_tagged_unattached_report_has_no_fallback_without_session_identity():
     profile = _profile_for(_session("tenant-origin"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="tenant-a", assignee="worker", tenant="tenant-a"
@@ -1615,7 +1617,7 @@ def test_tenant_tagged_unattached_report_has_no_fallback_without_session_identit
 def test_exact_origin_preserved_for_tenant_task_without_receiver_binding():
     origin = _session(ORIGIN_KEY)
     profile = _profile_for(origin)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(
             conn, title="tenant-origin", assignee="worker", tenant="tenant-a"
@@ -1637,7 +1639,7 @@ def test_exact_origin_preserved_for_tenant_task_without_receiver_binding():
 def test_backlog_is_paged_under_strict_row_and_byte_caps():
     profile = _profile_for(_session("paged"))
     total = server._CAPTAIN_POLL_ROW_CAP * 2 + 3
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         for i in range(total):
             tid = kb.create_task(conn, title=f"paged-{i:04d}", assignee="worker")
@@ -1673,7 +1675,7 @@ def test_row_cap_is_global_across_multiple_boards():
     second_board = "captain-second"
     kb.create_board(second_board)
     for board in (kb.DEFAULT_BOARD, second_board):
-        conn = kb.connect(board=board)
+        conn = kbc.connect(board=board)
         try:
             for index in range(server._CAPTAIN_POLL_ROW_CAP):
                 tid = kb.create_task(
@@ -1699,7 +1701,7 @@ def test_row_cap_is_global_across_multiple_boards():
 
 def test_ineligible_first_page_cannot_starve_later_fallback_report():
     profile = _profile_for(_session("fallback-reader"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         for idx in range(server._CAPTAIN_POLL_ROW_CAP):
             tid = kb.create_task(conn, title=f"owned-{idx}", assignee="worker")
@@ -1729,7 +1731,7 @@ def test_ineligible_first_page_cannot_starve_later_fallback_report():
 
 def test_byte_cap_releases_unrendered_rows_for_next_page(monkeypatch):
     profile = _profile_for(_session("byte-cap"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         for idx in range(2):
             tid = kb.create_task(conn, title=f"byte-cap-{idx}", assignee="worker")
@@ -1764,7 +1766,7 @@ def test_byte_cap_releases_unrendered_rows_for_next_page(monkeypatch):
 
 def test_gc_compacts_old_acked_rows_and_reopen_gets_new_event():
     profile = _profile_for(_session("gc-acked"))
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="gc-acked", assignee="worker")
         kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
@@ -1778,7 +1780,7 @@ def test_gc_compacts_old_acked_rows_and_reopen_gets_new_event():
     assert len(_collect_kanban_notifications(session, claim_records=claims)) == 1
     server._settle_kanban_notification_claims(claims, accepted=True)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         old = int(time.time()) - 3600
         with kb.write_txn(conn):

@@ -589,6 +589,36 @@ hermes dashboard        # "Kanban" tab appears in the nav, after "Skills"
 
 Visually the target is the familiar Linear / Fusion layout: dark theme, column headers with counts, coloured status dots, pill chips for priority and tenant. The plugin reads only theme CSS vars (`--color-*`, `--radius`, `--font-mono`, ...), so it reskins automatically with whichever dashboard theme is active.
 
+### Explicit continuation after a PR checkpoint
+
+For an unclaimed `ready` task (or an intentional `done` reopen), an authenticated
+operator/Captain can call the plugin backend:
+
+```http
+POST /api/plugins/kanban/tasks/{task_id}/resume?board=default
+Content-Type: application/json
+
+{"actor":"otto","reason":"Continue the approved brief on the existing branch and PR"}
+```
+
+Use the dashboard's normal authenticated session. `actor` is a required audit
+label, not a credential or a role override; `reason` must also be non-blank.
+The operation records `promoted_manual` with `source=dashboard_resume`, keeps
+PR comments and run history, and authorizes at most one subsequent claim under
+the existing dispatcher guard. It does not start a worker itself or change the
+assignee. Ordinary edits, comments, and automatic promotion do not grant this
+continuation. Existing review/unblock/specify operations remain unchanged.
+
+The status change and continuation event commit together. Unsatisfied parents,
+an existing claim/run/PID, prior-worker teardown, auth failures and rate-limit
+cooldown still prevent resume. Reopening `done` invalidates dependent tasks
+through the existing lifecycle, with worker termination only after commit.
+A `409` response commits no continuation; when a PR comment and the request
+share a timestamp second, wait until a later second before an explicit retry
+(the guard cannot establish ordering across those tables). Other `409` reasons
+require resolving the reported gate, not automatic retries. Unknown tasks or
+boards return `404`; invalid request fields return `400`/`422`.
+
 ### Auto vs Manual orchestration
 
 The kanban board has two ways to handle a task you drop into the Triage column:

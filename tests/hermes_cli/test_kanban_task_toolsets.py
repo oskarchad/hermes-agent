@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -67,7 +69,7 @@ def test_create_task_normalizes_and_roundtrips_requested_and_effective_toolsets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _allow_task_toolsets(monkeypatch)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="bounded worker",
@@ -84,7 +86,7 @@ def test_create_task_normalizes_and_roundtrips_requested_and_effective_toolsets(
 def test_create_task_null_toolsets_preserves_legacy_profile_inheritance(
     kanban_home: Path,
 ) -> None:
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="legacy", assignee="patch")
         task = kb.get_task(conn, task_id)
 
@@ -98,7 +100,7 @@ def test_idempotent_duplicate_returns_before_toolset_availability_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _allow_task_toolsets(monkeypatch)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="first delivery",
@@ -190,7 +192,7 @@ def test_create_task_rejects_malformed_or_unbounded_toolsets(
     message: str,
 ) -> None:
     _allow_task_toolsets(monkeypatch)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         with pytest.raises(ValueError, match=message):
             kb.create_task(
                 conn,
@@ -314,7 +316,7 @@ agent:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         legacy_id = kb.create_task(
             conn,
             title="spawn inherited task",
@@ -404,7 +406,7 @@ def test_review_transition_preserves_requested_and_effective_toolsets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _allow_task_toolsets(monkeypatch)
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="review bounded surface",
@@ -462,7 +464,7 @@ def test_dispatch_blocks_tampered_unknown_toolset_before_spawn(
     _allow_task_toolsets(monkeypatch)
     spawned: list[str] = []
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="tampered",
@@ -478,7 +480,7 @@ def test_dispatch_blocks_tampered_unknown_toolset_before_spawn(
             "hermes_cli.profiles.profile_exists", lambda _name: True
         )
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             spawn_fn=lambda task, workspace: spawned.append(task.id),
         )
@@ -505,7 +507,7 @@ def test_dispatch_blocks_tampered_review_toolset_before_spawn(
     _allow_task_toolsets(monkeypatch)
     spawned: list[str] = []
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="tampered review",
@@ -522,9 +524,9 @@ def test_dispatch_blocks_tampered_review_toolset_before_spawn(
             "hermes_cli.profiles.profile_exists", lambda _name: True
         )
         monkeypatch.setattr("hermes_cli.kanban_db_dispatch._memory_pressure_level", lambda: "ok")
-        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+        monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             spawn_fn=lambda task, workspace: spawned.append(task.id),
         )
@@ -561,7 +563,7 @@ def test_invalid_toolset_auto_block_preserves_concurrent_owner(
     _allow_task_toolsets(monkeypatch)
     spawned: list[str] = []
 
-    with kb.connect() as dispatcher_conn, kb.connect() as external_conn:
+    with kbc.connect() as dispatcher_conn, kbc.connect() as external_conn:
         task_id = kb.create_task(
             dispatcher_conn,
             title=f"concurrent {lane} claim",
@@ -581,7 +583,7 @@ def test_invalid_toolset_auto_block_preserves_concurrent_owner(
             "hermes_cli.profiles.profile_exists", lambda _name: True
         )
         monkeypatch.setattr("hermes_cli.kanban_db_dispatch._memory_pressure_level", lambda: "ok")
-        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+        monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
 
         claimed: dict[str, kb.Task] = {}
 
@@ -612,7 +614,7 @@ def test_invalid_toolset_auto_block_preserves_concurrent_owner(
             kb, "_available_task_toolset_names", claim_during_validation
         )
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             dispatcher_conn,
             spawn_fn=lambda task, workspace: spawned.append(task.id),
         )
@@ -648,7 +650,7 @@ def test_invalid_toolset_auto_block_rechecks_concurrent_config_update(
 ) -> None:
     _allow_task_toolsets(monkeypatch)
 
-    with kb.connect() as dispatcher_conn, kb.connect() as external_conn:
+    with kbc.connect() as dispatcher_conn, kbc.connect() as external_conn:
         task_id = kb.create_task(
             dispatcher_conn,
             title="concurrent toolset repair",
@@ -681,7 +683,7 @@ def test_invalid_toolset_auto_block_rechecks_concurrent_config_update(
         monkeypatch.setattr(
             kb, "_available_task_toolset_names", repair_during_validation
         )
-        first = kb.dispatch_once(dispatcher_conn, spawn_fn=lambda *_args: None)
+        first = kbd.dispatch_once(dispatcher_conn, spawn_fn=lambda *_args: None)
         current = kb.get_task(dispatcher_conn, task_id)
         first_events = kb.list_events(dispatcher_conn, task_id)
 
@@ -690,7 +692,7 @@ def test_invalid_toolset_auto_block_rechecks_concurrent_config_update(
             "_available_task_toolset_names",
             lambda *_args, **_kwargs: {"context7", "kanban", "web"},
         )
-        second = kb.dispatch_once(
+        second = kbd.dispatch_once(
             dispatcher_conn,
             dry_run=True,
             spawn_fn=lambda *_args: None,
@@ -711,7 +713,7 @@ def test_invalid_toolset_auto_block_rechecks_concurrent_assignee_update(
 ) -> None:
     _allow_task_toolsets(monkeypatch)
 
-    with kb.connect() as dispatcher_conn, kb.connect() as external_conn:
+    with kbc.connect() as dispatcher_conn, kbc.connect() as external_conn:
         task_id = kb.create_task(
             dispatcher_conn,
             title="concurrent assignee repair",
@@ -742,11 +744,11 @@ def test_invalid_toolset_auto_block_rechecks_concurrent_assignee_update(
         monkeypatch.setattr(
             kb, "_available_task_toolset_names", reassign_during_validation
         )
-        first = kb.dispatch_once(dispatcher_conn, spawn_fn=lambda *_args: None)
+        first = kbd.dispatch_once(dispatcher_conn, spawn_fn=lambda *_args: None)
         current = kb.get_task(dispatcher_conn, task_id)
         first_events = kb.list_events(dispatcher_conn, task_id)
 
-        second = kb.dispatch_once(
+        second = kbd.dispatch_once(
             dispatcher_conn,
             dry_run=True,
             spawn_fn=lambda *_args: None,
@@ -778,7 +780,7 @@ def test_dispatch_validates_default_assignee_toolsets_before_claim_or_spawn(
     (default_profile / "config.yaml").write_text("{}\n", encoding="utf-8")
     spawned: list[str] = []
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="default profile validation",
@@ -789,7 +791,7 @@ def test_dispatch_validates_default_assignee_toolsets_before_claim_or_spawn(
             "hermes_cli.profiles.profile_exists", lambda _name: True
         )
 
-        result = kb.dispatch_once(
+        result = kbd.dispatch_once(
             conn,
             default_assignee="patch",
             spawn_fn=lambda task, _workspace: spawned.append(task.id),
