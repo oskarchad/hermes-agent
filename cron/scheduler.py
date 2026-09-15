@@ -2149,6 +2149,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     if _cron_preflight_enabled(_cfg):
         _mcp_reason = _empty_requested_mcp_toolsets(job, _cfg)
         if _mcp_reason:
+            from cron.scheduler_preflight import _blocked_config_result
             setup.blocked = _blocked_config_result(job_id, job_name, _mcp_reason)
     return setup
 

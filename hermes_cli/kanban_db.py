@@ -1497,8 +1497,6 @@ def _resolve_captain_ownership(
         if len(tenants) > 1:
             raise ValueError("parent tasks have conflicting Captain tenants")
         inherited_tenant = next(iter(tenants), None)
-        if tenant and inherited_tenant and str(tenant) != inherited_tenant:
-            raise ValueError("child tenant conflicts with parent Captain tenant")
         return (
             next(iter(profiles)),
             next(iter(origins), None),
