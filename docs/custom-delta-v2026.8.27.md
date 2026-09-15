@@ -1,17 +1,22 @@
 # Hermes v2026.8.27 retained custom delta
 
 This manifest describes the local candidate rebuilt on the exact upstream base
-`v2026.8.27^{commit}=5fc308a70719a83cccdbba4c0e39c23f5a8239d5`.
+`ee4452991d17534aa561f31ee55596d082aa94e7`, then merged with the fork base
+`fork/main = 8e6495a44ee2d6dbaf837c7bf21bb10ba4196283` so the candidate carries
+both the current upstream and the retained fork delta. The earlier
+`v2026.8.27^{commit}=5fc308a70719a83cccdbba4c0e39c23f5a8239d5` base remains an
+ancestor; it is no longer the base this candidate is built on.
 The candidate commit containing this file is the review subject; its exact SHA
-is recorded in the Kanban completion handoff and bound OCR receipt.
+is recorded in the Kanban completion handoff and bound evidence receipt.
 
 The prior custom runtime `e2e0642166c02a682d071b89be9ef73109f88ec5` was used
 only as behavioral evidence. Shared upstream behavior was not replayed.
 
 Governing direction is indexed by `docs/ADR.md` and recorded in
-`docs/0001-retained-custom-runtime-delta.md`. The backend/renderer seam routes
-through `apps/desktop/DESIGN.md`, `docs/kanban/multi-gateway.md`, and
-`docs/session-lifecycle.md` so future contributors reach the same contracts.
+`docs/0001-retained-custom-runtime-delta.md`, with the cron delivery contract in
+`docs/adr/0001-explicit-cron-delivery-binding.md`. The backend/renderer seam
+routes through `apps/desktop/DESIGN.md` so future contributors reach the same
+contracts.
 
 ## 1. Captain inbox, durable signals, and session recovery
 
@@ -31,10 +36,12 @@ through `apps/desktop/DESIGN.md`, `docs/kanban/multi-gateway.md`, and
   `tests/tui_gateway/test_kanban_captain_signals.py`,
   `tests/tui_gateway/test_kanban_notify_poller.py`,
   `tests/tui_gateway/test_failed_turn_retention.py`,
-  `tests/test_tui_gateway_server.py`, `tests/test_hermes_state.py`,
-  the changed turn/runtime tests under `tests/agent/` and `tests/run_agent/`,
-  `ui-tui/src/__tests__/createGatewayEventHandler.test.ts`, and
-  `apps/desktop/src/app/session/hooks/use-message-stream/captain-report-deduplication.test.tsx`.
+  `tests/tui_gateway/test_tui_gateway_server.py`,
+  `tests/hermes_state/test_hermes_state.py`,
+  the changed turn/runtime tests under `tests/agent/`,
+  `ui-tui/src/__tests__/createGatewayEventHandler.test.ts`, and the Desktop
+  message-stream tests under
+  `apps/desktop/src/app/session/hooks/use-message-stream/`.
 - Keep rationale: upstream has no equivalent durable Captain ownership,
   receipt, signal, or recovery contract. The retained code extends upstream
   seams instead of replacing its base session lifecycle.
@@ -51,7 +58,8 @@ through `apps/desktop/DESIGN.md`, `docs/kanban/multi-gateway.md`, and
   `hermes_cli/kanban_alerts.py`, `gateway/kanban_watchers.py`,
   `tui_gateway/server.py`, `plugins/kanban/dashboard/plugin_api.py`, and the
   generated dashboard bundle `plugins/kanban/dashboard/dist/index.js`.
-- Custom/seam tests: changed `tests/hermes_cli/test_kanban_review_*.py`,
+- Custom/seam tests: changed `tests/hermes_cli/test_kanban_review_*.py`, plus
+  the unchanged upstream regression tests this delta must keep green —
   `tests/hermes_cli/test_kanban_host_cap.py`,
   `tests/hermes_cli/test_kanban_notify.py`,
   `tests/hermes_cli/test_kanban_parent_reopen_invalidation.py`,
@@ -73,7 +81,6 @@ through `apps/desktop/DESIGN.md`, `docs/kanban/multi-gateway.md`, and
   `plugins/kanban/dashboard/plugin_api.py`, and the dashboard bundle.
 - Custom/seam tests: `tests/hermes_cli/test_kanban_task_toolset_surfaces.py`,
   `tests/hermes_cli/test_kanban_task_toolsets.py`,
-  `tests/hermes_cli/test_kanban_worker_context_projection.py`,
   `tests/hermes_cli/test_kanban_worker_cgroup_isolation.py`, plus the changed
   dashboard, lifecycle, and review tests.
 - Keep rationale: frozen upstream has neither task-scoped allowlists nor the
@@ -103,6 +110,62 @@ through `apps/desktop/DESIGN.md`, `docs/kanban/multi-gateway.md`, and
   `tests/tools/test_snapshot_session_id_leak.py`.
 - Keep rationale: this is a one-line upstream-seam fix with no parallel
   terminal implementation.
+
+## 6. Governed Kanban lifecycle and explicit resume
+
+- Upstream base: keeps upstream task/run state transitions and dispatch.
+- Retained delta: a governed intake/caller boundary for lifecycle mutations
+  (`governance.evaluate_tx` consulted before status changes and completion),
+  explicit continuation past a PR checkpoint for ready tasks, terminal-action
+  handling for `kanban_request_review` in the stop guard, and the
+  child-tenant-conflict guard on Captain inheritance.
+- Runtime paths: `hermes_cli/kanban_governance.py`,
+  `hermes_cli/kanban_governance_store.py`, `hermes_cli/kanban_db.py`,
+  `agent/kanban_stop.py`, `gateway/kanban_watchers_notifier.py`, and
+  `plugins/kanban/dashboard/plugin_api.py`.
+- Custom/seam tests: `tests/hermes_cli/test_kanban_governance.py`,
+  `tests/hermes_cli/test_kanban_explicit_resume.py`,
+  `tests/gateway/test_kanban_governance_notifications.py`,
+  `tests/plugins/test_kanban_governance_callers.py`, and
+  `tests/agent/test_kanban_stop.py`.
+- Keep rationale: upstream has no governed-intake contract for these lifecycle
+  callers; the retained code gates existing transitions instead of replacing
+  them.
+
+## 7. Opt-in command-aware approval deny
+
+- Upstream base: keeps upstream approval flow, floors, and yolo/mode handling.
+- Retained delta: `approvals.deny_commands` selectors that match executable
+  commands rather than whole-text globs, so a quoted `merge`/`push` inside a PR
+  description cannot trigger a deny; shell control/input boundary handling and
+  positional push repository/tag ref normalization.
+- Runtime paths: `tools/approval.py`, `tools/approval_command_rules.py`,
+  `tools/approval_detection.py`, `tools/approval_floors.py`,
+  `tools/shell_heredoc.py`, and `hermes_cli/config_defaults.py`.
+- Governing decision: `docs/0003-command-aware-approval-deny.md`.
+- Custom/seam test: `tests/tools/test_approval_command_rules.py`.
+- Keep rationale: the upstream deny rule is a whole-text glob; the false-positive
+  class it creates is not addressed upstream.
+
+## 8. Explicit cron delivery binding and restart-safe worker
+
+- Upstream base: keeps upstream scheduling, catch-up, and delivery transport.
+- Retained delta: delivery targets bound to allowed live profile adapters with
+  a preflight route snapshot, a closed delivery-lookup race with blocked-alert
+  dedup, and the restart-safe external cron worker handoff (durable execution
+  ownership transfer, transient user scope with a documented non-scope
+  fallback, and adoption-grace-aligned acknowledgement).
+- Runtime paths: `cron/delivery_routes.py`, `cron/scheduler_worker.py`,
+  `cron/scheduler_delivery.py`, `cron/scheduler.py`, `cron/lifecycle_guard.py`,
+  `gateway/run_cron_delivery.py`, and `gateway/run.py`.
+- Governing decision: `docs/adr/0001-explicit-cron-delivery-binding.md`.
+- Custom/seam tests: `tests/cron/test_explicit_delivery_routes.py`,
+  `tests/cron/test_restart_safe_worker.py`,
+  `tests/cron/test_lifecycle_guard_budget.py`, and
+  `tests/gateway/test_cron_delivery_housekeeping.py`.
+- Keep rationale: upstream binds deliveries at send time and runs cron jobs
+  inside the gateway process, so neither the exact-target contract nor the
+  restart-safe ownership handoff exists upstream.
 
 ## Deliberately dropped
 
