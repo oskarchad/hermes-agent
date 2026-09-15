@@ -309,10 +309,11 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract last_failure_error enabled_toolsets effective_toolsets".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at current_run_id model_override provider_override "
+    "enabled_toolsets effective_toolsets".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")

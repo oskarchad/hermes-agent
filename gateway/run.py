@@ -4534,6 +4534,7 @@ def _start_gateway_housekeeping(
     so chores run under any ``CronScheduler`` provider (external scale-to-zero has no 60s loop).
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_profile_reconcile import _mcp_config_reconciler
+
     chores: list[tuple[int, str, Any]] = []
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for

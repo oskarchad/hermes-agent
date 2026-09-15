@@ -284,6 +284,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+        if platform_name.lower() in covered:
+            continue
         if connected is None:
             try:
                 from gateway.config import load_gateway_config

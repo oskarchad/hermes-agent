@@ -2147,6 +2147,9 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    if not dry_run:
+        from hermes_cli.kanban_governance import reconcile
+        reconcile(conn, now=int(time.time()))
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,

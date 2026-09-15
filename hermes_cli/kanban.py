@@ -625,6 +625,33 @@ def _cmd_set_toolsets(args: argparse.Namespace) -> int:
 
 
 
+def _cmd_set_toolsets(args: argparse.Namespace) -> int:
+    if args.clear and args.toolsets:
+        return _err("kanban: --clear cannot be combined with toolset names", 2)
+    requested = None if args.clear else list(args.toolsets)
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.set_enabled_toolsets(conn, args.task_id, requested)
+            task = kb.get_task(conn, args.task_id) if ok else None
+    except (ValueError, RuntimeError) as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok or task is None:
+        return _err(f"no such task: {args.task_id}")
+    if getattr(args, "json", False):
+        _print_json(_task_to_dict(task))
+    elif requested is None:
+        print(
+            f"Cleared toolset override on {args.task_id} "
+            "(worker inherits its profile toolsets)"
+        )
+    else:
+        print(
+            f"Set toolset override on {args.task_id}: "
+            + ",".join(task.effective_toolsets or ())
+        )
+    return 0
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))

@@ -465,9 +465,7 @@ class InProcessCronScheduler(CronScheduler):
         heartbeated."""
         from cron.scheduler import tick as cron_tick
         from cron.scheduler import CronTickYielded, _is_fd_exhaustion
-        from cron.scheduler_preflight import (
-            SharedRouteAdapters, _primary_profile_routes_for_current_home,
-        )
+
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
 
         initial_homes = _existing_profile_homes(profile_homes)

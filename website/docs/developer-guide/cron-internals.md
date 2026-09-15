@@ -328,6 +328,44 @@ send authorization. No Discord/Slack API is contacted by the regression suite;
 it exercises real worker launch/adoption, preflight, durable queue and gateway
 drain in temporary homes, with an in-memory platform transport.
 
+### Explicit cross-profile final-hop delivery
+
+In the **job-owning home's** `config.yaml`, an optional list binds an exact
+resolved target to an already-connected multiplex profile adapter:
+
+```yaml
+cron:
+  delivery_routes:
+    - platform: discord
+      chat_id: '1546483397059420210'
+      adapter_profile: otto
+```
+
+The gateway must already serve that profile through its existing multiplex
+allowlist. `cron/delivery_routes.py` supplies the same adapter selection to the
+ticker and `gateway/run_cron_delivery.py`. This is transport-only: no profile
+config or token inheritance, job move, new queue, thread creation, or session
+ownership transfer. Use literal string IDs; wildcard, duplicate, malformed and
+thread-specific mappings are rejected. A target containing a thread ID does not
+match a channel-only binding. Unbound targets retain own-adapter and
+satellite-to-primary routing. An absent/empty list preserves existing behavior.
+
+Before any job side effect, explicit routes require an enabled, connected,
+allowed adapter. The restart-safe worker handoff carries only secret-free
+route/gate evidence captured at dispatch, not an adapter or credentials. The
+worker validates this evidence against its owning-home mapping. This safety
+check also applies to script-only jobs and when optional `cron.preflight` is off.
+CLI/manual execution without live adapter evidence fails closed for bound routes.
+
+Final delivery resolves the current adapter and allowlist again. Dispatch intent
+is retained only in the attempt's existing delivery-queue payload (never the job
+registry), so removing/rebinding a route while a worker is running cannot fall
+through to another bot. A missing/disconnected/disallowed adapter or failed live
+send never retries with standalone credentials. Dispatch evidence is not final
+send authorization. No Discord/Slack API is contacted by the regression suite;
+it exercises real worker launch/adoption, preflight, durable queue and gateway
+drain in temporary homes, with an in-memory platform transport.
+
 ### Response Wrapping
 
 By default (`cron.wrap_response: true`), cron deliveries are wrapped with:
@@ -367,6 +405,6 @@ hermes cron remove <job_id>         # Delete a job
 
 ## Related Docs
 
-- [Cron Feature Guide](/user-guide/features/cron)
+- [Cron Feature Guide](../user-guide/features/cron.md)
 - [Gateway Internals](./gateway-internals.md)
 - [Agent Loop Internals](./agent-loop.md)

@@ -13,6 +13,7 @@ MANDATORY_KANBAN_TASK_TOOLSETS = ("context7", "kanban")
 # --toolsets argv pin, so argv presence alone cannot identify task bounds.
 KANBAN_TASK_TOOLSETS_BOUNDED_ENV = "HERMES_KANBAN_TASK_TOOLSETS_BOUNDED"
 
+
 # Shared tool list for CLI and all messaging platform toolsets (edit once, all
 # platforms follow). Desktop GUI affordances are deliberately NOT here: they live
 # in `desktop_ui`/`project`, enabled per desktop-sourced session by the GUI gateway
