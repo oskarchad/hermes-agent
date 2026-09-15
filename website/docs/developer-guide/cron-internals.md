@@ -14,6 +14,8 @@ The cron subsystem provides scheduled task execution — from simple one-shot de
 |------|---------|
 | `cron/jobs.py` | Job model, storage, atomic read/write to `jobs.json` |
 | `cron/scheduler.py` | Scheduler loop — due-job detection, execution, repeat tracking |
+| `cron/scheduler_worker.py` | Restart-safe subprocess launch and payload adoption |
+| `gateway/run_cron_delivery.py` | Live gateway drain of restart-safe delivery queues |
 | `tools/cronjob_tools.py` | Model-facing `cronjob` tool registration and handler |
 | `gateway/run.py` | Gateway integration — cron ticking in the long-running loop |
 | `hermes_cli/cron.py` | CLI `hermes cron` subcommands |
@@ -114,47 +116,6 @@ tick()
   6. Release scheduler lock
 ```
 
-### Missed-occurrence contract (restart gaps)
-
-Recurring jobs are **at-most-once per occurrence, and every occurrence is
-accounted for**: it either runs (one execution row carrying its
-`scheduled_instant`), or its skip is logged with a reason. An occurrence is never
-dropped silently. The mechanics, in the order the due scan applies them
-(`cron/jobs.py::_evaluate_due_job`):
-
-1. **Pre-dispatch advance is provisional.** `tick()` advances `next_run_at` past
-   the due occurrence *before* dispatch so a crash mid-run cannot re-fire it on
-   every restart. Because that leaves a window — advanced, but no fire claim yet
-   (interpreter finalizing, executor refusing work, `SIGKILL`) — the due scan
-   stamps `pending_slot = {scheduled_at, at, by}` on the record in the same
-   save. `claim_job_for_fire` (the point after which side effects may exist)
-   and `mark_job_run` clear it; an explicit `schedule` / `next_run_at` /
-   `enabled` / `state` rewrite (edit, pause, resume, run-now) drops it.
-2. **Restore once.** A later scan that finds a `pending_slot` whose owner is
-   provably gone (this process and the job is not in its running set; another
-   process past the 300 s fire-claim lease or with a dead pid) puts
-   `scheduled_at` back as `next_run_at`, drops the stamp, and logs a WARNING
-   (`cron/occurrences.py::unclaimed_pending_slot`). This happens at most once
-   per lost occurrence — the restored instant then meets the ordinary rules
-   below like any other overdue slot, so there is never a replay of N slots.
-3. **Already fired → never twice.** `completed_occurrence()` consults the
-   executions ledger for a `completed` row with that exact `scheduled_instant`
-   before anything is due; a slot that ran before the restart advances without
-   firing. `failed` / `unknown` rows do not count as completion.
-4. **Late within grace → fire late.** Grace = half the period clamped to
-   `[120 s, 2 h]` (`_compute_grace_seconds`); the dispatch is stamped
-   `last_dispatch.kind = late`.
-5. **Past grace → collapse the backlog, fire once** (`kind = catch_up`), or skip
-   with a logged reason when the operator set `cron.catch_up_missed: false`
-   (planned downtime). One-shots past their 120 s grace are retired with a
-   diagnostic, never resurrected.
-6. **Paused / disabled / terminal jobs never catch up**; the due scan drops them
-   before any of the above, and pause/resume clears any pending slot.
-
-The same store fields drive every topology: a standalone `hermes -p X gateway
-run` and a profile served by the default multiplexer (`_start_multiplex` ticks
-each home under `_profile_cron_scope`) evaluate the identical record.
-
 ### Gateway Integration
 
 In gateway mode, the cron **trigger** (the part that decides *when* a due job
@@ -224,7 +185,7 @@ If Chronos is misconfigured or the agent isn't logged into Nous,
 `resolve_cron_scheduler()` falls back to the built-in ticker (logged warning) —
 cron never loses its trigger. Recurring jobs re-arm after each fire; `repeat`-N
 jobs stop cleanly when the count is exhausted (no orphaned one-shot). The full
-agent↔Nous wire contract lives in [Chronos managed-cron contract](chronos-managed-cron-contract.md).
+agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 
 ### Fresh Session Isolation
 
@@ -328,6 +289,44 @@ Platforms in the first group have explicit, validated target syntax — named ch
 For **Telegram topics**, use `telegram:<chat_id>:<thread_id>` (e.g., `telegram:-1001234567890:17585`). For **Slack threads**, the third segment is the parent message's `thread_ts` (e.g., `slack:C0123ABCD45:1700000000.000100`), so it only applies when replying under an existing message.
 
 **Bot Chat** (`bot-chat`, `bot-chat:<profile>`) is a machine-local pseudo-platform, not a gateway adapter. A mailbox-capable canonical live owner receives durable admission immediately (idle or busy); only that owner executes the incoming turn. `scheduler_delivery._deliver_to_bot_chat` resolves the target with `get_profile_dir` or the job's current `get_hermes_home`, derives the receipt ID from the source home, job ID, durable `execution_id`, and target home, and checks the receipt before discovering an owner. An existing receipt never permits CLI fallback. Without a mailbox owner it retains `hermes [-p <profile>] chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file <tmp>` and normal ownership fencing. Both lanes deliver a real inbound turn, not a transcript mirror. Queued/claimed receipts populate `last_delivery_queued` with receipt IDs. The delivery aggregator excludes admission notices from genuine errors and records execution `delivery_outcome=queued`; successful jobs use `last_status=delivery_queued`. Genuine errors on mixed targets take precedence as failed while retaining queued receipt metadata. The target profile’s durable receipt is authoritative for terminal completion. Queued is the historical admission outcome, not proof of delivery. Historical cron status does not automatically track later receipt completion. Bot-chat targets are excluded from `all` and credential preflight. Bot-chat-only external workers bypass the gateway delivery queue; mixed external-worker targets retain gateway handoff. `cron.bot_chat_delivery_timeout_seconds` (default 600) bounds only the legacy subprocess lane.
+
+### Explicit cross-profile final-hop delivery
+
+In the **job-owning home's** `config.yaml`, an optional list binds an exact
+resolved target to an already-connected multiplex profile adapter:
+
+```yaml
+cron:
+  delivery_routes:
+    - platform: discord
+      chat_id: '1546483397059420210'
+      adapter_profile: otto
+```
+
+The gateway must already serve that profile through its existing multiplex
+allowlist. `cron/delivery_routes.py` supplies the same adapter selection to the
+ticker and `gateway/run_cron_delivery.py`. This is transport-only: no profile
+config or token inheritance, job move, new queue, thread creation, or session
+ownership transfer. Use literal string IDs; wildcard, duplicate, malformed and
+thread-specific mappings are rejected. A target containing a thread ID does not
+match a channel-only binding. Unbound targets retain own-adapter and
+satellite-to-primary routing. An absent/empty list preserves existing behavior.
+
+Before any job side effect, explicit routes require an enabled, connected,
+allowed adapter. The restart-safe worker handoff carries only secret-free
+route/gate evidence captured at dispatch, not an adapter or credentials. The
+worker validates this evidence against its owning-home mapping. This safety
+check also applies to script-only jobs and when optional `cron.preflight` is off.
+CLI/manual execution without live adapter evidence fails closed for bound routes.
+
+Final delivery resolves the current adapter and allowlist again. Dispatch intent
+is retained only in the attempt's existing delivery-queue payload (never the job
+registry), so removing/rebinding a route while a worker is running cannot fall
+through to another bot. A missing/disconnected/disallowed adapter or failed live
+send never retries with standalone credentials. Dispatch evidence is not final
+send authorization. No Discord/Slack API is contacted by the regression suite;
+it exercises real worker launch/adoption, preflight, durable queue and gateway
+drain in temporary homes, with an in-memory platform transport.
 
 ### Response Wrapping
 

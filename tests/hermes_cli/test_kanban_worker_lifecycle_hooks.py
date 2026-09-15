@@ -124,12 +124,25 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
     assert "profile_name" in kw
     assert "board" in kw
 
-def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
+def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks, monkeypatch):
     """A TTL-expired reclaim fires the stale-claim observer post-commit."""
+    committed_states = []
+
+    def _read_state(**kw):
+        with kbc.connect() as fresh:
+            task = kb.get_task(fresh, kw["task_id"])
+            run = kb.latest_run(fresh, kw["task_id"])
+            assert task is not None and run is not None
+            committed_states.append((task.status, task.current_run_id, run.outcome))
+
+    get_plugin_manager()._hooks["on_kanban_worker_stale_claim"].append(_read_state)
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="worker")
         kb.claim_task(conn, tid)
+        # A stale spawned worker is reclaimable; an in-flight spawn is not.
+        assert kbd._set_worker_pid(conn, tid, 98765)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 100, tid),
@@ -144,15 +157,17 @@ def test_stale_claim_reclaim_fires_hook(kanban_home, captured_hooks):
     kw = fired[0][1]
     assert kw["task_id"] == tid
     assert kw["assignee"] == "worker"
-    assert kw["worker_pid"] is None
+    assert kw["worker_pid"] == 98765
     assert kw["heartbeat_stale"] is False
     assert kw["retry_status"] == "ready"
     assert kw["run_id"] is not None
     assert "profile_name" in kw
     assert "board" in kw
+    assert committed_states == [("ready", None, "reclaimed")]
+
 
 def test_raising_callbacks_never_break_worker_lifecycle(
-    kanban_home, all_assignees_spawnable, monkeypatch,
+    kanban_home, all_assignees_spawnable, captured_hooks, monkeypatch,
 ):
     """Raising subscribers must not break spawn, crash reclaim, or stale reclaim."""
     mgr = get_plugin_manager()
@@ -174,13 +189,14 @@ def test_raising_callbacks_never_break_worker_lifecycle(
             assert kbd.detect_crashed_workers(conn) == [tid]
 
             kb.claim_task(conn, tid)
+            assert kbd._set_worker_pid(conn, tid, 98765)
             conn.execute(
-                "UPDATE tasks SET claim_expires = ?, worker_pid = NULL "
-                "WHERE id = ?",
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
                 (int(time.time()) - 100, tid),
             )
             conn.commit()
             assert kb.release_stale_claims(conn) == 1
+            assert {name for name, _ in captured_hooks} == set(WORKER_HOOKS)
         finally:
             conn.close()
     finally:

@@ -532,7 +532,8 @@ describe('useVirtualHistory offset cache reuse', () => {
       const scroll = expose.current!.scroll!
 
       scroll.scrollTo(0)
-      await delay(20)
+      // Range growth is deferred; elapsed time does not prove item-0 mounted.
+      await vi.waitFor(() => expect(expose.current!.virtualHistory.start).toBe(0), { timeout: 2000 })
       scroll.scrollTo(5)
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
       const staleHeights = new Map(initialHeights)

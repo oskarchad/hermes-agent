@@ -3,6 +3,16 @@
 from typing import Dict, List, Any, Set, Optional, Tuple
 
 
+# Dispatcher-owned workers with an explicit task allowlist must retain these
+# surfaces even when the assignee profile disables them for ordinary chats.
+# Keep the order stable: Kanban readback and worker argv expose it verbatim.
+MANDATORY_KANBAN_TASK_TOOLSETS = ("context7", "kanban")
+
+# Set by the dispatcher only when the persisted task row has an explicit
+# enabled_toolsets allowlist. Legacy NULL rows still receive a profile-derived
+# --toolsets argv pin, so argv presence alone cannot identify task bounds.
+KANBAN_TASK_TOOLSETS_BOUNDED_ENV = "HERMES_KANBAN_TASK_TOOLSETS_BOUNDED"
+
 # Shared tool list for CLI and all messaging platform toolsets (edit once, all
 # platforms follow). Desktop GUI affordances are deliberately NOT here: they live
 # in `desktop_ui`/`project`, enabled per desktop-sourced session by the GUI gateway
@@ -14,6 +24,7 @@ _HERMES_CORE_TOOLS = [
     "read_file", "write_file", "patch", "search_files",
     "vision_analyze", "image_generate",
     "skills_list", "skill_view", "skill_manage",
+    "wisdom_inbox", "wisdom_inspect", "present_wisdom_consent",  # Service-gated on Wisdom setup.
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
@@ -101,7 +112,11 @@ TOOLSETS = {
     "skills": _ts(
         "Access, create, edit, and manage skill documents with specialized "
         "instructions and knowledge",
-        ["skills_list", "skill_view", "skill_manage"],
+        ["skills_list", "skill_view", "skill_manage", "wisdom_inbox", "wisdom_inspect", "present_wisdom_consent"],
+    ),
+    "wisdom_consent": _ts(
+        "Present Collective Wisdom consent in the main user-facing conversation",
+        ["present_wisdom_consent"],
     ),
     # web_search belongs to `web`/`search` only. Listing it here too let
     # `disabled_toolsets: [browser]` (headless/Docker deployments) strip
@@ -325,11 +340,9 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
     return to_remove - core
 
 
-# Memo keyed on (name, include_registry, id(registry), registry generation, profile scope);
-# engages only at the public entry (visited is None). The scope is part of the key because a
-# multiplexed process resolves ``mcp-<server>`` per profile overlay: without it profile B got
-# profile A's tool names for a server B never connected (#106005).
-_resolve_toolset_memo: Dict[Tuple[str, bool, int, int, str], List[str]] = {}
+# Memo keyed on (name, include_registry, id(registry), registry generation);
+# engages only at the public entry (visited is None).
+_resolve_toolset_memo: Dict[Tuple[str, bool, int, int], List[str]] = {}
 
 
 def _plugin_platform_bundle(name: str) -> List[str]:
@@ -363,7 +376,7 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     """
     external_call = visited is None
     if external_call:
-        memo_key = (name, include_registry, *_registry_generation(), _registry_call("current_scope_key", ""))
+        memo_key = (name, include_registry, *_registry_generation())
         cached = _resolve_toolset_memo.get(memo_key)
         if cached is not None:
             return list(cached)

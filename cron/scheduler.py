@@ -2260,6 +2260,15 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    from cron.delivery_routes import check_explicit_delivery
+    route_error, _ = check_explicit_delivery(job)
+    if route_error:
+        from cron.scheduler_preflight import _blocked_config_result
+        return _blocked_config_result(job_id, job_name, route_error, mandatory=True)
+    if job.get("preflight_alerted") and (job.get("no_agent") or job.get("kind") == "monitor"):
+        from cron.jobs import clear_preflight_alerted
+        clear_preflight_alerted(job_id)
+
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
@@ -2475,7 +2484,7 @@ def run_one_job(
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
         try:
-            if _launch_external_cron_worker(job):
+            if _launch_external_cron_worker(job, adapters=adapters):
                 return True
         except Exception as handoff_error:
             error = f"Restart-safe cron worker dispatch failed: {handoff_error}"
@@ -2506,20 +2515,22 @@ def run_one_job(
         _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
             fire_owner or None, profile_home)
     try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
+        from cron.delivery_routes import delivery_preflight_scope
+        with delivery_preflight_scope(adapters):
+            return _run_with_fire_claim_heartbeat(
                 job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
-                ),
-                execution_token=execution_token))
+                lambda lost_ownership: _run_one_job_body(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    extra_prompt=extra_prompt,
+                    fire_claim_lost=(
+                        _CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None
+                        else lost_ownership
+                    ),
+                    execution_token=execution_token))
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])
@@ -3095,7 +3106,7 @@ def _wait_for_external_cron_worker(
                 pass
 
 
-def _launch_external_cron_worker(job: dict) -> bool:
+def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
     """Launch *job* outside the managed gateway process when required.
 
     Returns ``False`` outside a managed systemd gateway (in-process path).  In
@@ -3144,13 +3155,21 @@ def _launch_external_cron_worker(job: dict) -> bool:
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
         require_restart_safe_scope=require_restart_safe_scope,
     )
-    if dispatch.mode == "in_process":
+    dispatch_mode = getattr(dispatch, "mode", "in_process" if dispatch == command else "scoped")
+    dispatch_argv = getattr(dispatch, "argv", dispatch)
+    if dispatch_mode == "in_process":
         return False
 
     if mark_execution_handoff_pending(execution_id) is None:
         raise RuntimeError(
             "cron execution claim changed before external worker handoff"
         )
+
+    from cron.delivery_routes import preflight_snapshot
+    try:
+        route_snapshot = preflight_snapshot(adapters)
+    except Exception:
+        route_snapshot = []  # worker independently validates config and blocks before running
 
     _ensure_cron_dir(handoff_dir)
     try:
@@ -3165,6 +3184,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     "job": job,
                     "profile_home": str(_get_hermes_home().resolve()),
                     "multiplex_active": multiplex_active,
+                    "delivery_route_preflight": route_snapshot,
                 },
                 payload_file,
             )
@@ -3188,7 +3208,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
     worker_env = systemd_user_bus_env(worker_env)
     try:
         process = subprocess.Popen(
-            dispatch.argv,
+            dispatch_argv,
             cwd=str(Path(__file__).resolve().parent.parent),
             env=worker_env,
             stdin=subprocess.DEVNULL,
@@ -3351,7 +3371,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                return run_one_job(job, adapters=None, loop=None, verbose=False)
+                from cron.delivery_routes import delivery_preflight_scope
+                with delivery_preflight_scope(snapshot=payload.get("delivery_route_preflight", [])):
+                    return run_one_job(job, adapters=None, loop=None, verbose=False)
             finally:
                 if old_external_execution is None:
                     os.environ.pop("_HERMES_CRON_EXTERNAL_WORKER", None)
