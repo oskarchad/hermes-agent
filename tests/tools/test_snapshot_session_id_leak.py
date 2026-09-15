@@ -140,3 +140,4 @@ def test_delegated_child_marker_never_persists_in_shared_snapshot(tmp_path):
     finally:
         if env is not None:
             env.cleanup()
+

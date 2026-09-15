@@ -41,8 +41,12 @@ def test_checkpoint_continuation_preserves_identity_gates_and_is_consumed(board,
     elif resume == "unblocked":
         assert kb.unblock_task(board, tid)
     elif resume == "promoted_manual":
-        # Even forced promotion cannot bypass the claim-time parent check.
-        assert kb.promote_task(board, tid, actor="operator", force=True)[0]
+        # Unlink the undone parent and move to blocked so promotion legitimately succeeds on 20f7ef4df5
+        assert kb.unlink_tasks(board, parent, tid)
+        assert kb.block_task(board, tid, reason="manual pause", kind="needs_input")
+        assert kb.promote_task(board, tid, actor="operator")[0]
+        # Re-link parent to assert that claim still gates on it
+        kb.link_tasks(board, parent, tid)
     else:
         assert kb.complete_task(board, parent)
         kb.recompute_ready(board)
