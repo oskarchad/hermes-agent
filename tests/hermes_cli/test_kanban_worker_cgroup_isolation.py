@@ -399,10 +399,13 @@ def test_spawn_event_identifies_scope_without_exposing_claim(monkeypatch, tmp_pa
             (task_id,),
         ).fetchone()
         payload = json.loads(event["payload"])
+        # ``started_at`` is upstream's PID-recycle fingerprint (None for this synthetic pid);
+        # the invariant under test is the scope identity WITHOUT the claim lock.
         assert payload == {
             "pid": 67890,
             "isolation_mode": "systemd_scope",
             "scope_unit": scope_unit,
+            "started_at": None,
         }
         assert claimed.claim_lock not in event["payload"]
     finally:

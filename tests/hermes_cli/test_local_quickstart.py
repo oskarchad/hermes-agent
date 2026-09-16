@@ -119,21 +119,23 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
 
 
 @pytest.fixture
-def quickstart_budget(monkeypatch):
-    """Sequencing tests need a fitting machine, not the CI host's RAM/GPU.
+def capable_hardware(monkeypatch):
+    """Success-path orchestration tests need a model to fit, independent of host load.
 
     Keep catalog selection and engine preflight real; only hardware is input.
     """
+    from hermes_cli.local_runtime import hardware
     from hermes_cli.local_runtime.estimator import HardwareBudget
 
-    budget = HardwareBudget(usable_vram_bytes=64 << 30,
-                            total_device_bytes=64 << 30,
-                            ram_available_bytes=64 << 30)
-    monkeypatch.setattr("hermes_cli.local_runtime.hardware.probe_budget",
-                        lambda **kw: budget)
+    gib = 1 << 30
+    budget = HardwareBudget(
+        usable_vram_bytes=64 * gib, total_device_bytes=64 * gib,
+        ram_available_bytes=128 * gib, uma=False,
+    )
+    monkeypatch.setattr(hardware, "probe_budget", lambda **kw: budget)
 
 
-def test_quickstart_runs_all_three_legs(client, quickstart_budget, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, capable_hardware, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -194,7 +196,7 @@ def test_quickstart_runs_all_three_legs(client, quickstart_budget, monkeypatch, 
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, quickstart_budget, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, capable_hardware, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []

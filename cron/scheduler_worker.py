@@ -21,7 +21,6 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
     direct subprocess (process separation kept, cgroup isolation lost).
     """
     from cron.scheduler import (
-        HANDOFF_ADOPTION_GRACE_SECONDS,
         _ensure_cron_dir,
         _get_hermes_home,
         _restart_safe_waiter_job_ids,
@@ -32,6 +31,8 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
         mark_execution_handoff_pending,
         windows_hide_flags,
     )
+    from cron.executions import HANDOFF_ADOPTION_GRACE_SECONDS
+
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
     handoff_dir = _get_hermes_home() / "cron" / "external-workers"
@@ -57,6 +58,7 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
     from tools.environments.local import build_subprocess_env, strip_launch_profile_env
     from tools.process_registry import (
         restart_safe_gateway_child_argv,
+        scoped_spawn_lost_user_bus,
         systemd_user_bus_env,
     )
 
@@ -72,9 +74,7 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
         require_restart_safe_scope=require_restart_safe_scope,
     )
-    dispatch_mode = getattr(dispatch, "mode", "in_process" if dispatch == command else "scoped")
-    dispatch_argv = getattr(dispatch, "argv", dispatch)
-    if dispatch_mode == "in_process":
+    if dispatch.mode == "in_process":
         return False
 
     if mark_execution_handoff_pending(execution_id) is None:
@@ -82,6 +82,8 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
             "cron execution claim changed before external worker handoff"
         )
 
+    # The worker has no gateway adapters, so the exact allowed delivery routes are snapshotted
+    # here and carried in the payload (ADR docs/adr/0001-explicit-cron-delivery-binding.md).
     from cron.delivery_routes import preflight_snapshot
     try:
         route_snapshot = preflight_snapshot(adapters)
@@ -123,9 +125,19 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
     finally:
         reset_secret_scope(secret_token)
     worker_env = systemd_user_bus_env(worker_env)
+    # Unattended worker: the gateway sets HERMES_EXEC_ASK at startup (interactive launches set
+    # the other two), and an inherited presence var makes every env-fallback consumer in the
+    # child (`_is_interactive_cli`, sudo prompting, `check_cronjob_requirements`) believe a
+    # human is present to answer (#110932).
+    for _presence_var in (
+        "HERMES_INTERACTIVE",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_EXEC_ASK",
+    ):
+        worker_env.pop(_presence_var, None)
     try:
         process = subprocess.Popen(
-            dispatch_argv,
+            dispatch.argv,
             cwd=str(Path(__file__).resolve().parent.parent),
             env=worker_env,
             stdin=subprocess.DEVNULL,
@@ -198,6 +210,14 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
             with _running_lock:
                 _restart_safe_waiter_job_ids.discard(job_id)
             payload_path.unlink(missing_ok=True)
+            if dispatch.mode == "scoped" and scoped_spawn_lost_user_bus(worker_env):
+                # systemd-run itself failed (stderr is DEVNULL): name the cause, not the exit code.
+                raise RuntimeError(
+                    "restart-safe systemd scope could not be created: the user D-Bus session at "
+                    f"/run/user/{os.getuid()}/bus disappeared after the gateway started. On a "  # windows-footgun: ok — scoped dispatch exists only on Linux
+                    "system-level service install, run `sudo loginctl enable-linger <gateway-user>`; "
+                    "the next fire dispatches without scope isolation."
+                )
             raise RuntimeError(
                 f"cron external worker exited before ownership acknowledgement "
                 f"(exit {returncode})"
@@ -221,7 +241,6 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
         handoff_files=(payload_path, ack_path),
     )
 
-
 def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
     """Adopt and execute one gateway-dispatched cron payload.
 
@@ -229,8 +248,7 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
     here before the ready acknowledgement is published.  No side effect runs
     unless that durable ownership transfer succeeds.
     """
-    from cron.scheduler import run_one_job
-    from cron.jobs import use_cron_store
+    from cron.scheduler import (use_cron_store, run_one_job)
     try:
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         job = payload["job"]
@@ -302,4 +320,3 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
         reset_secret_scope(secret_token)
         set_multiplex_active(previous_multiplex)
         reset_hermes_home_override(home_token)
-

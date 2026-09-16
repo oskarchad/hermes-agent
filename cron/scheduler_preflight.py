@@ -232,14 +232,13 @@ def _blocked_config_result(job_id, job_name, reason, *, mandatory=False):
         f"**Job ID:** {job_id}\n"
         f"**Run Time:** {_sched._hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"**Status:** BLOCKED (configuration)\n\n"
-        "Pre-dispatch validation found a configuration problem and "
-        "the agent was NOT run (no tokens spent).\n\n"
+        "The pre-run configuration check found a problem, so the agent did not run "
+        "(nothing was charged).\n\n"
         f"**Reason:** {reason}\n\n"
-        "The job will stay blocked (without re-alerting) until the "
-        "configuration is fixed; the next healthy run clears this "
-        "state."
-        + (" This route safety check cannot be disabled by cron.preflight." if mandatory else
-           " Set `cron.preflight: false` in config.yaml to disable this validation.")
+        "Hermes tries again at the next scheduled time and clears this state on the first healthy "
+        "run; this alert is not repeated. Check with `hermes cron doctor`."
+        + (" This route safety check cannot be disabled." if mandatory else
+           " Set `cron.preflight: false` in config.yaml to disable this check.")
     )
     return False, blocked_doc, "", f"{marker} {reason}"
 
@@ -269,10 +268,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
             if _delivery.parse_bot_chat_deliver_token(part) is not None:
                 continue
-            p = part.split(":", 1)[0].strip()
-            if p.lower() in covered:
-                continue
-            platform_parts.append(p)
+            platform_parts.append(part.split(":", 1)[0].strip())
     if not platform_parts:
         return None
 

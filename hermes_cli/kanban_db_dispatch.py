@@ -259,6 +259,30 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _worker_alive(pid: Optional[int], started_at: Optional[int]) -> bool:
+    """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the start-time
+    fingerprint recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated
+    process can own the number, so bare existence is never enough to extend a claim or to signal.
+    A legacy row without a fingerprint keeps the existence answer: killing it is the pre-fingerprint
+    behaviour and the row is rewritten with a fingerprint on its next spawn."""
+    return _kb._pid_alive(pid) and not _pid_recycled(pid, started_at)
+
+
+def _pid_recycled(pid: Optional[int], started_at: Optional[int]) -> bool:
+    """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
+    longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never recycled."""
+    if started_at is None or not pid:
+        return False
+    from gateway.status import _start_times_agree, get_process_start_time
+    current = get_process_start_time(int(pid))
+    if current is None:
+        return True
+    try:
+        return not _start_times_agree(current, started_at)
+    except (TypeError, ValueError):
+        return True
+
+
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
     """``signal_fn`` test hook, else ``os.kill`` when the platform has one."""
     if signal_fn is not None:
@@ -266,10 +290,10 @@ def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
     return os.kill if hasattr(os, "kill") else None
 
 
-def _poll_worker_exit(pid: int) -> bool:
+def _poll_worker_exit(pid: int, started_at: Optional[int] = None) -> bool:
     """Poll ~5 s (10 x 0.5 s) for ``pid`` to die; True once it is gone."""
     for _ in range(10):
-        if not _kb._pid_alive(pid):
+        if not _worker_alive(pid, started_at):
             return True
         time.sleep(0.5)
     return False
@@ -312,11 +336,17 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    started_at: Optional[int] = None,
     scope_expected: Optional[bool] = None,
     scope_unit: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Stop a host-local worker and verify its exact ownership boundary."""
+    """Stop a host-local worker and verify its exact ownership boundary.
+
+    ``started_at`` is the spawn-time fingerprint: when the live process no longer matches it, the
+    PID was recycled and nothing is signalled — the worker is gone, which is what the reclaim
+    wanted (``terminated`` = True)."""
     import signal
+
 
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
@@ -343,6 +373,14 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    # A recycled PID (fingerprint mismatch) is never signalled: our worker is already gone,
+    # which is exactly what the reclaim wanted.
+    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
+        info["terminated"] = True
+        info["pid_recycled"] = True
+        info["cleanup_verified"] = not info["scope_expected"]
+        return info
+
     info["termination_attempted"] = True
     if info["scope_expected"]:
         info["scope_stop_attempted"] = True
@@ -356,37 +394,37 @@ def _terminate_reclaimed_worker(
 
     should_signal = (
         signal_fn is not None and not info["scope_stopped"]
-    ) or _kb._pid_alive(pid)
+    ) or _worker_alive(pid, started_at)
     if should_signal:
         try:
             info["termination_target"] = _signal_owned_worker(
                 int(pid), signal.SIGTERM, signal_fn=signal_fn,
             )
         except ProcessLookupError:
+            # Already gone = successful termination. Leaving terminated=False would
+            # make the reclaim guard misread a dead worker as alive and defer forever.
             info["terminated"] = True
             info["cleanup_verified"] = not info["scope_expected"]
             return info
         except (PermissionError, OSError):
             return info
 
-    for _ in range(10):
-        if not _kb._pid_alive(pid):
-            info["terminated"] = True
-            info["cleanup_verified"] = not info["scope_expected"]
-            return info
-        time.sleep(0.5)
+    if _poll_worker_exit(pid, started_at):
+        info["terminated"] = True
+        info["cleanup_verified"] = not info["scope_expected"]
+        return info
 
-    if _kb._pid_alive(pid):
+    if _worker_alive(pid, started_at):
         try:
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            _sigkill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
             info["termination_target"] = _signal_owned_worker(
-                int(pid), _sigkill, signal_fn=signal_fn,
+                int(pid), _sigkill_sig, signal_fn=signal_fn,
             )
             info["sigkill"] = True
         except (ProcessLookupError, PermissionError, OSError):
             return info
 
-    info["terminated"] = not _kb._pid_alive(pid)
+    info["terminated"] = not _worker_alive(pid, started_at)
     info["cleanup_verified"] = bool(
         info["scope_stopped"]
         if info["scope_expected"]
@@ -591,7 +629,7 @@ def enforce_max_runtime(
     host_prefix = f"{_kb._claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.current_run_id, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -611,16 +649,20 @@ def enforce_max_runtime(
         pid = int(row["worker_pid"])
         tid = row["id"]
         run_id: Optional[int] = None
+        started_at = _kb._row_get(row, "worker_started_at")
         snapshot_run = row["current_run_id"]
         expected_identity: _WorkerIdentity = (tid, snapshot_run, pid, row["claim_lock"])
         guard_sql, guard_params = _worker_identity_guard(tid, expected_identity)
         term_fn = getattr(_kb, "_terminate_reclaimed_worker", _terminate_reclaimed_worker)
         scope_exp_fn = getattr(_kb, "_worker_scope_expected", _worker_scope_expected)
         scope_unit_fn = getattr(_kb, "_worker_scope_unit", _worker_scope_unit)
+        # SIGTERM then SIGKILL after the grace poll; a recycled PID (fingerprint
+        # mismatch) is never signalled because that worker is already gone.
         termination = term_fn(
             pid,
             row["claim_lock"],
             signal_fn=signal_fn,
+            started_at=started_at,
             scope_expected=scope_exp_fn(conn, tid, run_id=snapshot_run),
             scope_unit=scope_unit_fn(conn, tid, run_id=snapshot_run),
         )
@@ -685,7 +727,8 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, t.current_run_id, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -714,6 +757,7 @@ def detect_stale_running(
             pid,
             lock,
             signal_fn=signal_fn,
+            started_at=_kb._row_get(row, "worker_started_at"),
             scope_expected=scope_exp_fn(conn, tid, run_id=snapshot_run),
             scope_unit=scope_unit_fn(conn, tid, run_id=snapshot_run),
         )
@@ -769,14 +813,14 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_started_at FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _kb._pid_alive(pid):
+        if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
             # Never requeue beside a live process. Retry next tick.
             _kb._log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
@@ -1014,7 +1058,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
 
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, current_run_id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, current_run_id, claim_lock, started_at, assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1026,8 +1070,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             grace_fn = getattr(_kb, "_resolve_crash_grace_seconds", _kb._resolve_crash_grace_seconds)
             if started_at is not None and time.time() - started_at < grace_fn():
                 continue
-            pid_alive_fn = getattr(_kb, "_pid_alive", _kb._pid_alive)
-            if pid_alive_fn(row["worker_pid"]):
+            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
 
             cleanup_entry = cleanup_ready.get(row["id"])
@@ -1314,7 +1357,14 @@ def _set_worker_pid(
     expected_run_id: Optional[int] = None,
     expected_claim_lock: Optional[str] = None,
 ) -> bool:
-    """Record the spawned child'''s pid + emit a ``spawned`` event."""
+    """Record the spawned child's pid + its start-time fingerprint, and emit a ``spawned`` event.
+
+    The fingerprint is what lets every later liveness/kill decision tell OUR worker from a process
+    that recycled the PID after a reboot. The write is a CAS against the exact claiming run: a
+    displaced spawn must never stamp its pid over its replacement owner.
+    """
+    from gateway.status import get_process_start_time
+    started_at = get_process_start_time(int(pid))
     if expected_run_id is None or expected_claim_lock is None:
         row = conn.execute(
             "SELECT id, current_run_id, worker_pid, claim_lock FROM tasks "
@@ -1339,9 +1389,9 @@ def _set_worker_pid(
         if owner is None:
             return False
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ? AND status = 'running' "
+            "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ? AND status = 'running' "
             "AND current_run_id IS ? AND claim_lock IS ? AND worker_pid IS NULL",
-            (int(pid), task_id, expected_run_id, expected_claim_lock),
+            (int(pid), started_at, task_id, expected_run_id, expected_claim_lock),
         )
         conn.execute(
             "UPDATE task_runs SET worker_pid = ? WHERE id = ? AND task_id = ? "
@@ -1349,7 +1399,7 @@ def _set_worker_pid(
             "AND claim_lock IS ? AND worker_pid IS NULL",
             (int(pid), expected_run_id, task_id, expected_claim_lock),
         )
-        payload: dict[str, Any] = {"pid": int(pid)}
+        payload: dict[str, Any] = {"pid": int(pid), "started_at": started_at}
         isolation_mode = getattr(pid, "isolation_mode", None)
         if isolation_mode:
             payload["isolation_mode"] = isolation_mode
@@ -1572,12 +1622,62 @@ def check_respawn_guard(
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     """``hermes_cli.profiles.profile_exists``, or ``None`` when it cannot be
     imported (local import avoids a cycle; callers fall back to trusting the
-    assignee)."""
+    assignee).
+
+    When ``kanban.dispatch_profiles`` is set (#110995) the returned predicate
+    additionally requires the assignee to be listed, fail-closed — so a card
+    assigned to ``default`` is only claimable by homes that opted into it.
+    Foreign assignees land in the existing ``skipped_nonspawnable`` bucket.
+    """
     try:
-        from hermes_cli.profiles import profile_exists
+        from hermes_cli.profiles import normalize_profile_name, profile_exists
     except Exception:
         return None
-    return profile_exists
+    allowlist = _dispatch_profile_allowlist(normalize_profile_name)
+    if allowlist is None:
+        return profile_exists
+
+    def _gated(name: str) -> bool:
+        try:
+            canon = normalize_profile_name(name)
+        except ValueError:
+            return False
+        return canon in allowlist and bool(profile_exists(name))
+
+    return _gated
+
+
+def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
+    """Per-home claim allowlist ``kanban.dispatch_profiles`` (#110995).
+
+    On a shared board (one ``kanban.db`` mounted across several Hermes homes),
+    every home's ``profile_exists`` returns True for ``default`` — the root
+    profile every home has — so a card assigned to ``default`` is claimable by
+    every home's dispatcher. A home opts out of foreign claims by declaring
+    which assignees it may claim::
+
+        kanban:
+          dispatch_profiles: ["sage", "researcher"]   # or "sage,researcher"
+
+    Returns ``None`` when the key is unset (upstream behavior: any existing
+    profile is claimable). A set value is fail-closed: an empty list claims
+    nothing. Config read is fail-open like the sibling ``kanban.*`` readers.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("dispatch_profiles")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    names = [str(n) for n in raw] if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    allowed = set()
+    for n in names:
+        try:
+            allowed.add(normalize_profile_name(n))
+        except ValueError:
+            continue
+    return frozenset(allowed)
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
@@ -2013,7 +2113,7 @@ def _run_reclaim_phase(
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
-    result.reclaimed = _kb.release_stale_claims(conn)
+    result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
@@ -2108,18 +2208,17 @@ def _any_spawnable_review(review_rows: list[sqlite3.Row]) -> bool:
 
 
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
-    """``kanban.default_assignee`` when it names a real profile. When the
-    profiles module isn't importable trust the operator's config: the
-    downstream profile_exists check still buckets a missing profile as
-    nonspawnable."""
+    """``kanban.default_assignee`` when it names a real profile this home may
+    claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
+    gate). Otherwise ``None`` so an unassigned shared-board card is never
+    written to. When the profiles module isn't importable trust the
+    operator's config: the downstream check still buckets a missing profile
+    as nonspawnable."""
     name = (default_assignee or "").strip() or None
     if name:
-        try:
-            from hermes_cli.profiles import profile_exists
-            if not profile_exists(name):
-                return None
-        except Exception:
-            pass
+        profile_exists = _profile_exists_fn()
+        if profile_exists is not None and not profile_exists(name):
+            return None
     return name
 
 
@@ -2419,15 +2518,24 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     if not hermes_home:
         return None
     try:
+        from agent.secret_scope import (
+            build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope)
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
         token = set_hermes_home_override(hermes_home)
+        # Toolset availability probes read credentials (``get_secret``); under multiplex an
+        # unscoped read raises and the pin was silently dropped for every worker.
+        secret_token = (
+            set_secret_scope(build_profile_secret_scope(Path(hermes_home)))
+            if is_multiplex_active() else None)
         try:
             cfg = load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
             reset_hermes_home_override(token)
         return toolsets or None
     except Exception as exc:
@@ -2564,13 +2672,15 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     if workspaces_root_path in _retagged_workspace_roots:
         return
     try:
-        from hermes_state import SessionDB
+        from hermes_state_registry import acquire, release_or_close
 
-        db = SessionDB()
+        # Inside the gateway the dispatcher shares the process's registry handle; a bare
+        # SessionDB() here was one more writer connection on the same state.db (#100896).
+        db = acquire()
         try:
             db.retag_kanban_worker_sessions(workspaces_root_path)
         finally:
-            db.close()
+            release_or_close(db)
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
@@ -2813,12 +2923,16 @@ def _worker_scope_unit(
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
-    """Wrap a managed-gateway worker in the shared restart-safe scope."""
+    """Wrap a managed-gateway worker in the shared restart-safe scope.
+
+    Kanban workers are long-lived agentic runs, so they never take cron's
+    degraded mode: ``require_restart_safe_scope=True`` makes the helper raise.
+    """
     from tools.process_registry import restart_safe_gateway_child_argv
 
     if task.current_run_id is None:
         # Outside managed systemd this is harmless, but a managed dispatch must
-        # never mint an untraceable scope.  Check topology through the shared
+        # never mint an untraceable worker.  Check topology through the shared
         # helper first, using a placeholder suffix that cannot be launched.
         dispatch = restart_safe_gateway_child_argv(
             command,
@@ -2832,12 +2946,11 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
             )
         return command
 
-    dispatch = restart_safe_gateway_child_argv(
+    return restart_safe_gateway_child_argv(
         command,
         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
         require_restart_safe_scope=True,
-    )
-    return dispatch.argv
+    ).argv
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
@@ -2856,13 +2969,33 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    from agent.secret_scope import is_multiplex_active
-    from tools.environments.local import build_subprocess_env
+    from agent.secret_scope import (
+        build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope)
+    from tools.environments.local import build_subprocess_env, strip_launch_profile_env
 
-    env = build_subprocess_env(
-        scrub_secrets=is_multiplex_active(),
-        inherit_profile_home=True,
-    )
+    try:
+        profile_home = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # No profile dir (isolated test fixtures) — the CLI resolves it from
+        # HERMES_PROFILE (set below) instead.
+        profile_home = None
+
+    multiplex_active = is_multiplex_active()
+    # build_subprocess_env's secret scrub resolves terminal.env_passthrough vars
+    # through get_secret(), which raises UnscopedSecretError with no profile scope
+    # installed while multiplexing is on — mirrors _resolve_worker_cli_toolsets's
+    # own scope-then-read ordering a few functions up in this module.
+    secret_token = (
+        set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+        if multiplex_active and profile_home else None)
+    try:
+        env = build_subprocess_env(
+            scrub_secrets=multiplex_active,
+            inherit_profile_home=True,
+        )
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
     # The dispatcher is detached from every conversation; its worker must never
     # inherit routing mirrored by a previous gateway turn.
     from gateway.session_context import _VAR_MAP
@@ -2873,12 +3006,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # without it the child's get_hermes_home() falls back to the DEFAULT
     # profile root because `hermes -p` applies its override before
     # hermes_constants is imported.
-    try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # No profile dir (isolated test fixtures) — the CLI resolves it from
-        # HERMES_PROFILE (set below) instead.
-        pass
+    if profile_home:
+        env["HERMES_HOME"] = profile_home
+        # A multiplexer dispatching for another profile must not hand it the launch
+        # profile's .env settings / TERMINAL_* policy — a standalone dispatcher never would.
+        strip_launch_profile_env(env, profile_home)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -2937,11 +3069,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    # A worker spawned by a managed systemd gateway must leave the gateway's
+    # cgroup before startup; otherwise restarting the service kills the worker
+    # that is performing the handoff.
     scoped_cmd = _restart_safe_worker_argv(task, cmd)
-    from tools.process_registry import systemd_user_bus_env
-    env = systemd_user_bus_env(env)
     worker_scoped = scoped_cmd is not cmd
     cmd = scoped_cmd
+    from tools.process_registry import systemd_user_bus_env
+    env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
     isolation_mode = "process_session"
     scope_unit: Optional[str] = None
