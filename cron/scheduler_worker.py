@@ -83,7 +83,8 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
         )
 
     # The worker has no gateway adapters, so the exact allowed delivery routes are snapshotted
-    # here and carried in the payload (ADR docs/adr/0001-explicit-cron-delivery-binding.md).
+    # here and carried in the payload (ADR
+    # website/docs/developer-guide/adr/0001-explicit-cron-delivery-binding.md).
     from cron.delivery_routes import preflight_snapshot
     try:
         route_snapshot = preflight_snapshot(adapters)
