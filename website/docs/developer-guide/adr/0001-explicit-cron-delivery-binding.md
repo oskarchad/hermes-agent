@@ -47,4 +47,4 @@ Independent exact-SHA review is required. Merge, release, restart, production
 configuration changes and a delivery-only canary remain operator-owned gates;
 this ADR grants none of those permissions.
 
-See the [cron implementation contract](../../website/docs/developer-guide/cron-internals.md).
+See the [cron implementation contract](../cron-internals.md).

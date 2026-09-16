@@ -48,9 +48,9 @@ gates remain unchanged. ADR 0002's overlay maintenance direction still applies.
 
 ## Contract and migration
 
-The [configuration defaults](../hermes_cli/config_defaults.py) are the settings
-catalog; the [security reference](../website/docs/user-guide/security.md) defines
-user-facing semantics. The [tools rules](../tools/AGENTS.md) govern integration.
+The [configuration defaults](../../../hermes_cli/config_defaults.py) are the settings
+catalog; the [security reference](../user-guide/security.md) defines
+user-facing semantics. The [tools rules](../../../tools/AGENTS.md) govern integration.
 
 After independent review and a separately authorized runtime release, the policy
 owner may replace only the defective merge glob (or its three-glob attempted
