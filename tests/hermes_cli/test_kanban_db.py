@@ -545,6 +545,69 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         assert len(kb.list_runs(conn, t)) == 0
 
 
+def _seed_governance_rows(conn, task_id: str, run_id: int) -> None:
+    """Bind ``task_id`` through every governance table that FKs back to it."""
+    conn.execute(
+        "INSERT INTO kanban_workflows VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("wf1", "audit", None, "d1", "l1", "real", "active", 1, "{}", "a" * 64),
+    )
+    conn.execute(
+        "INSERT INTO kanban_task_bindings VALUES (?,?,?,?,?)",
+        (task_id, "wf1", "{}", None, 1),
+    )
+    conn.execute(
+        "INSERT INTO kanban_dispositions VALUES (?,?,?,?,?,?,?)",
+        ("ak1", "wf1", "create", "tk1", "{}", task_id, "applied"),
+    )
+    conn.execute(
+        "INSERT INTO kanban_invocations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("inv1", task_id, run_id, "wf1", "{}", "wrench", "lock1", "real",
+         "b" * 64, "[]", None, "v1", None, "started"),
+    )
+
+
+def test_delete_task_cascades_governance_bindings(kanban_home):
+    """A governance-bound task deletes cleanly: the FK rows go with it."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="governed", assignee="alice")
+        kb.claim_task(conn, t)
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (t,)
+        ).fetchone()[0]
+        kb.complete_task(conn, t, result="done")
+        _seed_governance_rows(conn, t, run_id)
+        conn.commit()
+
+        assert kb.delete_task(conn, t) is True
+        assert kb.get_task(conn, t) is None
+        for table in ("kanban_task_bindings", "kanban_dispositions", "kanban_invocations"):
+            assert conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (t,)
+            ).fetchone()[0] == 0
+
+
+def test_delete_archived_task_cascades_governance_bindings(kanban_home):
+    """The archived-delete path shares the cascade; it must not trip the FKs either."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="governed", assignee="alice")
+        kb.claim_task(conn, t)
+        run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (t,)
+        ).fetchone()[0]
+        kb.complete_task(conn, t, result="done")
+        assert kb.archive_task(conn, t)
+        _seed_governance_rows(conn, t, run_id)
+        conn.commit()
+
+        assert kb.delete_archived_task(conn, t) is True
+        assert kb.get_task(conn, t) is None
+        for table in ("kanban_task_bindings", "kanban_dispositions", "kanban_invocations"):
+            assert conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (t,)
+            ).fetchone()[0] == 0
+
+
+
 
 
 # ---------------------------------------------------------------------------

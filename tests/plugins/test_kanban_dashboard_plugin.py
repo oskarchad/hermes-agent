@@ -559,6 +559,30 @@ def test_delete_task(client):
     assert r.status_code == 404
 
 
+def test_delete_task_with_governance_binding(client):
+    """The dashboard DELETE route clears governance FK rows instead of 500-ing."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "governed"}).json()["task"]
+    tid = t["id"]
+    with kbc.connect() as conn:
+        conn.execute(
+            "INSERT INTO kanban_workflows VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("wf1", "audit", None, "d1", "l1", "real", "active", 1, "{}", "a" * 64),
+        )
+        conn.execute(
+            "INSERT INTO kanban_task_bindings VALUES (?,?,?,?,?)",
+            (tid, "wf1", "{}", None, 1),
+        )
+        conn.commit()
+
+    r = client.delete(f"/api/plugins/kanban/tasks/{tid}")
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] is True
+    with kbc.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_task_bindings WHERE task_id = ?", (tid,)
+        ).fetchone()[0] == 0
+
+
 # ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------

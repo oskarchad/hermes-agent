@@ -4226,6 +4226,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
+    from hermes_cli.kanban_governance_store import delete_task_rows
+    # Governance rows FK to tasks(id) AND task_runs(id): clear them before task_runs.
+    delete_task_rows(conn, task_id)
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
     for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
@@ -4320,25 +4323,29 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if not cleanup_ok or worker_identity is None:
             return False
     with write_txn(conn):
+        # The CAS must be a read here, not a WHERE clause on the DELETE: governance
+        # rows FK to tasks(id), so relations have to go first and the task row's
+        # identity must already be proven by then.
+        current = conn.execute(
+            "SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if current is None:
+            return False
         if worker_identity is not None:
             _, run_id, worker_pid, claim_lock = worker_identity
-            cur = conn.execute(
-                "DELETE FROM tasks WHERE id = ? AND status = 'running' "
-                "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
-                (task_id, run_id, worker_pid, claim_lock),
-            )
-        else:
-            cur = conn.execute(
-                "DELETE FROM tasks WHERE id = ? AND status = ?",
-                (task_id, expected_status),
-            )
-        if cur.rowcount != 1:
+            if (
+                str(current["status"]) != "running"
+                or current["current_run_id"] != run_id
+                or current["worker_pid"] != worker_pid
+                or current["claim_lock"] != claim_lock
+            ):
+                return False
+        elif str(current["status"]) != expected_status:
             return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_task_relations(conn, task_id)
+        if conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,)).rowcount != 1:
+            return False
     recompute_ready(conn)
     return True
 

@@ -130,6 +130,11 @@ contracts.
   `tests/gateway/test_kanban_governance_notifications.py`,
   `tests/plugins/test_kanban_governance_callers.py`, and
   `tests/agent/test_kanban_stop.py`.
+- Deletion cascade: the governance tables FK to `tasks(id)` and `task_runs(id)`,
+  so `kanban_governance_store.delete_task_rows` clears them from
+  `_delete_task_relations` before the task row goes. `delete_task` therefore
+  proves its CAS identity with a read under the write transaction instead of a
+  `WHERE` clause on the `DELETE`, because relations must be cleared first.
 - Keep rationale: upstream has no governed-intake contract for these lifecycle
   callers; the retained code gates existing transitions instead of replacing
   them.
