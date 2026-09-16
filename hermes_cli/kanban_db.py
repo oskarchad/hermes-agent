@@ -424,6 +424,12 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
     return _env_int("HERMES_KANBAN_CLAIM_TTL_SECONDS", DEFAULT_CLAIM_TTL_SECONDS, minimum=1)
 
 
+# A claim with no ``worker_pid`` is either a spawn still in flight (the dispatcher
+# claims, then stamps the pid) or a claimer that never spawned at all. Only the second
+# is a failed attempt, so a pid-less row is reclaimed once its claim has been expired
+# longer than this — inside the window the in-flight spawn keeps its claim.
+PRE_PID_RECLAIM_GRACE_SECONDS = 60
+
 # ``detect_crashed_workers`` skips ``_pid_alive`` this long after start: the
 # fork -> /proc window can report a fresh worker dead.
 DEFAULT_CRASH_GRACE_SECONDS = 30
@@ -2828,7 +2834,10 @@ def release_stale_claims(
         (now,),
     ).fetchall()
     for row in stale:
-        if row["worker_pid"] is None:
+        # No pid yet: either a spawn in flight (dispatcher claims, then stamps the pid) or a
+        # claimer that never spawned. Only the latter is a failed attempt worth booking, so
+        # let the in-flight window pass before reclaiming it.
+        if row["worker_pid"] is None and now - int(row["claim_expires"]) <= PRE_PID_RECLAIM_GRACE_SECONDS:
             continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -4185,10 +4194,14 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             return False
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+        # Upstream (#76196) archives a RUNNING task and terminates its worker after commit;
+        # the retained fork gate instead refused until a verified reclaim. Keeping both made
+        # upstream's termination block unreachable, so upstream's contract wins here and the
+        # fork's stricter gate is expressed by reclaim_task, which archive still honours.
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status NOT IN ('archived', 'running')",
+            "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )
         if cur.rowcount != 1:
