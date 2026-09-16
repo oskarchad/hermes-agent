@@ -2221,5 +2221,9 @@ def _(rid, params: dict) -> dict:
 
 
 def register(server) -> None:
-    """Publish this module's helpers onto ``server`` (rebound to its globals) and install handlers."""
-    bind_module(globals(), server, skip=("_",))
+    """Publish this module's helpers onto ``server`` (rebound to its globals) and install handlers.
+
+    ``_active_pet`` is deliberately re-published over ``change_watcher``'s identical helper: both
+    modules derive it from ``_pet_active_selection()`` and either binding behaves the same.
+    """
+    bind_module(globals(), server, skip=("_",), override=("_active_pet",))
