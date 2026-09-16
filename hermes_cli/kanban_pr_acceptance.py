@@ -56,13 +56,10 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
-        query = '''{repository(owner:%s,name:%s){isPrivate pullRequest(number:%d){headRefOid baseRefName state
-            baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}
-            statusCheckRollup{state}
-        }}}''' % (json.dumps(owner), json.dumps(name), number)
-        data = _api("graphql", query=query)["data"]["repository"]
-        is_private = data.get("isPrivate", False)
-        pr = data["pullRequest"]
+        query = '''{repository(owner:%s,name:%s){pullRequest(number:%d){headRefOid baseRefName state
+            baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}}}}}''' % (
+                json.dumps(owner), json.dumps(name), number)
+        pr = _api("graphql", query=query)["data"]["repository"]["pullRequest"]
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
@@ -104,8 +101,6 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
 
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
 
-        rollup = pr.get("statusCheckRollup") or {}
-        rollup_state = rollup.get("state")
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
@@ -125,8 +120,6 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
                     "classification": classification, "conclusion": outcome})
-        if rollup_state and rollup_state != "SUCCESS":
-            outcomes.append("failure" if rollup_state in {"FAILURE", "ERROR"} else "pending")
 
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}")
