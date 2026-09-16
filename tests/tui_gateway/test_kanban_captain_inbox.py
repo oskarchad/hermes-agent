@@ -1076,6 +1076,10 @@ class _EmptyCompletionQueue:
     def empty(self):
         return True
 
+    def qsize(self):
+        # Upstream's shutdown drain sizes the queue instead of polling ``empty()``.
+        return 0
+
 
 def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     from tools.process_registry import process_registry

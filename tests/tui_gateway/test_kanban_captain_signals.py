@@ -274,7 +274,10 @@ def test_captain_signal_delivery_reads_bounded_redacted_authoritative_comment(
     conn = kbc.connect(tmp_path / "delivery.db")
     try:
         task_id = kb.create_task(conn, title="decision target", assignee="worker")
-        secret = "«redacted:sk-…»"
+        # A real-SHAPED credential, not the redactor's own sentinel: upstream's redactor
+        # now skips values already starting with «redacted:, so a sentinel fixture would
+        # prove nothing about masking.
+        secret = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGh"
         comment_id = kb.add_comment(
             conn,
             task_id,

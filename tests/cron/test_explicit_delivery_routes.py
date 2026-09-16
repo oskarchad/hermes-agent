@@ -155,9 +155,10 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
     previous_multiplex = is_multiplex_active()
     set_multiplex_active(True)
     # Replace only the OS supervisor wrapper, not launch/payload/adoption/preflight/delivery.
-    # Tuple keeps the actual argv, while exercising the managed-worker branch's distinct value.
+    # A "scoped" dispatch carrying the actual argv exercises the managed-worker branch without
+    # needing a real systemd user scope.
     monkeypatch.setattr(process_registry, 'restart_safe_gateway_child_argv',
-                        lambda argv, **kw: tuple(argv))
+                        lambda argv, **kw: process_registry.GatewayChildDispatch('scoped', list(argv)))
     sent = []
 
     async def send(chat_id, text, metadata=None):
@@ -166,7 +167,7 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
 
     adapter.send = send
     runner = SimpleNamespace(
-        config=SimpleNamespace(multiplex_profiles=True, multiplex_profile_allowlist=['otto']),
+        config=SimpleNamespace(multiplex_profiles=True),
         _profile_adapters={'otto': {Platform.DISCORD: adapter}})
     loop = asyncio.new_event_loop()
     ready = threading.Event()
@@ -194,7 +195,10 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
             assert queued and queued['status'] == 'pending'
             assert ran.read_text() == 'once', 'real worker preflight must accept dispatch evidence'
             if revoke_before_drain == 'gate':
-                runner.config.multiplex_profile_allowlist = []
+                # Upstream retired ``gateway.multiplex_profile_allowlist`` in config v43; the
+                # served set is now the authoritative gate, so revoke it by turning multiplex off
+                # (``_handoff_watch_scopes`` then yields only the root scope).
+                runner.config.multiplex_profiles = False
             elif revoke_before_drain == 'mapping':
                 (home / 'config.yaml').write_text('{}\n')
             elif revoke_before_drain == 'adapter':

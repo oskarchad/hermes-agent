@@ -132,7 +132,10 @@ def test_delegated_child_marker_never_persists_in_shared_snapshot(tmp_path):
         )
 
         assert child["returncode"] == 0
-        assert "child=[1]" in child["output"]
+        # Upstream's marker carries the fenced board ROOT (a path), not the legacy bare "1";
+        # this test's subject is snapshot persistence, so assert only that it is set and real.
+        assert "child=[unset]" not in child["output"]
+        assert "child=[" in child["output"]
         assert "HERMES_DELEGATED_CHILD_CONTEXT" not in initial_snapshot
         assert "HERMES_DELEGATED_CHILD_CONTEXT" not in refreshed_snapshot
         assert controller["returncode"] == 0

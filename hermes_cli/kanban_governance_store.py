@@ -132,3 +132,12 @@ def charge_tx(conn, lineage_id, category):
         "WHERE lineage_id=? AND category=? AND used_count < limit_count",
         (lineage_id, category),
     ).rowcount == 1
+
+
+def delete_task_rows(conn, task_id):
+    """Drop every governance row referencing ``task_id``. These tables FK back to
+    ``tasks(id)`` (and ``task_runs(id)``), so the caller must run this before it
+    deletes the task itself or SQLite aborts the transaction."""
+    conn.execute("DELETE FROM kanban_invocations WHERE task_id=?", (task_id,))
+    conn.execute("DELETE FROM kanban_dispositions WHERE task_id=?", (task_id,))
+    conn.execute("DELETE FROM kanban_task_bindings WHERE task_id=?", (task_id,))

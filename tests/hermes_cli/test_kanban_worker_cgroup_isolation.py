@@ -399,10 +399,13 @@ def test_spawn_event_identifies_scope_without_exposing_claim(monkeypatch, tmp_pa
             (task_id,),
         ).fetchone()
         payload = json.loads(event["payload"])
+        # ``started_at`` is upstream's PID-recycle fingerprint (None for this synthetic pid);
+        # the invariant under test is the scope identity WITHOUT the claim lock.
         assert payload == {
             "pid": 67890,
             "isolation_mode": "systemd_scope",
             "scope_unit": scope_unit,
+            "started_at": None,
         }
         assert claimed.claim_lock not in event["payload"]
     finally:
@@ -670,7 +673,10 @@ def test_manual_reclaim_scope_failure_preserves_ownership(monkeypatch, tmp_path)
         conn.close()
 
 
-def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_path):
+def test_archive_running_task_terminates_worker_and_clears_ownership(monkeypatch, tmp_path):
+    """Upstream (#76196) archives a RUNNING task and terminates its worker rather than
+    refusing until a verified reclaim: ``archived`` is terminal, so no dispatcher can spawn
+    a duplicate off the released claim. The reclaim-then-archive path must stay clean too."""
     from hermes_cli import kanban_db as kb
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -680,15 +686,6 @@ def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_pa
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
         kb._set_worker_pid(conn, task_id, 84567)
-
-        assert kb.archive_task(conn, task_id) is False
-        running = kb.get_task(conn, task_id)
-        assert running is not None
-        assert running.status == "running"
-        assert running.claim_lock == claimed.claim_lock
-        assert running.worker_pid == 84567
-        assert running.current_run_id == claimed.current_run_id
-        assert not any(event.kind == "archived" for event in kb.list_events(conn, task_id))
 
         monkeypatch.setattr(
             kb,
@@ -705,7 +702,6 @@ def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_pa
                 "cleanup_verified": True,
             },
         )
-        assert kb.reclaim_task(conn, task_id, reason="archive requested") is True
         assert kb.archive_task(conn, task_id) is True
 
         archived = kb.get_task(conn, task_id)
@@ -714,6 +710,10 @@ def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_pa
         assert archived.claim_lock is None
         assert archived.worker_pid is None
         assert archived.current_run_id is None
+        # The termination outcome is auditable, and the claim lock never leaks into it.
+        events = [e for e in kb.list_events(conn, task_id) if e.kind == "archive_worker_termination"]
+        assert events and events[-1].payload["terminated"] is True
+        assert claimed.claim_lock not in json.dumps(events[-1].payload)
     finally:
         conn.close()
 

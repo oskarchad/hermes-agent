@@ -361,6 +361,10 @@ class TestNotificationPollerLoopKanbanWiring:
             def empty(self):
                 return True
 
+            def qsize(self):
+                # Upstream's shutdown drain sizes the queue instead of polling ``empty()``.
+                return 0
+
         monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
         monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
         monkeypatch.setattr(
@@ -834,6 +838,10 @@ class TestNotificationPollerLoopKanbanWiring:
 
             def empty(self):
                 return True
+
+            def qsize(self):
+                # Upstream's shutdown drain sizes the queue instead of polling ``empty()``.
+                return 0
 
         history_lock = _WaiterFirstLock()
         session = {

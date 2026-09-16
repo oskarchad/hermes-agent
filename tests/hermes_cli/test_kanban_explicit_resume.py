@@ -41,8 +41,13 @@ def test_checkpoint_continuation_preserves_identity_gates_and_is_consumed(board,
     elif resume == "unblocked":
         assert kb.unblock_task(board, tid)
     elif resume == "promoted_manual":
-        # Even forced promotion cannot bypass the claim-time parent check.
-        assert kb.promote_task(board, tid, actor="operator", force=True)[0]
+        # Upstream's promote_task now REFUSES an undone parent outright (no --force knob:
+        # a forced promotion only reported a success the first claim reverted). The guard's
+        # subject is the promoted_manual event itself, so emit it directly.
+        ok, reason = kb.promote_task(board, tid, actor="operator")
+        assert not ok and "unsatisfied parent dependencies" in (reason or "")
+        with kb.write_txn(board):
+            kb._append_event(board, tid, "promoted_manual", {"actor": "operator", "reason": None})
     else:
         assert kb.complete_task(board, parent)
         kb.recompute_ready(board)

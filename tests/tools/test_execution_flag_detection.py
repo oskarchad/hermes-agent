@@ -335,12 +335,16 @@ def _time_benign_segments(count):
 
 def test_benign_segment_scaling_benchmark():
     """Retain real metrics without making correctness depend on wall-clock ratios."""
-    small, small_result = _time_benign_segments(2_000)
-    large, large_result = _time_benign_segments(4_000)
+    # Scaling is quadratic in segment count, so the sizes are the file's whole
+    # runtime budget: 2k+4k costs ~249s of the runner's 300s per-file cap and
+    # left this file 1.84s of margin on CI before the retained tests below were
+    # added. 500/1000 shows the same shape for ~15s; neither size is asserted on.
+    small, small_result = _time_benign_segments(500)
+    large, large_result = _time_benign_segments(1_000)
 
     assert small_result == (False, None, None)
     assert large_result == (False, None, None)
-    print(f"benign segment benchmark: 2k={small:.3f}s, 4k={large:.3f}s")
+    print(f"benign segment benchmark: 500={small:.3f}s, 1k={large:.3f}s")
 
 
 def test_max_accepted_separator_free_input_is_fast():

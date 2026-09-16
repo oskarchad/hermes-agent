@@ -1,5 +1,6 @@
 """Restart-safe cron subprocess handoff. No gateway transport credentials cross this boundary."""
 from __future__ import annotations
+import contextlib
 import json
 import logging
 import os
@@ -11,14 +12,27 @@ import time
 logger = logging.getLogger("cron.scheduler")
 
 def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
-    """Launch *job* outside a managed gateway cgroup when required.
+    """Launch *job* outside the managed gateway process when required.
 
-    Returns ``False`` when the caller is not a managed systemd gateway and the
-    existing in-process path should be used.  In managed topology, failure to
-    establish the transient scope raises: falling back would recreate the
-    restart interruption this handoff exists to prevent.
+    Returns ``False`` outside a managed systemd gateway (in-process path).  In
+    managed topology the job always goes to an external worker with the #101940
+    ownership handoff: in a transient user scope, or — when no user D-Bus
+    session exists and ``cron.require_restart_safe_scope`` is false — as a
+    direct subprocess (process separation kept, cgroup isolation lost).
     """
-    from cron.scheduler import (_get_hermes_home, mark_execution_handoff_pending, _ensure_cron_dir, windows_hide_flags, _running_lock, _restart_safe_waiter_job_ids, _wait_for_external_cron_worker)
+    from cron.scheduler import (
+        _ensure_cron_dir,
+        _get_hermes_home,
+        _restart_safe_waiter_job_ids,
+        _running_lock,
+        _running_worker_pids,
+        _wait_for_external_cron_worker,
+        load_config_readonly,
+        mark_execution_handoff_pending,
+        windows_hide_flags,
+    )
+    from cron.executions import HANDOFF_ADOPTION_GRACE_SECONDS
+
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
     handoff_dir = _get_hermes_home() / "cron" / "external-workers"
@@ -34,16 +48,33 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
         str(ack_path),
     ]
 
-    from agent.secret_scope import is_multiplex_active
-    from tools.environments.local import build_subprocess_env
-    from tools.process_registry import restart_safe_gateway_child_argv
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        is_multiplex_active,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+    from tools.environments.local import build_subprocess_env, strip_launch_profile_env
+    from tools.process_registry import (
+        restart_safe_gateway_child_argv,
+        scoped_spawn_lost_user_bus,
+        systemd_user_bus_env,
+    )
 
+    try:
+        require_restart_safe_scope = bool(
+            (load_config_readonly().get("cron") or {}).get("require_restart_safe_scope", False)
+        )
+    except Exception:
+        require_restart_safe_scope = False
     multiplex_active = is_multiplex_active()
-    scoped_command = restart_safe_gateway_child_argv(
+    dispatch = restart_safe_gateway_child_argv(
         command,
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
+        require_restart_safe_scope=require_restart_safe_scope,
     )
-    if scoped_command == command:
+    if dispatch.mode == "in_process":
         return False
 
     if mark_execution_handoff_pending(execution_id) is None:
@@ -51,6 +82,9 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
             "cron execution claim changed before external worker handoff"
         )
 
+    # The worker has no gateway adapters, so the exact allowed delivery routes are snapshotted
+    # here and carried in the payload (ADR
+    # website/docs/developer-guide/adr/0001-explicit-cron-delivery-binding.md).
     from cron.delivery_routes import preflight_snapshot
     try:
         route_snapshot = preflight_snapshot(adapters)
@@ -80,14 +114,31 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
         payload_path.unlink(missing_ok=True)
         raise
 
-    worker_env = build_subprocess_env(
-        scrub_secrets=multiplex_active,
-        inherit_profile_home=True,
-        extra={"HERMES_HOME": str(_get_hermes_home().resolve())},
-    )
+    profile_home = _get_hermes_home().resolve()
+    hydrate_profile_secret_sources(profile_home)
+    secret_token = set_secret_scope(build_profile_secret_scope(profile_home))
+    try:
+        worker_env = strip_launch_profile_env(build_subprocess_env(
+            scrub_secrets=multiplex_active,
+            inherit_profile_home=True,
+            extra={"HERMES_HOME": str(profile_home)},
+        ))
+    finally:
+        reset_secret_scope(secret_token)
+    worker_env = systemd_user_bus_env(worker_env)
+    # Unattended worker: the gateway sets HERMES_EXEC_ASK at startup (interactive launches set
+    # the other two), and an inherited presence var makes every env-fallback consumer in the
+    # child (`_is_interactive_cli`, sudo prompting, `check_cronjob_requirements`) believe a
+    # human is present to answer (#110932).
+    for _presence_var in (
+        "HERMES_INTERACTIVE",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_EXEC_ASK",
+    ):
+        worker_env.pop(_presence_var, None)
     try:
         process = subprocess.Popen(
-            scoped_command,
+            dispatch.argv,
             cwd=str(Path(__file__).resolve().parent.parent),
             env=worker_env,
             stdin=subprocess.DEVNULL,
@@ -103,7 +154,11 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
     with _running_lock:
         _restart_safe_waiter_job_ids.add(job_id)
 
-    deadline = time.monotonic() + 5.0
+    # Same window the dead-owner recovery ledger grants a pending handoff: a cold
+    # worker start (imports + secret hydration) measures ~10-12s in the field, and
+    # a dispatch deadline shorter than the adoption grace made the two guards
+    # around one handoff disagree.
+    deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
     while time.monotonic() < deadline:
         if ack_path.exists():
             try:
@@ -143,6 +198,8 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
                 acknowledgement.get("pid"),
                 execution_id,
             )
+            with _running_lock, contextlib.suppress(TypeError, ValueError):
+                _running_worker_pids[job_id] = int(acknowledgement.get("pid") or process.pid)
             return _wait_for_external_cron_worker(
                 process,
                 execution_id=execution_id,
@@ -154,6 +211,14 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
             with _running_lock:
                 _restart_safe_waiter_job_ids.discard(job_id)
             payload_path.unlink(missing_ok=True)
+            if dispatch.mode == "scoped" and scoped_spawn_lost_user_bus(worker_env):
+                # systemd-run itself failed (stderr is DEVNULL): name the cause, not the exit code.
+                raise RuntimeError(
+                    "restart-safe systemd scope could not be created: the user D-Bus session at "
+                    f"/run/user/{os.getuid()}/bus disappeared after the gateway started. On a "  # windows-footgun: ok — scoped dispatch exists only on Linux
+                    "system-level service install, run `sudo loginctl enable-linger <gateway-user>`; "
+                    "the next fire dispatches without scope isolation."
+                )
             raise RuntimeError(
                 f"cron external worker exited before ownership acknowledgement "
                 f"(exit {returncode})"
@@ -165,9 +230,10 @@ def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
     # handoff: that could duplicate side effects.  The execution owner/dead-owner
     # recovery ledger remains the authority.
     logger.warning(
-        "Cron external worker for job '%s' did not acknowledge within 5s; "
+        "Cron external worker for job '%s' did not acknowledge within %.0fs; "
         "leaving the durable execution claim untouched",
         job_id,
+        HANDOFF_ADOPTION_GRACE_SECONDS,
     )
     return _wait_for_external_cron_worker(
         process,

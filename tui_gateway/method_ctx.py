@@ -66,19 +66,23 @@ class HandlerRegistry:
             real = rebind(fn, g)
             if getattr(fn, "_hermes_profile_scoped", False):
                 real = server._profile_scoped(real)
-            server._methods[name] = real
+            server.register_method(name, real)
 
 
 _PLUMBING = {"HandlerRegistry", "method", "_profile_scoped", "register", "rebind", "logger"}
 
 
-def bind_module(module_globals: dict, server, *, skip=()) -> None:
+def bind_module(module_globals: dict, server, *, skip=(), override=()) -> None:
     """Publish everything a split module defines onto ``server``, rebound to its globals.
     ``module_globals`` is the caller's ``globals()`` (not ``sys.modules[__name__]``: tests that
     ``patch.dict(sys.modules)`` around the server import drop the submodule entries). Functions
     are rebound; classes get their methods rebound in place; dispatch tables (dict/tuple/list of
     this module's functions) get their values rebound; other values are copied as-is. Imported
-    modules/functions, dunders and registry plumbing are skipped; finally ``_registry`` installs."""
+    modules/functions, dunders and registry plumbing are skipped; finally ``_registry`` installs.
+
+    Taking over a name another split module already published is a RuntimeError unless the name is
+    listed in ``override``: registration order decides the winner, so an undeclared takeover
+    silently reverts the other module's behaviour for every caller."""
     g = vars(server)
     mod_name = module_globals["__name__"]
     seen: dict = {}
@@ -117,9 +121,14 @@ def bind_module(module_globals: dict, server, *, skip=()) -> None:
                 elif isinstance(val, (staticmethod, classmethod)):
                     setattr(obj, attr, type(val)(rebind(val.__func__, g)))
         prev = g.get(name)
-        if isinstance(prev, types.FunctionType) and isinstance(obj, types.FunctionType):
-            owner = getattr(prev, "_hermes_split_module", None)
-            if owner and owner != mod_name:
+        if isinstance(obj, types.FunctionType) and name != "_":
+            # Tag on FIRST publication too: the guard below can only see a takeover if the
+            # incumbent already carries its owner, and an untagged incumbent is exactly the
+            # silent-overwrite case (a retained module shadowing an upstream helper).
+            # ``_`` is the throwaway name every ``@method``-decorated handler shares; its
+            # server binding is meaningless, so it is never owned by anyone.
+            owner = getattr(prev, "_hermes_split_module", None) if isinstance(prev, types.FunctionType) else None
+            if owner and owner != mod_name and name not in override:
                 raise RuntimeError(
                     f"split-module name collision: {mod_name}.{name} would overwrite {owner}.{name}"
                 )
