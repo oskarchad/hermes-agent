@@ -36,6 +36,11 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
     return value
 
 
+def _is_plan_unavailable(err: subprocess.CalledProcessError) -> bool:
+    output = f"{err.stdout or ''}\n{err.stderr or ''}".lower()
+    return "upgrade to github pro" in output or "make this repository public" in output
+
+
 def collect_acceptance(contract: str, published_pr: str | None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
                "pr_url": published_pr, "checks": [],
@@ -61,21 +66,41 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
-        for page in rules:
-            for rule in page:
-                if rule["type"] == "required_status_checks":
-                    required.update((r["context"], r.get("integration_id"))
-                                    for r in rule["parameters"]["required_status_checks"])
-        receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
-        if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
-            return receipt
+        rules_skipped = False
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100", paginate=True)
+            for page in rules:
+                for rule in page:
+                    if rule["type"] == "required_status_checks":
+                        required.update((r["context"], r.get("integration_id"))
+                                        for r in rule["parameters"]["required_status_checks"])
+        except subprocess.CalledProcessError as err:
+            if _is_plan_unavailable(err):
+                rules_skipped = True
+            else:
+                raise
+
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
         runs = [run for page in pages for run in page["check_runs"]]
         if len({r["id"] for r in runs}) != pages[0]["total_count"]:
             raise ValueError("Incomplete check-run pagination")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100", paginate=True) for s in page]
+
+        if not required:
+            if not rules_skipped:
+                receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+                return receipt
+            active_runs = [r for r in runs if r.get("conclusion") != "skipped"]
+            for r in active_runs:
+                required.add((r["name"], (r.get("app") or {}).get("id")))
+            for s in statuses:
+                required.add((s["context"], None))
+            if not required:
+                receipt["detail"] = "No CI checks found for PR head."
+                return receipt
+
+        receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
+
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
@@ -95,6 +120,7 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
                     "url": check.get("html_url") or check.get("target_url"),
                     "head_sha": check.get("head_sha", check.get("sha")),
                     "classification": classification, "conclusion": outcome})
+
         # Re-read after all pages: old-head successes are never transferable.
         current = _api(f"repos/{repo}/pulls/{number}")
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
