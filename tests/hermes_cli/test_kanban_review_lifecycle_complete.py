@@ -723,3 +723,139 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         )
     assert kb.complete_task(conn, ok_id, summary="done")
     assert _failures(conn, ok_id) == 0
+
+
+def test_review_status_and_retry_preserved_across_failure_and_unblock(conn):
+    """Scenario t_cf0f9fdf: a task in review must preserve 'review' status across
+    failures/timeouts and unblocks instead of demoting to 'ready'."""
+    task_id = kb.create_task(conn, title="Inspect migrations", assignee="patch")
+    implementation = kb.claim_task(conn, task_id, claimer="patch:1")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="gauge",
+        summary="Findings ready.",
+        expected_run_id=implementation.current_run_id,
+    )
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    assert task.assignee == "gauge"
+
+    # Turn finalizer records failure with release_claim=True and trips breaker
+    tripped = kbd._record_task_failure(
+        conn,
+        task_id,
+        "Iteration budget exhausted (150/150)",
+        outcome="timed_out",
+        release_claim=True,
+        end_run=True,
+        failure_limit=1,
+    )
+    assert tripped is True
+
+    # Check that gave_up event retains retry_status='review'
+    gave_up = _event(kb.list_events(conn, task_id), "gave_up")
+    assert gave_up.payload is not None
+    assert gave_up.payload.get("retry_status") == "review"
+
+    # Unblocking must restore status='review', not demote to 'ready'
+    assert kb.unblock_task(conn, task_id)
+    unblocked_task = kb.get_task(conn, task_id)
+    assert unblocked_task is not None
+    assert unblocked_task.status == "review"
+    assert unblocked_task.assignee == "gauge"
+
+
+def test_request_changes_succeeds_when_reviewer_claimed_from_ready(conn):
+    """Reviewer verdict must succeed even if active run was claimed from ready
+    (e.g. after a prior reclaim/unblock anomaly), preserving the handoff to the implementer."""
+    task_id = kb.create_task(conn, title="Check export", assignee="patch")
+    implementation = kb.claim_task(conn, task_id, claimer="patch:1")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="gauge",
+        summary="Implementation ready for review.",
+        expected_run_id=implementation.current_run_id,
+    )
+
+    # Simulate anomalous claim from ready (e.g. after prior reclaim or unblock anomaly)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+
+    claimed = kb.claim_task(conn, task_id, claimer="gauge:1")
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.assignee == "gauge"
+
+    # Active run was claimed from ready, but Gauge is the legitimate reviewer for this handoff.
+    # request_changes MUST succeed and route back to patch.
+    ok, implementer = kb.request_changes(
+        conn,
+        task_id,
+        reason="Five findings documented; please fix F1-F5.",
+        expected_run_id=claimed.current_run_id,
+    )
+    assert ok is True
+    assert implementer == "patch"
+
+    rework = kb.get_task(conn, task_id)
+    assert rework is not None
+    assert rework.status == "ready"
+    assert rework.assignee == "patch"
+
+
+def test_request_changes_fails_closed_when_caller_is_not_reviewer(conn):
+    """Implementer cannot use request_changes on their own implementation run,
+    even if a historical review_requested event exists from a prior cycle."""
+    task_id = kb.create_task(conn, title="Implement feature", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+
+    # Implementer without review_requested cannot call request_changes
+    ok, detail = kb.request_changes(
+        conn,
+        task_id,
+        reason="Trying to request changes on self",
+        expected_run_id=implementation.current_run_id,
+    )
+    assert ok is False
+    assert "no prior review_requested event" in (detail or "")
+
+    # Implementer requests review
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="gauge",
+        summary="Ready.",
+        expected_run_id=implementation.current_run_id,
+    )
+
+    # Reviewer claims and requests changes
+    review = kb.claim_review_task(conn, task_id, claimer="gauge:1")
+    assert review is not None
+    ok, implementer = kb.request_changes(
+        conn,
+        task_id,
+        reason="Fix F1",
+        expected_run_id=review.current_run_id,
+    )
+    assert ok is True
+    assert implementer == "builder"
+
+    # Now task is back with builder (rework phase)
+    builder_run = kb.claim_task(conn, task_id, claimer="builder:2")
+    assert builder_run is not None
+    assert builder_run.assignee == "builder"
+
+    # Builder cannot call request_changes during implementation
+    ok, detail = kb.request_changes(
+        conn,
+        task_id,
+        reason="Builder trying to request changes again",
+        expected_run_id=builder_run.current_run_id,
+    )
+    assert ok is False

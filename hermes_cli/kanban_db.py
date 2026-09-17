@@ -2437,9 +2437,24 @@ def _latest_event(
     return conn.execute(sql + " ORDER BY id DESC LIMIT 1", params).fetchone()
 
 
+def _has_active_review_requested(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True if the task has a review_requested event that has not been
+    subsequently closed by changes_requested, review_reopened, or completed."""
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN ('review_requested', 'changes_requested', 'review_reopened', 'completed') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None and row["kind"] == "review_requested"
+
+
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     """``review`` when the newest lifecycle event carries a review
-    ``resume_status``/``retry_status``/``source_status``, else ``ready`` (legacy)."""
+    ``resume_status``/``retry_status``/``source_status``, or the task is in an
+    active review handoff, else ``ready`` (legacy)."""
+    if _has_active_review_requested(conn, task_id):
+        return "review"
     row = conn.execute(
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
@@ -3657,16 +3672,20 @@ def request_changes(
 
         claimed_event = _latest_event(conn, task_id, "claimed", current_run_id)
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
-        if claimed_payload.get("source_status") != "review":
-            return False, "active run was not claimed from review"
+        claimed_from_review = claimed_payload.get("source_status") == "review"
 
         requested_event = _latest_event(conn, task_id, "review_requested")
         if requested_event is None:
             return False, "no prior review_requested event"
+        if not _has_active_review_requested(conn, task_id):
+            return False, "active run is not in an active review handoff"
         implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
         if implementer is None:
             return False, "review handoff has no valid implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+
+        if not claimed_from_review and reviewer == implementer:
+            return False, "active run was not claimed from review"
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is

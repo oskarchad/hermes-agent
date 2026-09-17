@@ -1226,11 +1226,10 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
-        retry_status = (
-            _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
-            if release_claim
-            else ("review" if row["status"] == "review" else "ready")
-        )
+        if row["status"] == "review" or _kb._has_active_review_requested(conn, task_id):
+            retry_status = "review"
+        else:
+            retry_status = _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
         failures = int(row["consecutive_failures"]) + 1
 
         # Per-task override wins over caller-supplied and default thresholds.
