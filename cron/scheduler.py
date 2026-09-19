@@ -1499,32 +1499,9 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
         return None
     return _blocked_config_result(job_id, job_name, _pf_reason)
 
-
-def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple:
-    """The ``blocked_config`` failure tuple for *_pf_reason*, alerting once per job."""
-    logger.warning(
-        "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
-        job_name, job_id, _pf_reason)
-    already_alerted = False
-    try:
-        from cron.jobs import mark_preflight_alerted
-        already_alerted = mark_preflight_alerted(job_id)
-    except Exception:
-        logger.debug("Job '%s': could not persist preflight alert marker", job_id, exc_info=True)
-    marker = BLOCKED_CONFIG_SILENT_MARKER if already_alerted else BLOCKED_CONFIG_MARKER
-    blocked_doc = (
-        f"# Cron Job: {job_name}\n\n"
-        f"**Job ID:** {job_id}\n"
-        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"**Status:** BLOCKED (configuration)\n\n"
-        "The pre-run configuration check found a problem, so the agent did not run "
-        "(nothing was charged).\n\n"
-        f"**Reason:** {_pf_reason}\n\n"
-        "Hermes tries again at the next scheduled time and clears this state on the first healthy "
-        "run; this alert is not repeated. Check with `hermes cron doctor`. Set `cron.preflight: "
-        "false` in config.yaml to disable this check."
-    )
-    return False, blocked_doc, "", f"{marker} {_pf_reason}"
+def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str, *, mandatory: bool = False) -> tuple:
+    from cron.scheduler_preflight import _blocked_config_result as _impl
+    return _impl(job_id, job_name, _pf_reason, mandatory=mandatory)
 
 
 def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[dict, str]:
@@ -2294,6 +2271,15 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    from cron.delivery_routes import check_explicit_delivery
+    route_error, _ = check_explicit_delivery(job)
+    if route_error:
+        from cron.scheduler_preflight import _blocked_config_result
+        return _blocked_config_result(job_id, job_name, route_error, mandatory=True)
+    if job.get("preflight_alerted") and (job.get("no_agent") or job.get("kind") == "monitor"):
+        from cron.jobs import clear_preflight_alerted
+        clear_preflight_alerted(job_id)
+
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
@@ -2518,7 +2504,7 @@ def run_one_job(
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
         try:
-            if _launch_external_cron_worker(job):
+            if _launch_external_cron_worker(job, adapters=adapters):
                 return True
         except Exception as handoff_error:
             error = f"Restart-safe cron worker dispatch failed: {handoff_error}"
@@ -2549,7 +2535,8 @@ def run_one_job(
         _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
             fire_owner or None, profile_home)
     try:
-        with self_removal_delivery_scope(job["id"]):
+        from cron.delivery_routes import delivery_preflight_scope
+        with self_removal_delivery_scope(job["id"]), delivery_preflight_scope(adapters):
             return _run_with_fire_claim_heartbeat(
                 job,
                 lambda lost_ownership: _run_one_job_body(
@@ -3217,7 +3204,7 @@ def _wait_for_external_cron_worker(
                 pass
 
 
-def _launch_external_cron_worker(job: dict) -> bool:
+def _launch_external_cron_worker(job: dict, *, adapters=None) -> bool:
     """Launch *job* outside the managed gateway process when required.
 
     Returns ``False`` outside a managed systemd gateway (in-process path).  In
@@ -3277,6 +3264,12 @@ def _launch_external_cron_worker(job: dict) -> bool:
             "cron execution claim changed before external worker handoff"
         )
 
+    from cron.delivery_routes import preflight_snapshot
+    try:
+        route_snapshot = preflight_snapshot(adapters)
+    except Exception:
+        route_snapshot = []  # worker independently validates config and blocks before running
+
     _ensure_cron_dir(handoff_dir)
     try:
         handoff_dir.chmod(0o700)
@@ -3290,6 +3283,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     "job": job,
                     "profile_home": str(_get_hermes_home().resolve()),
                     "multiplex_active": multiplex_active,
+                    "delivery_route_preflight": route_snapshot,
                 },
                 payload_file,
             )
@@ -3508,7 +3502,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                return run_one_job(job, adapters=None, loop=None, verbose=False)
+                from cron.delivery_routes import delivery_preflight_scope
+                with delivery_preflight_scope(snapshot=payload.get("delivery_route_preflight", [])):
+                    return run_one_job(job, adapters=None, loop=None, verbose=False)
             finally:
                 if old_external_execution is None:
                     os.environ.pop("_HERMES_CRON_EXTERNAL_WORKER", None)

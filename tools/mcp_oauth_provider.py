@@ -91,7 +91,7 @@ class HermesProviderMixin:
         self._hermes_token_user_agent = token_user_agent
 
     async def _perform_authorization(self):
-        info = self.context.client_info
+        info = getattr(self, "context", None) and self.context.client_info
         grants = getattr(info, "grant_types", None) or []
         if (getattr(self, "_hermes_oauth_flow", "browser") == "device"
                 or ("urn:ietf:params:oauth:grant-type:device_code" in grants and "authorization_code" not in grants)):
@@ -100,17 +100,26 @@ class HermesProviderMixin:
                 "MCP device authorization requires `hermes mcp login <server> --flow device`; "
                 "background reconnects cannot start a device login")
         self._tolerate_missing_iss_for_known_server()
-        return await super()._perform_authorization()
+        from mcp.client.auth import OAuthFlowError
+        try:
+            return await super()._perform_authorization()
+        except OAuthFlowError as exc:
+            if str(exc).startswith("State parameter mismatch:"):
+                raise OAuthFlowError("OAuth state parameter mismatch") from None
+            raise
 
     def _tolerate_missing_iss_for_known_server(self) -> None:
         """Figma advertises ``authorization_response_iss_parameter_supported`` and then omits ``iss``
         from the redirect, so the SDK's RFC 9207 check rejects every valid code (#111135). For that
         one issuer only, fill a missing ``iss`` with the discovered issuer and warn; a present-but-
         different ``iss`` still fails the SDK check, and every other server keeps the strict rule."""
-        issuer = _metadata_issuer(self.context)
+        context = getattr(self, "context", None)
+        if context is None:
+            return
+        issuer = _metadata_issuer(context)
         if issuer not in _ISS_OMITTING_ISSUERS:
             return
-        inner = self.context.callback_handler
+        inner = context.callback_handler
 
         async def _fill_iss():
             result = await inner()

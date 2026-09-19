@@ -670,9 +670,10 @@ def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
     monkeypatch.setattr(scheduler, "run_job", run)
     job = {"id": "job-1", "execution_id": "exec-1"}
 
-    assert scheduler.run_one_job(job, adapters={"discord": object()}) is True
+    adapters = {"discord": object()}
+    assert scheduler.run_one_job(job, adapters=adapters) is True
 
-    launch.assert_called_once_with(job)
+    launch.assert_called_once_with(job, adapters=adapters)
     run.assert_not_called()
 
 
@@ -761,7 +762,7 @@ def test_gateway_tool_run_without_adapter_objects_hands_off(monkeypatch):
 
     created.assert_called_once_with("tool-job", source="direct", scheduled_instant=None)
     assert job["execution_id"] == "exec-tool"
-    launch.assert_called_once_with(job)
+    launch.assert_called_once_with(job, adapters=None)
     run.assert_not_called()
 
 
@@ -774,11 +775,12 @@ def test_shared_run_path_creates_execution_before_managed_handoff(monkeypatch):
     monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
     job = {"id": "manual-job"}
 
-    assert scheduler.run_one_job(job, adapters={"discord": object()}) is True
+    adapters = {"discord": object()}
+    assert scheduler.run_one_job(job, adapters=adapters) is True
 
     created.assert_called_once_with("manual-job", source="direct", scheduled_instant=None)
     assert job["execution_id"] == "exec-new"
-    launch.assert_called_once_with(job)
+    launch.assert_called_once_with(job, adapters=adapters)
 
 
 def test_lost_execution_start_cas_prevents_side_effects(monkeypatch):

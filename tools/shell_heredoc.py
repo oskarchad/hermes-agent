@@ -177,11 +177,18 @@ def _find_heredoc_close(
         cursor = after
 
 
-def strip_inert_heredoc_bodies(command: str) -> str:
-    """Mask heredoc bodies that are provably inert data (see module docstring)."""
+# Only an unambiguous Python stdin program enters language-aware lifecycle scanning.
+# -c, script operands, multiple redirects and compound openers retain the legacy scan.
+_PYTHON_STDIN_HEREDOC_RE = re.compile(
+    r"\s*(?:[A-Za-z0-9_./-]+/)?python(?:3(?:\.\d+)*)?\s+"
+    r"(?:-\s+)?<<\s*(?:''|\"\")\s*"
+)
+
+
+def _heredoc_body_ranges(command: str, *, python_only: bool = False) -> list[tuple[int, int]]:
     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
     if "<<" not in command:
-        return command
+        return []
     last_opener_index = command.rfind("<<")
     ranges: list[tuple[int, int]] = []
     command_start = 0
@@ -194,20 +201,20 @@ def strip_inert_heredoc_bodies(command: str) -> str:
             owner_start,
         ) = _scan_heredoc_command_unit(command, command_start)
         if unknown_operator:
-            return command
+            return []
         if not specs:
             if command_end >= len(command):
                 break
             command_start = command_end + 1
             continue
         if command_end >= len(command):
-            return command  # opener with no body line: unterminated — leave visible
+            return []  # opener with no body line: unterminated — leave visible
         body_cursor = command_end + 1
         body_ranges: list[tuple[int, int]] = []
         for delimiter, strip_tabs, _quoted in specs:
             close_end = _find_heredoc_close(command, body_cursor, delimiter, strip_tabs)
             if close_end is None:
-                return command  # unterminated
+                return []  # unterminated
             body_ranges.append((body_cursor, close_end))
             body_cursor = close_end
         if (
@@ -216,12 +223,18 @@ def strip_inert_heredoc_bodies(command: str) -> str:
         ):
             masked_opener = _mask_simple_quotes(command[command_start:command_end])
             masked_owner = _mask_simple_quotes(command[owner_start:command_end])
+            consumer = (_PYTHON_STDIN_HEREDOC_RE.fullmatch(masked_opener) if python_only
+                        else _INERT_HEREDOC_CONSUMER_RE.search(masked_owner))
             if not any(
                 marker in masked_opener
                 for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")
-            ) and _INERT_HEREDOC_CONSUMER_RE.search(masked_owner):
+            ) and consumer:
                 ranges.extend(body_ranges)
         command_start = body_cursor
+    return ranges
+
+
+def _mask_body_ranges(command: str, ranges: list[tuple[int, int]]) -> str:
     # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.
     parts: list[str] = []
     previous = 0
@@ -229,3 +242,16 @@ def strip_inert_heredoc_bodies(command: str) -> str:
         parts += [command[previous:start], "\n" * command.count("\n", start, end)]
         previous = end
     return "".join(parts) + command[previous:]
+
+
+def strip_inert_heredoc_bodies(command: str) -> str:
+    """Mask heredoc bodies that are provably inert data (see module docstring)."""
+    return _mask_body_ranges(command, _heredoc_body_ranges(command))
+
+
+def split_python_heredoc_bodies(command: str) -> tuple[str, list[str]]:
+    """Separate quoted Python stdin source from shell source; neither is declared safe."""
+    ranges = _heredoc_body_ranges(command, python_only=True)
+    bodies = ["".join(command[start:end].splitlines(keepends=True)[:-1])
+              for start, end in ranges]
+    return _mask_body_ranges(command, ranges), bodies

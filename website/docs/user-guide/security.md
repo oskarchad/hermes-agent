@@ -183,6 +183,50 @@ Like the rest of the approval config, changes take effect immediately (the confi
 Deny rules are a shell-command policy, not a complete shell interpreter or an OS capability sandbox. Normalization does not resolve arbitrary variables (including GNU `env -S` `${NAME}` expansion), aliases, functions, renamed binaries, scripts, interpreter programs, or every shell/launcher grammar (for example, case-pattern syntax, clustered launcher options, or options embedded inside an `env -S` string). Do not use a basename deny rule as a guarantee that a capability cannot be reached by other means. For containment, use OS permissions and an isolated backend with appropriately restricted mounts, credentials, and network access. This matching behavior does not change the configured approval mode or the empty-deny-list default.
 :::
 
+### Command-Aware Deny (`approvals.deny_commands`)
+
+To block a command without blocking PR descriptions that mention it, opt in to
+`approvals.deny_commands` (default `[]`). Supported selectors are exactly
+`gh pr merge` and `git push main`:
+
+```yaml
+approvals:
+  deny_commands:
+    - 'gh pr merge'
+    - 'git push main'
+```
+
+These selectors recognize executable command positions, including binary paths,
+repository flags, compound commands, shell `-c` strings, `eval`, and active
+command substitutions (including inside double quotes). Single-quoted data and
+ordinary PR body text such as `Do not execute gh pr merge 6; release needs
+approval.` do not match. The same backend scope and unconditional precedence
+as `approvals.deny` apply: yolo, mode off, and permanent approvals cannot
+override it. Invalid types or unsupported selectors return an explicit blocked
+configuration error; malformed or over-limit command inspection fails closed.
+
+`git push main` matches an explicit destination `main` or `refs/heads/main`,
+including `HEAD:main`, `+feature:refs/heads/main`, `:main`, and `--delete origin main`.
+It does not match a source such as `main:feature`, a remote named `main`,
+`tag main`, option values, or a later PR command's `--base main`. Refs are
+case-sensitive; Git configuration/defaults, wildcard refspecs, and implicit
+pushes (`--all`, `--mirror`, or no explicit refspec) are not resolved by this
+selector. Keep separately required policy for those operations.
+
+Literal shell stdin is inspected as a program only when the shell consumes it
+as source. Unresolved source such as stdin FD duplication fails closed; unused
+FDs and a shell `-c` command's PR input remain data. Escaped ANSI-C PR body
+arguments remain data too; unsupported quoting in execution-relevant words
+and Git options with unknown operand ownership fail closed.
+
+Legacy `approvals.deny` glob semantics are unchanged. To migrate broad merge or
+git-main globs, replace only those rules with their selectors and retain unrelated deny entries;
+keeping the broad glob still blocks prose. The mtime-keyed config loader picks
+up the setting without a session restart on a runtime supporting this key.
+Before rolling back to a runtime without a selector, restore its old globs
+first, then remove the unsupported selector. This is a guardrail, not a shell interpreter: arbitrary variables,
+aliases, scripts on disk, and programs using other GitHub APIs are not resolved.
+
 ### Approval Timeout
 
 When a dangerous command prompt appears, the user has a configurable amount of time to respond. If no response is given within the timeout, the command is **denied** by default (fail-closed).
@@ -815,7 +859,21 @@ Three consecutive operational failures (spawn error, timeout, crash) suspend sca
 
 Tirith ships prebuilt binaries for Linux (x86_64 / aarch64) and macOS (x86_64 / arm64). On platforms with no prebuilt binary (Windows, etc.), tirith is silently skipped — pattern-matching guards still run, and the CLI does not surface an "unavailable" banner. To use tirith on Windows, run Hermes under WSL.
 
-Tirith's verdict integrates with the approval flow: safe commands pass through, while both suspicious and blocked commands trigger user approval with the full tirith findings (severity, title, description, safer alternatives). Users can approve or deny — the default choice is deny to keep unattended scenarios secure.
+
+### Pipeline & Data-Reading Safe Carveout
+
+Hermes pattern detection recognizes safe data-reading and formatting operations in `python -c` scripts, distinguishing them from dangerous code execution. Commands like:
+
+```bash
+gh api repos/owner/repo/actions/jobs/123/logs | python3 -c 'import sys; s=sys.stdin.read(); print(s[-5000:])'
+cat data.json | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])'
+python3 -c 'import json, pathlib; print(json.loads(pathlib.Path("rules.json").read_text()))'
+```
+
+are verified by AST inspection as safe data parsers (using standard read/parse modules like `sys`, `json`, `pathlib`, `ast`, `re` with no dynamic `exec`/`eval`, subprocesses, network requests, file writes, or callable aliasing). Such commands do not trigger the native `script execution via -e/-c flag` approval warning. Note that other security layers (such as operator command deny rules, Tirith scanner checks, and filesystem guards) remain authoritative and are not bypassed by this carveout.
+
+Upstream Tirith >=0.3.2 (available in v0.3.3) similarly recognizes Python data pipelines (`is_python_dash_c_data_pipeline`), avoiding `pipe_to_interpreter` blocks on data slicing and log reading. If an older Tirith binary (e.g. 0.3.0) is installed in a profile or default home, updating it to >=0.3.3 resolves the pipe scanner warning.
+
 
 Two known Tirith false positives are downgraded to "allow" so they never prompt (or, in cron, never deny): a `lookalike_tld` warning whose only target is the legitimate `.app` gTLD, and a `variation_selector` warning when every selector in the command is U+FE0F directly after an emoji (folder names such as `🗞️ Journal/` or `▶️ Media/`). A variation selector after a letter or digit — the steganographic-obfuscation signal the rule exists for — still prompts.
 

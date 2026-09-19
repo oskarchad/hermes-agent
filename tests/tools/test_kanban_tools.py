@@ -1269,3 +1269,77 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_create_with_contract_and_creator_origin_and_show_readback(worker_env, monkeypatch):
+    """Verify create_task preserves creator_task_id and completion_contract,
+    and kanban_show returns completion_contract without error."""
+    import model_tools
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    # Seed owner task with persistent session_id and notification subscription
+    conn = kbc.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET session_id = 'parent-session-123' WHERE id = ?",
+            (worker_env,),
+        )
+        conn.commit()
+        kbn.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="chat-456",
+            thread_id="thread-789",
+        )
+    finally:
+        conn.close()
+
+    # Dispatch through registered public tool dispatch (model_tools.handle_function_call)
+    out = model_tools.handle_function_call(
+        "kanban_create",
+        {
+            "title": "task with contract",
+            "assignee": "peer",
+            "parents": [],  # NOT a parent! Must NOT have dependency link to creator
+            "completion_contract": "acme/repo",
+        },
+    )
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    task_id = d["task_id"]
+
+    show_out = model_tools.handle_function_call(
+        "kanban_show",
+        {"task_id": task_id},
+    )
+    show_d = json.loads(show_out)
+    assert "task" in show_d, show_d
+    assert show_d["task"]["id"] == task_id
+    assert show_d["task"]["completion_contract"] == "acme/repo"
+
+    conn = kbc.connect()
+    try:
+        t = kb.get_task(conn, task_id)
+        assert t is not None
+        # Child inherits session_id and subscriptions from creator task (worker_env via HERMES_KANBAN_TASK)
+        assert t.session_id == "parent-session-123"
+        subs = kbn.list_notify_subs(conn, task_id=task_id)
+        assert len(subs) == 1
+        assert subs[0]["platform"] == "telegram"
+        assert subs[0]["chat_id"] == "chat-456"
+
+        # Assert contract readback and status
+        assert t.completion_contract == "acme/repo"
+        assert t.status == "ready"  # No parents, so ready
+
+        # Assert NO dependency link to creator task
+        links = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE child_id = ? OR parent_id = ?",
+            (task_id, task_id),
+        ).fetchone()[0]
+        assert links == 0
+    finally:
+        conn.close()
