@@ -51,6 +51,33 @@ def _user_deny_block_result(pattern: str) -> dict:
         "approvals.mode=off. Do NOT retry or rephrase this command; the user has explicitly forbidden it.")}
 
 
+def _user_command_deny_block(command: str) -> dict | None:
+    """Validate and apply opt-in command selectors before any approval bypass."""
+    from tools.approval_command_rules import (
+        COMMAND_DENY_SELECTORS, CommandDenyParseError, match_command_deny)
+
+    selectors = _ctx._get_approval_config().get("deny_commands", [])
+    if not isinstance(selectors, list) or any(
+        not isinstance(selector, str) or selector not in COMMAND_DENY_SELECTORS for selector in selectors
+    ):
+        return {"approved": False, "user_deny": True, "config_error": True, "message": (
+            "BLOCKED: invalid approvals.deny_commands in config.yaml; expected a list "
+            "containing only 'gh pr merge' or 'git push main'. Ask the operator "
+            "to correct the configuration; do not retry or rephrase the command.")}
+    if not selectors:
+        return None
+    try:
+        matched = match_command_deny(command, selectors)
+    except CommandDenyParseError as exc:
+        return _hardline_block_result(str(exc), command)
+    if matched:
+        return {"approved": False, "user_deny": True, "message": (
+            f"BLOCKED: this command matches '{matched}' (approvals.deny_commands "
+            "in config.yaml). It cannot be executed via the agent, even under "
+            "--yolo or approvals.mode=off. Do NOT retry or rephrase this command.")}
+    return None
+
+
 def _save_blocked_payload(command: str) -> str | None:
     """Persist a parser-limit-blocked command as a runnable script. That block
     fires on payload SIZE/shape, not the operation — usually a legitimate script
