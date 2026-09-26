@@ -36,14 +36,18 @@ logger = logging.getLogger(__name__)
 # Gateway-internal notifications arrive through the same user-role channel as genuine
 # user messages; they are execution metadata and must never become durable memory.
 # Deliberately anchored: a human discussing one of these strings mid-message is valid input.
+# Shared group/thread sessions prepend one ``[sender] `` tag and Discord a ``[Triggering message id``
+# header (gateway/run_inbound.py), so the anchor tolerates exactly those prefixes. Process wording
+# mirrors tools/process_registry_notifications.format_process_notification.
 _INTERNAL_GATEWAY_TURN_RE = re.compile(
-    r"^\s*(?:"
-    r"\[ASYNC (?:DELEGATION )?(?:BATCH )?COMPLETE[^\]]*\]|"
+    r"^\s*(?:\[Triggering message id: [^\]\n]*\]\s*)?(?:\[[^\]\n]+\]\s+)?(?:"
+    r"\[ASYNC (?:DELEGATION )?(?:BATCH )?(?:COMPLETE|TASK FAILED)[^\]]*\]|"
     r"\[CONTEXT COMPACTION[^\]]*\]|"
     r"\[CONTEXT SUMMARY\]:?|"
     r"\[PRIOR CONTEXT[^\]]*\]|"
     r"\[Your active task list was preserved across context compression\]|"
-    r"\[IMPORTANT: Background process \d+ matched watch pattern[^\n]*|"
+    r"\[IMPORTANT: Background process \S+ (?:matched watch pattern|completed normally|exited"
+    r"|terminated by|marked lost|failed to start)|"
     r"A background fan-out of \d+ subagent\(s\) you dispatched earlier has finished\.|"
     r"A background subagent you dispatched earlier has finished\."
     r")",
@@ -222,8 +226,9 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._recall_generation = object()
         try:
             agent_context, platform = kwargs.get("agent_context", ""), kwargs.get("platform", "cli")
-            if agent_context in {"cron", "flush"} or platform == "cron":
-                logger.debug("Honcho skipped: cron/flush context (agent_context=%s, platform=%s)",
+            # A dispatcher-spawned Kanban worker speaks for an agent, not for the user: same as cron.
+            if agent_context in {"cron", "flush"} or platform == "cron" or os.environ.get("HERMES_KANBAN_TASK"):
+                logger.debug("Honcho skipped: cron/flush/kanban context (agent_context=%s, platform=%s)",
                              agent_context, platform)
                 self._cron_skipped = True
                 return
