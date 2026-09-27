@@ -2450,6 +2450,22 @@ class _FireAudit:
 
 
 
+def _user_config_parseable_for(job: dict) -> bool:
+    """False when an agent job faces a corrupt config.yaml. Then the explicit-route check is
+    skipped so ``_prepare_job_prompt`` reports upstream's own "settings file" refusal instead of a
+    misleading route error; the job still fails closed there. no_agent jobs are exempt upstream,
+    so for them the route check runs as before."""
+    if job.get("no_agent"):
+        return True
+    from hermes_cli.config import InvalidUserConfigError, require_parseable_user_config
+
+    try:
+        require_parseable_user_config()
+    except InvalidUserConfigError:
+        return False
+    return True
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
@@ -2473,7 +2489,9 @@ def run_job(
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
     from cron.delivery_routes import check_explicit_delivery
-    route_error, _ = check_explicit_delivery(job)
+    route_error = None
+    if _user_config_parseable_for(job):
+        route_error, _ = check_explicit_delivery(job)
     if route_error:
         from cron.scheduler_preflight import _blocked_config_result
         return _blocked_config_result(job_id, job_name, route_error, mandatory=True)

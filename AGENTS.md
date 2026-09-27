@@ -444,7 +444,7 @@ extract, not to regex around it.
 
 ## Routing Table — working in X → read X/AGENTS.md
 
-For retained runtime changes, read the [ADR index](docs/ADR.md). Approval policy
+For retained runtime changes, read the [ADR index](docs/adr/README.md). Approval policy
 changes also follow [ADR 0003](docs/0003-command-aware-approval-deny.md).
 Contributor attribution follows the [contributor guide](contributors/README.md).
 
@@ -463,7 +463,7 @@ Contributor attribution follows the [contributor guide](contributors/README.md).
 | `gateway/platforms/` new adapter | `gateway/platforms/ADDING_A_PLATFORM.md` | Step-by-step adapter guide |
 | profiles / multiplex / secret scope (any area) | `gateway/AGENTS.md` § Profile scope, `website/docs/user-guide/multi-profile-gateways.md` § What is isolated per profile | which execution points bind scope, what is isolated per profile |
 
-Kanban retained-runtime direction: [ADR index](docs/ADR.md) and
+Kanban retained-runtime direction: [ADR index](docs/adr/README.md) and
 [Kanban reference](website/docs/user-guide/features/kanban.md).
 
 Long-form background lives in `website/docs/developer-guide/` (agent-loop, prompt-assembly,

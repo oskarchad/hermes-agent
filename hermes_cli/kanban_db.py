@@ -2963,15 +2963,15 @@ def release_stale_claims(
                 continue
             run_id = _record_reclaim(
                 conn, row["id"], termination,
-                error="claim_expired",
+                error=f"stale_lock={row['claim_lock']}",
                 payload={
-                    "claim_expires": row["claim_expires"],
-                    "last_heartbeat_at": hb,
-                    "worker_pid": row["worker_pid"],
+                    "stale_lock": row["claim_lock"],
+                    "worker_pid": _opt_int(row["worker_pid"]),
+                    "claim_expires": int(row["claim_expires"]),
+                    "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
+                    "now": now,
                     "host_local": host_local,
-                    "reclaimed_at": now,
-                    "prev_lock": row["claim_lock"],
-                    "prev_pid": row["worker_pid"],
+                    "heartbeat_stale": bool(heartbeat_stale),
                     "retry_status": retry_status,
                 },
             )
