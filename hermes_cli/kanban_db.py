@@ -3088,7 +3088,14 @@ def reclaim_task(
         scope_expected=_worker_scope_expected(conn, task_id, run_id=snapshot_run),
         scope_unit=_worker_scope_unit(conn, task_id, run_id=snapshot_run),
     )
-    if _worker_survived_termination(termination):
+    # An operator reclaim is a human override (upstream): an UNVERIFIED-fingerprint
+    # PID that was deliberately not signalled does not hold it. Only a cleanup we
+    # actually attempted (scope stop / signal) that is not verified keeps the claim.
+    if (
+        termination.get("host_local")
+        and termination.get("termination_attempted")
+        and not _worker_cleanup_verified(termination)
+    ):
         _defer_reclaim_for_live_worker(
             conn,
             task_id,

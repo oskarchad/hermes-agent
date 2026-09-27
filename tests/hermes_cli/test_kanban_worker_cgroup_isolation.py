@@ -14,6 +14,17 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 
 
+@pytest.fixture(autouse=True)
+def _live_kanban_modules():
+    """Harness only: other suites purge ``hermes_cli`` from ``sys.modules``, so
+    re-bind the module-level aliases to the live modules; otherwise ``kb``
+    (imported inside each test) and ``kbd`` would be different generations."""
+    global kbc, kbd, kbw
+    from hermes_cli import kanban_db_connect, kanban_db_dispatch, kanban_db_workspace
+    kbc, kbd, kbw = kanban_db_connect, kanban_db_dispatch, kanban_db_workspace
+    yield
+
+
 def _make_task(kb, *, claim_lock: str = "test-host:claim-token"):
     return kb.Task(
         id="t_scope_worker",
@@ -41,6 +52,9 @@ def _prepare_spawn(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     (root / "profiles" / "patch").mkdir(parents=True)
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    # Upstream profile_exists() now requires an identity marker in the profile
+    # home (named_profile_is_live); an empty directory is a ghost shell.
+    (root / "profiles" / "patch" / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)

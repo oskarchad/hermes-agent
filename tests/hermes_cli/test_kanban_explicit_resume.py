@@ -48,7 +48,7 @@ def test_checkpoint_continuation_preserves_identity_gates_and_is_consumed(board,
         # Re-link parent to assert that claim still gates on it
         kb.link_tasks(board, parent, tid)
     else:
-        assert kb.complete_task(board, parent)
+        assert kb.complete_task(board, parent, result="prerequisite done")
         kb.recompute_ready(board)
         assert kb.request_review(board, tid, summary="checkpoint", reviewer="reviewer")
         if resume == "review_reopened":
@@ -60,7 +60,7 @@ def test_checkpoint_continuation_preserves_identity_gates_and_is_consumed(board,
         kb.link_tasks(board, parent, tid)
     assert kbd.check_respawn_guard(board, tid) is None
     assert kb.claim_task(board, tid) is None
-    assert kb.complete_task(board, parent)
+    assert kb.complete_task(board, parent, result="prerequisite done")
     kb.recompute_ready(board)
     assert kbd.check_respawn_guard(board, tid) is None
     claimed = kb.claim_task(board, tid)
