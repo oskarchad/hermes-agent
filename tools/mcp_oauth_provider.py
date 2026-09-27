@@ -95,7 +95,7 @@ class HermesProviderMixin:
         self._hermes_token_user_agent = token_user_agent
 
     async def _perform_authorization(self):
-        info = self.context.client_info
+        info = getattr(self, "context", None) and self.context.client_info
         grants = getattr(info, "grant_types", None) or []
         if (getattr(self, "_hermes_oauth_flow", "browser") == "device"
                 or ("urn:ietf:params:oauth:grant-type:device_code" in grants and "authorization_code" not in grants)):
@@ -105,7 +105,13 @@ class HermesProviderMixin:
                 "background reconnects cannot start a device login")
         self._tolerate_missing_iss_for_known_server()
         self._request_google_offline_access()
-        return await super()._perform_authorization()
+        from mcp.client.auth import OAuthFlowError
+        try:
+            return await super()._perform_authorization()
+        except OAuthFlowError as exc:
+            if str(exc).startswith("State parameter mismatch:"):
+                raise OAuthFlowError("OAuth state parameter mismatch") from None
+            raise
 
     def _tolerate_missing_iss_for_known_server(self) -> None:
         """Figma advertises ``authorization_response_iss_parameter_supported`` and then omits ``iss``
