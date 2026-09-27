@@ -22,17 +22,12 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
             from cron.delivery_routes import adapters_for_profile
 
             def _allowed_profiles():
-                # Gate on the runner's LIVE allowlist, not just the watch scopes. Watch scopes come
-                # from `_multiplex_profile_homes`, which enumerates profiles on disk and ignores
-                # `multiplex_profile_allowlist` — so a profile whose authorization was revoked after
-                # dispatch would still drain here. Cron output must never be delivered through an
-                # adapter the operator has since de-authorized.
-                names = {name for name, _ in _handoff_watch_scopes(runner) if name is not None}
-                cfg = getattr(runner, "config", None)
-                allowlist = getattr(cfg, "multiplex_profile_allowlist", None)
-                if allowlist is not None:
-                    names &= set(allowlist)
-                return names
+                # Re-read the served set at drain time, not at dispatch: a profile the operator has
+                # since parked (`hermes -p <name> gateway stop`) or made standalone drops out of
+                # `profiles_to_serve`, so its queued cron output is never delivered through an
+                # adapter it no longer owns. (The old `multiplex_profile_allowlist` key was removed
+                # upstream in config v43 and GatewayConfig no longer carries it.)
+                return {name for name, _ in _handoff_watch_scopes(runner) if name is not None}
 
             view = adapters_for_profile(
                 profile_name, primary=adapters,
