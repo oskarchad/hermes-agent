@@ -637,6 +637,30 @@ class TestTerminalToolGatewayLifecycleGuard:
             )
             assert (result is not None) is blocked
 
+    @pytest.mark.parametrize("opener, body", [
+        ("python3 - <<'EOF' 2>&1", "subprocess.run(['hermes', 'gateway', 'stop'])"),
+        ("cd /tmp && python3 - <<'EOF' 2>&1", "subprocess.run(['hermes', 'gateway', 'stop'])"),
+        ("python3 - <<'EOF' 2>&1", "os.system('systemctl --user stop hermes-gateway')"),
+        ("env python3 - <<'EOF'", "subprocess.run(['hermes', 'gateway', 'stop'])"),
+        ("VAR=x python3 - <<'EOF'", "subprocess.run(['hermes', 'gateway', 'stop'])"),
+        ("python3 - <<'EOF'", "os.popen(str(Path({script!r})))"),
+        ("python3 - <<'EOF'", "os.execv(str(Path({script!r})), ['x'])"),
+    ])
+    def test_f1_python_heredoc_variants_reach_real_caller(self, monkeypatch, tmp_path, opener, body):
+        from tools.terminal_tool_guards import gateway_lifecycle_block
+
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+        command = (f"{opener}\nimport os, subprocess\nfrom pathlib import Path\n"
+                   f"{body.format(script=str(script))}\nEOF")
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        result = gateway_lifecycle_block(
+            command=command, env=self._make_fake_env(), env_type="local", cwd=str(tmp_path),
+            workdir=str(tmp_path), session_key="f1-regression",
+        )
+        assert result is not None
+        assert "Blocked" in json.loads(result)["error"]
+
     def test_force_true_cannot_bypass_block(self, monkeypatch):
         import tools.terminal_tool as tt
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)

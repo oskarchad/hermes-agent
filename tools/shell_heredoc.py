@@ -108,12 +108,16 @@ def _is_fd_redirect_ampersand(command: str, index: int) -> bool:
     return before in "<>" or after == ">"
 
 
-def _scan_heredoc_command_unit(command: str, start: int):
+def _scan_heredoc_command_unit(
+        command: str, start: int, *, spec_owners: list[int] | None = None,
+        list_operators: list[int] | None = None):
     """Scan one logical command.
 
     Return ``(end, specs, unknown_operator, post_heredoc_list_operator, owner_start)``.
     List operators before the first heredoc select the simple command that owns it. A list
     operator after a heredoc keeps the body visible because another command may consume it.
+    Optional *spec_owners* receives, per heredoc spec, the start of the simple command that
+    carries its ``<<`` (PR17 per-spec ownership); *list_operators* receives every list operator.
     """
     cursor = start
     quote = None
@@ -122,6 +126,7 @@ def _scan_heredoc_command_unit(command: str, start: int):
     unknown_operator = False
     post_heredoc_list_operator = False
     owner_start = start
+    simple_start = start
     while cursor < len(command):
         char = command[cursor]
         if char == "\n" and (comment or quote is None):
@@ -149,6 +154,8 @@ def _scan_heredoc_command_unit(command: str, start: int):
             else:
                 cursor, delimiter, strip_tabs, quoted = parsed
                 specs.append((delimiter, strip_tabs, quoted))
+                if spec_owners is not None:
+                    spec_owners.append(simple_start)
         else:
             if char in ";|&" and not (
                 char == "&" and _is_fd_redirect_ampersand(command, cursor)
@@ -157,6 +164,9 @@ def _scan_heredoc_command_unit(command: str, start: int):
                     post_heredoc_list_operator = True
                 else:
                     owner_start = cursor + 1
+                simple_start = cursor + 1
+                if list_operators is not None:
+                    list_operators.append(cursor)
             cursor += 1
     return cursor, specs, unknown_operator, post_heredoc_list_operator, owner_start
 
@@ -177,11 +187,11 @@ def _find_heredoc_close(
         cursor = after
 
 
-def _heredoc_body_ranges(command: str, *, python_only: bool = False):
-    """Find complete bodies without treating their contents as shell openers."""
+def strip_inert_heredoc_bodies(command: str) -> str:
+    """Mask heredoc bodies that are provably inert data (see module docstring)."""
     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
     if "<<" not in command:
-        return []
+        return command
     last_opener_index = command.rfind("<<")
     ranges: list[tuple[int, int]] = []
     command_start = 0
@@ -194,20 +204,20 @@ def _heredoc_body_ranges(command: str, *, python_only: bool = False):
             owner_start,
         ) = _scan_heredoc_command_unit(command, command_start)
         if unknown_operator:
-            return []
+            return command
         if not specs:
             if command_end >= len(command):
                 break
             command_start = command_end + 1
             continue
         if command_end >= len(command):
-            return []  # opener with no body line: unterminated — leave visible
+            return command  # opener with no body line: unterminated — leave visible
         body_cursor = command_end + 1
         body_ranges: list[tuple[int, int]] = []
         for delimiter, strip_tabs, _quoted in specs:
             close_end = _find_heredoc_close(command, body_cursor, delimiter, strip_tabs)
             if close_end is None:
-                return []  # unterminated
+                return command  # unterminated
             body_ranges.append((body_cursor, close_end))
             body_cursor = close_end
         if (
@@ -216,42 +226,12 @@ def _heredoc_body_ranges(command: str, *, python_only: bool = False):
         ):
             masked_opener = _mask_simple_quotes(command[command_start:command_end])
             masked_owner = _mask_simple_quotes(command[owner_start:command_end])
-            # Both lanes classify the OWNING simple command (upstream d939605ff7), so every Python
-            # body upstream would mask as inert behind a `cd x &&` prefix is also split out for
-            # PR17 inspection instead of silently vanishing from the lifecycle walk.
-            consumer = (_PYTHON_STDIN_HEREDOC_RE.fullmatch(masked_owner) if python_only
-                        else _INERT_HEREDOC_CONSUMER_RE.search(masked_owner))
             if not any(
                 marker in masked_opener
                 for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")
-            ) and consumer:
+            ) and _INERT_HEREDOC_CONSUMER_RE.search(masked_owner):
                 ranges.extend(body_ranges)
         command_start = body_cursor
-    return ranges
-
-
-# Only an unambiguous Python stdin program enters language-aware lifecycle scanning.
-# -c, script operands, multiple redirects and compound openers retain the legacy scan.
-_PYTHON_STDIN_HEREDOC_RE = re.compile(
-    r"\s*(?:[A-Za-z0-9_./-]+/)?python(?:3(?:\.\d+)*)?\s+"
-    r"(?:-\s+)?<<\s*(?:''|\"\")\s*"
-)
-
-
-def split_python_heredoc_bodies(command: str) -> tuple[str, list[str]]:
-    """Separate quoted Python stdin source from shell source; neither is declared safe."""
-    ranges = _heredoc_body_ranges(command, python_only=True)
-    bodies = ["".join(command[start:end].splitlines(keepends=True)[:-1])
-              for start, end in ranges]
-    return _mask_body_ranges(command, ranges), bodies
-
-
-def strip_inert_heredoc_bodies(command: str) -> str:
-    """Mask heredoc bodies that are provably inert data (see module docstring)."""
-    return _mask_body_ranges(command, _heredoc_body_ranges(command))
-
-
-def _mask_body_ranges(command: str, ranges: list[tuple[int, int]]) -> str:
     # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.
     parts: list[str] = []
     previous = 0
@@ -259,3 +239,135 @@ def _mask_body_ranges(command: str, ranges: list[tuple[int, int]]) -> str:
         parts += [command[previous:start], "\n" * command.count("\n", start, end)]
         previous = end
     return "".join(parts) + command[previous:]
+
+
+# --- PR17: Python heredoc bodies for the cron lifecycle guard ----------------------------------
+#
+# Every quoted heredoc whose owning simple command is a Python interpreter is classified, so no
+# Python body the inert masker above hides can escape language-aware inspection:
+# * PROGRAM: the owner reads its program from this heredoc on stdin (``python3 - <<'EOF'``, with
+#   optional VAR=/env prefixes, flags, argv after ``-`` and output redirections, and with any list
+#   operator after it, e.g. ``2>&1 | tail``). The body is split out of the shell source and
+#   inspected strictly.
+# * OTHER: any other Python-owned body (script/``-c``/``-m`` operand, unquoted, input redirection,
+#   unusual quoting). It stays in the shell source untouched (upstream masking applies) and is
+#   inspected additively: a literal lifecycle process call in it still blocks.
+
+_PY_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\S*")
+_PY_INTERPRETER_RE = re.compile(r"(?:[A-Za-z0-9_./-]+/)?python(?:3(?:\.\d+)*)?", re.IGNORECASE)
+_PY_OWNER_TOKEN_RE = re.compile(r"(?:^|[\s/])python[0-9.]*(?:\.exe)?(?=\s|$)", re.IGNORECASE)
+_PY_FLAG_RE = re.compile(r"-[BEIOPRSbdqsuvx]+|-[WX]\S+")
+_PY_HEREDOC_TOKEN_RE = re.compile(r"<<-?(?:''|\"\")")
+# Output redirections / fd duplication only: an input redirection would replace the heredoc as stdin.
+_PY_REDIRECT_RE = re.compile(r"(?:\d*>>?|&>>?|\d*>\|)(?:&(?:\d+|-)|[^\s<>&|;]+)|\d*<&(?:\d+|-)")
+_PY_REDIRECT_OPERATOR_RE = re.compile(r"\d*>>?|&>>?|\d*>\|")
+
+
+def _is_python_stdin_program_owner(masked_owner: str) -> bool:
+    """Whether the quote-masked simple command runs Python with its program read from one heredoc."""
+    tokens = masked_owner.split()
+    index = 0
+    while index < len(tokens) and _PY_ASSIGNMENT_RE.fullmatch(tokens[index]):
+        index += 1
+    if index < len(tokens) and tokens[index] == "env":
+        index += 1
+        while index < len(tokens):
+            token = tokens[index]
+            if _PY_ASSIGNMENT_RE.fullmatch(token) or token in ("-i", "--ignore-environment"):
+                index += 1
+            elif token == "-u" and index + 1 < len(tokens):
+                index += 2
+            elif token.startswith("--unset="):
+                index += 1
+            else:
+                break
+    if index >= len(tokens) or not _PY_INTERPRETER_RE.fullmatch(tokens[index]):
+        return False
+    index += 1
+    heredocs = 0
+    program_from_stdin = False  # after `-` every word is sys.argv for the stdin program
+    while index < len(tokens):
+        token = tokens[index]
+        if _PY_HEREDOC_TOKEN_RE.fullmatch(token):
+            heredocs += 1
+            index += 1
+        elif token in ("<<", "<<-") and index + 1 < len(tokens) and tokens[index + 1] in ("''", '""'):
+            heredocs += 1
+            index += 2
+        elif _PY_REDIRECT_RE.fullmatch(token):
+            index += 1
+        elif (_PY_REDIRECT_OPERATOR_RE.fullmatch(token) and index + 1 < len(tokens)
+              and not tokens[index + 1].startswith(("<", ">", "&"))):
+            index += 2
+        elif "<" in token or ">" in token:
+            return False
+        elif program_from_stdin:
+            index += 1
+        elif token == "-":
+            program_from_stdin = True
+            index += 1
+        elif _PY_FLAG_RE.fullmatch(token):
+            index += 1
+        elif token in ("-W", "-X") and index + 1 < len(tokens):
+            index += 2
+        else:
+            return False  # a script, -c, -m or unknown option: the heredoc is that program's data
+    return heredocs == 1
+
+
+def split_python_heredoc_bodies(command: str) -> tuple[str, list[str], list[str]]:
+    """``(shell_source, program_bodies, other_bodies)``: PROGRAM bodies are removed from the shell
+    source (newlines kept); OTHER Python-owned bodies stay in it. Neither kind is declared safe."""
+    if "<<" not in command:
+        return command, [], []
+    last_opener_index = command.rfind("<<")
+    program_ranges: list[tuple[int, int]] = []
+    program_bodies: list[str] = []
+    other_bodies: list[str] = []
+    command_start = 0
+    while command_start <= last_opener_index:
+        spec_owners: list[int] = []
+        list_operators: list[int] = []
+        command_end, specs, unknown_operator, _post_list, _owner = _scan_heredoc_command_unit(
+            command, command_start, spec_owners=spec_owners, list_operators=list_operators)
+        if unknown_operator:
+            break  # the masker leaves such a command fully visible; classify nothing further
+        if not specs:
+            if command_end >= len(command):
+                break
+            command_start = command_end + 1
+            continue
+        if command_end >= len(command):
+            break  # unterminated: visible to every scanner
+        masked_unit = _mask_simple_quotes(command[command_start:command_end])
+        grouped = any(marker in masked_unit for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}"))
+        body_cursor = command_end + 1
+        unit_ranges: list[tuple[int, int, int, bool]] = []
+        for (delimiter, strip_tabs, quoted), owner_start in zip(specs, spec_owners):
+            close_end = _find_heredoc_close(command, body_cursor, delimiter, strip_tabs)
+            if close_end is None:
+                unit_ranges = []
+                body_cursor = None
+                break
+            unit_ranges.append((body_cursor, close_end, owner_start, quoted))
+            body_cursor = close_end
+        if body_cursor is None:
+            break
+        for start, end, owner_start, quoted in unit_ranges:
+            owner_end = next((p for p in list_operators if p >= owner_start), command_end)
+            masked_owner = _mask_simple_quotes(command[owner_start:owner_end])
+            if not _PY_OWNER_TOKEN_RE.search(masked_owner):
+                continue
+            body = "".join(command[start:end].splitlines(keepends=True)[:-1])
+            if quoted and not grouped and _is_python_stdin_program_owner(masked_owner):
+                program_ranges.append((start, end))
+                program_bodies.append(body)
+            else:
+                other_bodies.append(body)
+        command_start = body_cursor
+    parts: list[str] = []
+    previous = 0
+    for start, end in program_ranges:
+        parts += [command[previous:start], "\n" * command.count("\n", start, end)]
+        previous = end
+    return "".join(parts) + command[previous:], program_bodies, other_bodies

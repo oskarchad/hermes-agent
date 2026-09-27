@@ -1157,71 +1157,164 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 
 # --- recursive walk ---------------------------------------------------------------------------
 
-def _python_process_payloads(source: str) -> Optional[tuple[list[str | list[str]], str]]:
-    """Inspect literal process operands, never execute Python or infer aliases/dataflow.
+# Python process callables PR17 understands, by (module, attribute). `posix`/`nt` are the modules
+# behind `os`. A STRING call runs its first operand through a shell; an ARGS call takes a string or
+# a literal argv. Every other process-spawning callable is OPAQUE: its operands are refused.
+_PY_OS_MODULES = frozenset({"os", "posix", "nt"})
+_PY_STRING_PROCESS_CALLS = frozenset(
+    {(m, "system") for m in _PY_OS_MODULES} | {(m, "popen") for m in _PY_OS_MODULES}
+    | {("subprocess", "getoutput"), ("subprocess", "getstatusoutput")})
+_PY_ARGS_PROCESS_CALLS = frozenset(
+    ("subprocess", name) for name in ("run", "Popen", "call", "check_call", "check_output"))
+_PY_OS_OPAQUE_ATTR_RE = re.compile(r"exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|startfile|fork(?:pty)?")
+_PY_OPAQUE_PROCESS_CALLS = frozenset({
+    ("pty", "spawn"), ("asyncio", "create_subprocess_exec"), ("asyncio", "create_subprocess_shell"),
+})
+# Modules whose process callables are resolved through `import x as y` / `from x import f as g`.
+_PY_PROCESS_MODULES = frozenset({"os", "posix", "nt", "subprocess", "pty", "asyncio"})
+# Signals that a body can reach a process (or hide which callable it calls). While any appears, no
+# `Path(...)` operand is blanked as data: dataflow from a Path value into a process call is not
+# modelled, so the path must stay visible to the walk. A bare `import os`/`import asyncio` is not a
+# signal by itself; their process attributes are.
+_PY_PROCESS_IMPORTS = frozenset({
+    "subprocess", "importlib", "ctypes", "runpy", "pexpect", "sh", "plumbum", "commands", "popen2",
+    "cffi",
+})
+_PY_DYNAMIC_NAMES = frozenset({
+    "exec", "eval", "compile", "__import__", "getattr", "setattr", "globals", "locals", "vars",
+    "__builtins__", "__dict__", "execfile", "import_module", "run_path", "run_module",
+    "system", "popen", "getoutput", "getstatusoutput", "Popen", "check_call", "check_output",
+    "spawn", "create_subprocess_exec", "create_subprocess_shell",
+})
 
-    Called only for complete, quoted Python stdin bodies after the root text budget
-    is charged. Unknown operands of recognized process calls fail closed; syntax
-    failure must not turn partial language parsing into a new allow.
+
+def _is_python_process_signal(name: str) -> bool:
+    return name in _PY_DYNAMIC_NAMES or bool(_PY_OS_OPAQUE_ATTR_RE.fullmatch(name))
+
+
+def _python_process_kind(module: str, attr: str) -> Optional[str]:
+    """``"string"`` / ``"args"`` / ``"opaque"`` for a process-spawning callable, else ``None``."""
+    if (module, attr) in _PY_STRING_PROCESS_CALLS:
+        return "string"
+    if (module, attr) in _PY_ARGS_PROCESS_CALLS:
+        return "args"
+    if (module in _PY_OS_MODULES and _PY_OS_OPAQUE_ATTR_RE.fullmatch(attr)) or (
+            (module, attr) in _PY_OPAQUE_PROCESS_CALLS):
+        return "opaque"
+    return None
+
+
+def _python_process_payloads(source: str) -> Optional[tuple[list[str | list[str]], str]]:
+    """Inspect literal process operands, never execute Python or infer dataflow.
+
+    Returns ``(payloads, reference_source)`` or ``None`` when the body cannot be owned: invalid
+    syntax, or a process call (resolved through ``import x as y`` / ``from x import f as g``) whose
+    operand is not a literal, which carries ``executable=``/``**kwargs``, or which is opaque
+    (``os.exec*``/``os.spawn*``/``os.posix_spawn*``/``pty.spawn``/``asyncio.create_subprocess_*``).
+    ``reference_source`` is *source* with literal argv operands already owned by recursion
+    blanked, and literal ``Path(...)`` data operands blanked ONLY when the body has no
+    process-capable module or dynamic-dispatch name at all.
     """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return None
-    payloads = []
+    module_aliases: dict[str, str] = {name: name for name in _PY_PROCESS_MODULES}
+    function_aliases: dict[str, tuple[str, str]] = {}
+    process_capable = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                process_capable = process_capable or root in _PY_PROCESS_IMPORTS
+                if root in _PY_PROCESS_MODULES:
+                    module_aliases[alias.asname or root] = root
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            process_capable = process_capable or root in _PY_PROCESS_IMPORTS
+            for alias in node.names:
+                if alias.name == "*":
+                    process_capable = process_capable or root in _PY_PROCESS_MODULES
+                    continue
+                process_capable = process_capable or (
+                    root in _PY_PROCESS_MODULES and _is_python_process_signal(alias.name))
+                function_aliases[alias.asname or alias.name] = (root, alias.name)
+        elif isinstance(node, ast.Name) and _is_python_process_signal(node.id):
+            process_capable = True
+        elif isinstance(node, ast.Attribute) and _is_python_process_signal(node.attr):
+            process_capable = True
+
+    def resolve(func: ast.expr) -> Optional[tuple[str, str]]:
+        if isinstance(func, ast.Name):
+            return function_aliases.get(func.id)
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            module = module_aliases.get(func.value.id)
+            return (module, func.attr) if module else None
+        return None
+
+    payloads: list[str | list[str]] = []
     data_spans = []
+    path_spans = []
     lines = source.encode("utf-8").splitlines(keepends=True)
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
+
+    def span(node: ast.expr) -> Optional[tuple[int, int]]:
+        if node.end_lineno is None or node.end_col_offset is None:
+            return None
+        return (offsets[node.lineno - 1] + node.col_offset,
+                offsets[node.end_lineno - 1] + node.end_col_offset)
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        # Path constructs a data value, not a shell command. Keep all unknown
-        # calls on the legacy reference path rather than granting a Python-wide
-        # exemption. Only literal operands are removed, never nested calls.
+        # Path constructs a data value, not a shell command. Only literal operands are candidates,
+        # never nested calls, and only while no process-capable name exists (see docstring).
         if isinstance(node.func, ast.Name) and node.func.id == "Path":
             for argument in node.args:
-                if (isinstance(argument, ast.Constant) and isinstance(argument.value, str)
-                        and argument.end_lineno is not None and argument.end_col_offset is not None):
-                    data_spans.append((offsets[argument.lineno - 1] + argument.col_offset,
-                                       offsets[argument.end_lineno - 1] + argument.end_col_offset))
-        if not isinstance(node.func, ast.Attribute):
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    path_spans.append(span(argument))
             continue
-        owner = node.func.value
-        if not isinstance(owner, ast.Name):
+        target = resolve(node.func)
+        kind = _python_process_kind(*target) if target else None
+        if kind is None:
             continue
-        is_system = owner.id == "os" and node.func.attr == "system"
-        is_subprocess = owner.id == "subprocess" and node.func.attr in {
-            "run", "Popen", "call", "check_call", "check_output",
-        }
-        if not (is_system or is_subprocess):
-            continue
+        process_capable = True
+        if kind == "opaque" or any(keyword.arg in (None, "executable") for keyword in node.keywords):
+            return None
+        names = ("command", "cmd") if kind == "string" else ("args",)
         argument = node.args[0] if node.args else next(
-            (kw.value for kw in node.keywords if kw.arg == ("command" if is_system else "args")),
-            None,
-        )
+            (keyword.value for keyword in node.keywords if keyword.arg in names), None)
         if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
             payloads.append(argument.value)
-        elif is_subprocess and isinstance(argument, (ast.List, ast.Tuple)) and argument.elts:
+        elif kind == "args" and isinstance(argument, (ast.List, ast.Tuple)) and argument.elts:
             argv = []
             for item in argument.elts:
                 if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
                     return None
                 argv.append(item.value)
-            if argument.end_lineno is None or argument.end_col_offset is None:
+            argument_span = span(argument)
+            if argument_span is None:
                 return None
+            shell = next((keyword.value for keyword in node.keywords if keyword.arg == "shell"), None)
+            if shell is not None and not (isinstance(shell, ast.Constant) and shell.value is False):
+                # shell=True with a sequence runs `/bin/sh -c argv[0] argv[1:]`.
+                argv = ["/bin/sh", "-c", *argv]
             payloads.append(argv)
             # Keep data out of shell re-tokenization. This is not a coverage
             # verdict: the consumer must finish inspection or explicitly refuse.
-            data_spans.append((offsets[argument.lineno - 1] + argument.col_offset,
-                               offsets[argument.end_lineno - 1] + argument.end_col_offset))
+            data_spans.append(argument_span)
         else:
             return None
+    if not process_capable:
+        data_spans += [s for s in path_spans if s is not None]
     raw = source.encode("utf-8")
     parts = []
     previous = 0
     for start, end in sorted(data_spans):
+        if start < previous:
+            continue  # nested inside an already blanked span
         parts.extend((raw[previous:start], b"''", b"\n" * raw.count(b"\n", start, end)))
         previous = end
     parts.append(raw[previous:])
@@ -1268,16 +1361,29 @@ def _contains_unsafe_gateway_action(
     walk_command = command
 
     if isinstance(walk_command, str):
-        shell_source, python_bodies = split_python_heredoc_bodies(walk_command)
+        shell_source, python_bodies, other_python_bodies = split_python_heredoc_bodies(walk_command)
         reference_sources = [shell_source]
+        # A Python-owned body that is not the owner's stdin PROGRAM (script/-c/-m operand, unquoted,
+        # unusual quoting) stays in the shell source, where upstream's masker may treat it as inert
+        # data. It is additionally inspected with mention semantics: a literal lifecycle process
+        # call still blocks; "could not inspect" is nothing to scan (F1).
+        for source in other_python_bodies:
+            inspected = _python_process_payloads(source)
+            for payload in (inspected[0] if inspected else ()):
+                try:
+                    if recurse(payload, cwd, False):
+                        return True
+                except _IncompleteProcessArgv:
+                    continue
         for source in python_bodies:
             inspected = _python_process_payloads(source)
             if inspected is None:
                 if executed:
                     logger.warning("lifecycle guard cannot inspect a Python stdin heredoc; refusing")
                     return _refuse_uninspectable(
-                        budget, "a quoted Python stdin heredoc could not be inspected "
-                        "(invalid syntax, or a process call whose operand is not a literal)")
+                        budget, "a quoted Python stdin heredoc could not be inspected (invalid "
+                        "syntax, or a process call whose operand is not a literal or whose "
+                        "callable is os.exec*/os.spawn*/pty.spawn/asyncio subprocess)")
                 # #113944: inside a file that is only MENTIONED, "could not inspect" is "nothing
                 # to scan"; its text stays on the (non-blocking) reference walk.
                 reference_sources.append(source)
