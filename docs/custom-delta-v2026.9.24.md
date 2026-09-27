@@ -97,6 +97,18 @@ current structure.
   `mcp_oauth_manager.py` is upstream's. The Windows paste reader was dropped.
 
 
+## Known open defect (pre-existing, not introduced by this update)
+
+- `tui_gateway/captain_inbox.py` calls `_run_prompt_submit(..., on_terminal=..., completion_id=...)`,
+  but `_run_prompt_submit` accepts `terminal_callback` and none of `on_terminal`,
+  `completion_id`, `require_persisted`, `turn_purpose`. A durable Captain/kanban turn inside a
+  TUI or Desktop session therefore raises `TypeError` and is released and retried. Production
+  `30999cc039` has the same call; the last logged occurrence is 2026-09-08
+  (`logs/tui_gateway_crash.log`). Our tests mock `_run_prompt_submit`, so they do not see it.
+  The prompt-turn side of this contract exists only on the unmerged branch
+  `patch/her-171-origin-delivery` (`captain_turn.py`). Fix separately: port that, or move the
+  call onto upstream's `terminal_callback`.
+
 ## Verification boundary
 
 Only our contract tests and the upstream tests of the modules we touch are run,
