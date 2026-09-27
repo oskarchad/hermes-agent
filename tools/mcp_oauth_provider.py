@@ -95,7 +95,7 @@ class HermesProviderMixin:
         self._hermes_token_user_agent = token_user_agent
 
     async def _perform_authorization(self):
-        info = getattr(self, "context", None) and self.context.client_info
+        info = self.context.client_info
         grants = getattr(info, "grant_types", None) or []
         if (getattr(self, "_hermes_oauth_flow", "browser") == "device"
                 or ("urn:ietf:params:oauth:grant-type:device_code" in grants and "authorization_code" not in grants)):
@@ -109,6 +109,7 @@ class HermesProviderMixin:
         try:
             return await super()._perform_authorization()
         except OAuthFlowError as exc:
+            # The SDK formats both OAuth states into this message; it reaches the SDK's and Hermes' logs.
             if str(exc).startswith("State parameter mismatch:"):
                 raise OAuthFlowError("OAuth state parameter mismatch") from None
             raise

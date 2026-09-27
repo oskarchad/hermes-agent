@@ -5,6 +5,7 @@ import logging
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 from unittest.mock import MagicMock
 
@@ -24,7 +25,19 @@ def _send_callback_when_ready(url: str) -> None:
 
 def _send_callback_then_secondary_get(callback_url: str, secondary_url: str) -> None:
     _send_callback_when_ready(callback_url)
-    urllib.request.urlopen(secondary_url, timeout=1).close()
+    try:
+        urllib.request.urlopen(secondary_url, timeout=1).close()
+    except urllib.error.HTTPError:
+        pass  # a queryless follow-up is answered 404; only the latched result matters
+
+
+def _free_port() -> int:
+    """A fixed callback port (``oauth.redirect_port`` / cached registration port): the waiter binds it
+    itself with ``allow_reuse_address``. Ephemeral picks are parked by ``_reserve_callback_port`` without
+    it, and the next flow gets a fresh port, so a TIME_WAIT probe on them would test nothing we own."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _assert_port_released(port: int) -> None:
@@ -68,7 +81,7 @@ async def test_forced_headless_oauth_eof_does_not_retry_authorization(monkeypatc
     monkeypatch.setattr(mcp_tool, "_ensure_mcp_sdk", lambda: None)
 
     authorization_attempts: list[int] = []
-    port = oauth._find_free_port()
+    port = _free_port()
     server = mcp_tool.MCPServerTask("headless-oauth")
 
     async def fail_after_eof(_self, _config):
@@ -114,7 +127,7 @@ async def test_forced_headless_loopback_callback_completes_without_paste(monkeyp
     stdin.isatty.return_value = False
     stdin.readline.side_effect = AssertionError("non-TTY stdin must not be read")
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
-    port = oauth._find_free_port()
+    port = _free_port()
     waiter = oauth._make_callback_waiter(port, timeout=5.0)
     callback = (
         f"http://127.0.0.1:{port}/callback"
@@ -144,7 +157,7 @@ async def test_loopback_callback_result_survives_secondary_get(monkeypatch):
     stdin = MagicMock()
     stdin.isatty.return_value = False
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
-    port = oauth._find_free_port()
+    port = _free_port()
     callback = (
         f"http://127.0.0.1:{port}/callback"
         "?code=fake-latched-code&state=fake-latched-state"
@@ -174,7 +187,7 @@ async def test_loopback_callback_does_not_log_code_or_state(monkeypatch, caplog)
     stdin = MagicMock()
     stdin.isatty.return_value = False
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
-    port = oauth._find_free_port()
+    port = _free_port()
     code = "fake-secret-callback-code"
     state = "fake-secret-callback-state"
     callback = f"http://127.0.0.1:{port}/callback?code={code}&state={state}"
@@ -208,27 +221,26 @@ async def test_state_mismatch_is_redacted_before_sdk_and_application_logs(
     import tools.mcp_oauth as oauth
     import tools.mcp_oauth_manager as oauth_manager
 
+    from mcp.client.auth import OAuthClientProvider
+
     monkeypatch.setattr(oauth, "_is_interactive", lambda: True)
     manager = oauth_manager.get_manager()
-    provider_classes = []
-    # Test through manager's provider class and legacy build_oauth_auth class
-    provider = manager.get_or_build_provider(
-        "test-mismatch",
-        "https://mcp.example.test/mcp",
-        {"client_id": "cid", "client_secret": "csec"},
-    )
-    if provider is not None:
-        provider_classes.append(type(provider))
-    legacy_provider = oauth.build_oauth_auth(
-        "test-mismatch-legacy",
-        "https://mcp.example.test/mcp",
-        {"client_id": "cid", "client_secret": "csec"},
-    )
-    if legacy_provider is not None:
-        provider_classes.append(type(legacy_provider))
-
-    assert len(provider_classes) >= 1
-    upstream_provider = provider_classes[0].__mro__[2]  # OAuthClientProvider
+    # Real providers from both construction paths (manager and legacy build_oauth_auth): the
+    # Hermes mixin reads the SDK context before delegating, so a bare object.__new__ cannot stand in.
+    providers = [
+        manager.get_or_build_provider(
+            "test-mismatch",
+            "https://mcp.example.test/mcp",
+            {"client_id": "cid", "client_secret": "csec"},
+        ),
+        oauth.build_oauth_auth(
+            "test-mismatch-legacy",
+            "https://mcp.example.test/mcp",
+            {"client_id": "cid", "client_secret": "csec"},
+        ),
+    ]
+    providers = [p for p in providers if p is not None]
+    assert len(providers) >= 1
     received_state = "fake-received-secret-state"
     expected_state = "fake-expected-secret-state"
 
@@ -238,14 +250,13 @@ async def test_state_mismatch_is_redacted_before_sdk_and_application_logs(
         )
 
     monkeypatch.setattr(
-        upstream_provider,
+        OAuthClientProvider,
         "_perform_authorization",
         raise_state_mismatch,
     )
     with caplog.at_level(logging.DEBUG):
         caught_errors = []
-        for provider_class in provider_classes:
-            provider = object.__new__(provider_class)
+        for provider in providers:
             with pytest.raises(OAuthFlowError) as caught:
                 await provider._perform_authorization()
             caught_errors.append(caught.value)
@@ -276,7 +287,7 @@ async def test_tty_paste_callback_completes_and_releases_listener(monkeypatch):
     master_fd, slave_fd = pty.openpty()
     stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
-    port = oauth._find_free_port()
+    port = _free_port()
 
     try:
         os.write(
@@ -307,7 +318,7 @@ async def test_loopback_callback_stops_tty_reader_before_next_flow_input(monkeyp
     master_fd, slave_fd = pty.openpty()
     stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
-    port = oauth._find_free_port()
+    port = _free_port()
     callback = (
         f"http://127.0.0.1:{port}/callback"
         "?code=fake-loopback-code&state=fake-loopback-state"
@@ -352,12 +363,7 @@ async def test_tty_skip_or_cancel_releases_listener(monkeypatch, decision):
     stdin.isatty.return_value = True
     stdin.readline.return_value = decision + "\n"
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
-    monkeypatch.setattr(
-        oauth,
-        "_read_paste_line",
-        lambda _stop: stdin.readline(),
-    )
-    port = oauth._find_free_port()
+    port = _free_port()
 
     with pytest.raises(oauth.OAuthNonInteractiveError, match="user_skipped"):
         await oauth._make_callback_waiter(port, timeout=5.0)()
@@ -372,7 +378,7 @@ def test_stalled_callback_client_cannot_block_timeout_or_port_cleanup(monkeypatc
     stdin = MagicMock()
     stdin.isatty.return_value = False
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
-    port = oauth._find_free_port()
+    port = _free_port()
     outcome: list[BaseException] = []
 
     def run_waiter() -> None:
