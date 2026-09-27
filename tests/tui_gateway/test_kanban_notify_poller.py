@@ -346,6 +346,9 @@ class TestNotificationPollerLoopKanbanWiring:
             def empty(self):
                 return True
 
+            def qsize(self):  # upstream's poller loop sizes its ready snapshot and shutdown drain
+                return 0
+
         monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
         monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
         monkeypatch.setattr(
@@ -425,7 +428,7 @@ class TestNotificationPollerLoopKanbanWiring:
         )
         monkeypatch.setattr(
             server,
-            "_collect_kanban_notifications",
+            "_captain_collect_kanban_notifications",
             lambda *_args, **_kwargs: [],
         )
 
@@ -820,6 +823,9 @@ class TestNotificationPollerLoopKanbanWiring:
             def empty(self):
                 return True
 
+            def qsize(self):  # upstream's poller loop sizes its ready snapshot and shutdown drain
+                return 0
+
         history_lock = _WaiterFirstLock()
         session = {
             "agent": SimpleNamespace(),
@@ -854,13 +860,19 @@ class TestNotificationPollerLoopKanbanWiring:
 
         monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
         monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
-        monkeypatch.setattr(server, "_collect_kanban_notifications", collect)
+        # Upstream's loop also drives /heartbeat before the kanban step; its cold first call can
+        # outlast this test's 2 s collection window.
+        monkeypatch.setattr(server, "_maybe_fire_tui_heartbeat_tick", lambda *_args: None)
+        monkeypatch.setattr(server, "_captain_collect_kanban_notifications", collect)
         monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
         monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_args: None)
         monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_args: False)
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_args: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda *_args: None)
+        # v2026.9.24's prompt.submit also stages the user row in state.db; its cold open can
+        # outlast the 2 s window under host IO load. Storage is not what this test covers.
+        monkeypatch.setattr(server, "_persist_submit_user_row", lambda *_args: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
         monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_args: None)
         monkeypatch.setattr(server, "_run_prompt_submit", run_prompt)
@@ -874,6 +886,9 @@ class TestNotificationPollerLoopKanbanWiring:
             )
             prompt_returned.set()
 
+        # Bootstrap the board schema before the 2 s windows: the poller's first Captain receiver
+        # heartbeat otherwise pays the cold schema init (seconds under host IO load).
+        kbc.connect().close()
         server._sessions["sid-poller-test"] = session
         poller = threading.Thread(
             target=server._notification_poller_loop,

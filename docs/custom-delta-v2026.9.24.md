@@ -21,9 +21,9 @@ current structure.
 ## Kept, unchanged in substance
 
 1. **Captain inbox, durable signals, session recovery.** Upstream still has no
-   durable Captain ownership, receipt or recovery contract. Applied cleanly;
-   contract tests pass (`tests/tui_gateway/test_kanban_captain_*.py`,
-   `test_kanban_notify_poller.py`).
+   durable Captain ownership, receipt or recovery contract. Contract tests pass
+   (`tests/tui_gateway/test_kanban_captain_*.py`, `test_kanban_notify_poller.py`);
+   the poller wiring changed, see "Changed".
 2. **Kanban review provenance and lifecycle gates.** Applied cleanly; tests pass.
    Upstream extended the stop guard's terminal-tool set with
    `kanban_request_changes`; we take upstream's set (it is a superset of ours).
@@ -35,6 +35,19 @@ current structure.
 
 ## Changed
 
+- **Captain inbox rides upstream's poller.** The overlay carried a full copy of
+  the old upstream notification poller in `tui_gateway/captain_inbox.py`.
+  `bind_module` registers that module after `session_notifications`, so the copy
+  replaced upstream's loop and with it profile runtime scoping, batched process
+  completions, `/heartbeat`, bot mailbox delivery and the orphaned-completion
+  sweep. The copies are gone. Upstream's loop now takes its kanban step through
+  one fork seam, `_captain_poll_kanban` (receiver heartbeat, turn reservation
+  under upstream's turn admission, durable exact-origin and Captain claims,
+  settlement after the terminal turn). Our collector and formatter are named
+  `_captain_collect_kanban_notifications` and `_captain_format_kanban_event_text`;
+  upstream's RAM-buffered `_notif_poll_kanban` stays defined but is off the
+  runtime path. A test pins that `server` publishes upstream's poller functions
+  and that `captain_inbox` defines no name `session_notifications` owns.
 - **Cron delivery gate.** Our drain-time gate read
   `gateway.multiplex_profile_allowlist`, a key upstream removed in config v43;
   `GatewayConfig` no longer carries it, so the gate never restricted anything.

@@ -21,7 +21,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 import tui_gateway.server as server
-from tui_gateway.server import _collect_kanban_notifications
+from tui_gateway.server import _captain_collect_kanban_notifications
 
 ORIGIN_KEY = "captain-origin-session"
 SIBLING_KEY = "captain-sibling-session"
@@ -156,17 +156,17 @@ def test_live_origin_owns_report_sibling_gets_none():
 
     # Sibling must not claim while the exact origin is live.
     sib_claims = []
-    assert _collect_kanban_notifications(sibling, claim_records=sib_claims) == []
+    assert _captain_collect_kanban_notifications(sibling, claim_records=sib_claims) == []
     assert sib_claims == []
 
     orig_claims = []
-    texts = _collect_kanban_notifications(origin, claim_records=orig_claims)
+    texts = _captain_collect_kanban_notifications(origin, claim_records=orig_claims)
     assert len(texts) == 1
     assert tid in texts[0]
     server._settle_kanban_notification_claims(orig_claims, accepted=True)
 
     # No replay once acked.
-    assert _collect_kanban_notifications(origin, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(origin, claim_records=[]) == []
     assert _inbox_states() == {"acked": 1}
 
 
@@ -195,16 +195,16 @@ def test_origin_gone_sibling_claims_exactly_once():
     _register_live("sid-b", s2)
 
     c1, c2 = [], []
-    t1 = _collect_kanban_notifications(s1, claim_records=c1)
-    t2 = _collect_kanban_notifications(s2, claim_records=c2)
+    t1 = _captain_collect_kanban_notifications(s1, claim_records=c1)
+    t2 = _captain_collect_kanban_notifications(s2, claim_records=c2)
     total = t1 + t2
     assert len(total) == 1
     assert tid in total[0]
 
     server._settle_kanban_notification_claims(c1, accepted=True)
     server._settle_kanban_notification_claims(c2, accepted=True)
-    assert _collect_kanban_notifications(s1, claim_records=[]) == []
-    assert _collect_kanban_notifications(s2, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(s1, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(s2, claim_records=[]) == []
 
 
 # ── requirement 3: different profile cannot claim ──────────────────────────
@@ -224,7 +224,7 @@ def test_different_profile_cannot_claim():
     s = _session("live-x")
     _register_live("sid-x", s)
     assert _profile_for(s) != "a-totally-other-profile"
-    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(s, claim_records=[]) == []
     # The row stays pending for its own profile — never consumed by another.
     assert _inbox_states() == {"pending": 1}
 
@@ -244,12 +244,12 @@ def test_expired_lease_is_reclaimed_and_acked_once():
     _register_live("sid-r", s)
 
     c1 = []
-    t1 = _collect_kanban_notifications(s, claim_records=c1)
+    t1 = _captain_collect_kanban_notifications(s, claim_records=c1)
     assert len(t1) == 1  # leased
 
     # Simulate a crash BEFORE ack: never settle. A fresh poll must not
     # re-claim the still-valid lease.
-    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(s, claim_records=[]) == []
 
     # Simulate a process restart past the lease expiry.
     conn = kbc.connect()
@@ -264,12 +264,12 @@ def test_expired_lease_is_reclaimed_and_acked_once():
         conn.close()
 
     c2 = []
-    t2 = _collect_kanban_notifications(s, claim_records=c2)
+    t2 = _captain_collect_kanban_notifications(s, claim_records=c2)
     assert len(t2) == 1  # reclaimed
     assert t2[0] == t1[0]
     server._settle_kanban_notification_claims(c2, accepted=True)
 
-    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(s, claim_records=[]) == []
     assert _inbox_states() == {"acked": 1}
 
 
@@ -292,7 +292,7 @@ def test_live_owner_renews_lease_past_original_expiry(monkeypatch):
     _register_live("slow-contender", contender)
 
     claims = []
-    assert len(_collect_kanban_notifications(owner, claim_records=claims)) == 1
+    assert len(_captain_collect_kanban_notifications(owner, claim_records=claims)) == 1
     original_expiry = clock[0] + server._CAPTAIN_LEASE_SECONDS
 
     clock[0] = original_expiry - 10
@@ -305,7 +305,7 @@ def test_live_owner_renews_lease_past_original_expiry(monkeypatch):
     # Past the original expiry, the renewed owner still fences the row.
     clock[0] = original_expiry + 1
     contender_claims = []
-    assert _collect_kanban_notifications(
+    assert _captain_collect_kanban_notifications(
         contender, claim_records=contender_claims
     ) == []
     assert contender_claims == []
@@ -330,7 +330,7 @@ def test_expired_owner_cannot_ack_before_a_contender_reclaims(monkeypatch):
 
     claims = []
     assert len(
-        _collect_kanban_notifications(_session("expired-owner"), claim_records=claims)
+        _captain_collect_kanban_notifications(_session("expired-owner"), claim_records=claims)
     ) == 1
     clock[0] = 1_121
     with pytest.raises(RuntimeError, match="expected 1 row"):
@@ -375,7 +375,7 @@ def test_ack_exception_releases_claim_for_retry(monkeypatch):
     session = _session("ack-error")
     _register_live("ack-error", session)
     claims = []
-    assert len(_collect_kanban_notifications(session, claim_records=claims)) == 1
+    assert len(_captain_collect_kanban_notifications(session, claim_records=claims)) == 1
 
     monkeypatch.setattr(
         kb,
@@ -387,7 +387,7 @@ def test_ack_exception_releases_claim_for_retry(monkeypatch):
 
     assert _inbox_states() == {"pending": 1}
     retry_claims = []
-    assert len(_collect_kanban_notifications(session, claim_records=retry_claims)) == 1
+    assert len(_captain_collect_kanban_notifications(session, claim_records=retry_claims)) == 1
 
 
 def test_zero_row_ack_is_failure_and_releases_claim_for_retry(monkeypatch):
@@ -403,7 +403,7 @@ def test_zero_row_ack_is_failure_and_releases_claim_for_retry(monkeypatch):
     session = _session("zero-ack")
     _register_live("zero-ack", session)
     claims = []
-    assert len(_collect_kanban_notifications(session, claim_records=claims)) == 1
+    assert len(_captain_collect_kanban_notifications(session, claim_records=claims)) == 1
     monkeypatch.setattr(kb, "ack_captain_reports", lambda *_args, **_kwargs: 0)
 
     with pytest.raises(RuntimeError, match="expected 1 row"):
@@ -500,7 +500,7 @@ def test_captain_delivery_uses_one_event_per_turn_across_boards():
     session = _session("one-event-turn")
     _register_live("one-event-turn", session)
     first_claims = []
-    first_texts = _collect_kanban_notifications(session, claim_records=first_claims)
+    first_texts = _captain_collect_kanban_notifications(session, claim_records=first_claims)
     assert len(first_texts) == 1
     first_ids = [
         delivery["id"]
@@ -511,7 +511,7 @@ def test_captain_delivery_uses_one_event_per_turn_across_boards():
     server._settle_kanban_notification_claims(first_claims, accepted=True)
 
     second_claims = []
-    second_texts = _collect_kanban_notifications(session, claim_records=second_claims)
+    second_texts = _captain_collect_kanban_notifications(session, claim_records=second_claims)
     assert len(second_texts) == 1
     second_ids = [
         delivery["id"]
@@ -554,12 +554,12 @@ def test_captain_turn_does_not_batch_an_ordinary_subscription_event():
     session = _session("captain-plus-ordinary")
     _register_live("captain-plus-ordinary", session)
     first_claims = []
-    first = _collect_kanban_notifications(session, claim_records=first_claims)
+    first = _captain_collect_kanban_notifications(session, claim_records=first_claims)
     assert len(first) == 1 and "captain event" in first[0]
     server._settle_kanban_notification_claims(first_claims, accepted=True)
 
     second_claims = []
-    second = _collect_kanban_notifications(session, claim_records=second_claims)
+    second = _captain_collect_kanban_notifications(session, claim_records=second_claims)
     assert len(second) == 1 and "ordinary event" in second[0]
 
 
@@ -578,18 +578,18 @@ def test_dispatch_failure_releases_then_accepted_retry_no_replay():
     _register_live("sid-f", s)
 
     c1 = []
-    t1 = _collect_kanban_notifications(s, claim_records=c1)
+    t1 = _captain_collect_kanban_notifications(s, claim_records=c1)
     assert len(t1) == 1
     server._settle_kanban_notification_claims(c1, accepted=False)  # rejected
     assert _inbox_states() == {"pending": 1}  # released
 
     c2 = []
-    t2 = _collect_kanban_notifications(s, claim_records=c2)
+    t2 = _captain_collect_kanban_notifications(s, claim_records=c2)
     assert len(t2) == 1
     assert t2[0] == t1[0]
     server._settle_kanban_notification_claims(c2, accepted=True)
 
-    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(s, claim_records=[]) == []
     assert _inbox_states() == {"acked": 1}
 
 
@@ -614,12 +614,12 @@ def test_no_duplicate_across_exact_origin_and_captain_routes():
         conn.close()
 
     claims = []
-    texts = _collect_kanban_notifications(origin, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(origin, claim_records=claims)
     assert len(texts) == 1  # deduplicated across both routes
     assert tid in texts[0]
     server._settle_kanban_notification_claims(claims, accepted=True)
 
-    assert _collect_kanban_notifications(origin, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(origin, claim_records=[]) == []
     # Captain row acked; the exact-origin sub is retained (done is reversible).
     assert _inbox_states() == {"acked": 1}
     conn = kbc.connect()
@@ -673,10 +673,10 @@ def test_reopen_creates_new_report_without_replaying_acked():
     _register_live("sid-re", s)
 
     c1 = []
-    t1 = _collect_kanban_notifications(s, claim_records=c1)
+    t1 = _captain_collect_kanban_notifications(s, claim_records=c1)
     assert len(t1) == 1 and "first pass" in t1[0]
     server._settle_kanban_notification_claims(c1, accepted=True)
-    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(s, claim_records=[]) == []
 
     conn = kbc.connect()
     try:
@@ -688,16 +688,16 @@ def test_reopen_creates_new_report_without_replaying_acked():
         conn.close()
 
     c2 = []
-    t2 = _collect_kanban_notifications(s, claim_records=c2)
+    t2 = _captain_collect_kanban_notifications(s, claim_records=c2)
     assert len(t2) == 1 and "→ ready" in t2[0]
     server._settle_kanban_notification_claims(c2, accepted=True)
     c3 = []
-    t3 = _collect_kanban_notifications(s, claim_records=c3)
+    t3 = _captain_collect_kanban_notifications(s, claim_records=c3)
     joined = "\n".join(t2 + t3)
     assert "second pass" in joined
     assert "first pass" not in joined  # acked cycle never replays
     server._settle_kanban_notification_claims(c3, accepted=True)
-    assert _collect_kanban_notifications(s, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(s, claim_records=[]) == []
 
 
 # ── migration / backward compatibility ─────────────────────────────────────
@@ -755,7 +755,7 @@ def test_archive_keeps_pending_then_purges_after_accepted_report():
     s = _session("live-arc")
     _register_live("sid-arc", s)
     claims = []
-    texts = _collect_kanban_notifications(s, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(s, claim_records=claims)
     assert len(texts) == 1
     assert "before archive" in texts[0]
     server._settle_kanban_notification_claims(claims, accepted=True)
@@ -785,7 +785,7 @@ def test_archive_with_no_unreported_work_purges_directly():
     s = _session("live-arc2")
     _register_live("sid-arc2", s)
     claims = []
-    assert len(_collect_kanban_notifications(s, claim_records=claims)) == 1
+    assert len(_captain_collect_kanban_notifications(s, claim_records=claims)) == 1
     server._settle_kanban_notification_claims(claims, accepted=True)
 
     conn = kbc.connect()
@@ -817,7 +817,7 @@ def test_captain_report_is_bounded_and_privacy_safe():
 
     s = _session("live-p")
     _register_live("sid-p", s)
-    texts = _collect_kanban_notifications(s, claim_records=[])
+    texts = _captain_collect_kanban_notifications(s, claim_records=[])
     assert len(texts) == 1
     text = texts[0]
     assert tid in text
@@ -846,7 +846,7 @@ def test_captain_report_omits_raw_error_and_force_redacts_secrets():
     s = _session("live-secret")
     _register_live("sid-secret", s)
     claims = []
-    texts = _collect_kanban_notifications(s, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(s, claim_records=claims)
     assert len(texts) == 1
     assert "gave up" in texts[0]
     assert "RAW_TOOL_OUTPUT_SHOULD_NOT_SURFACE" not in texts[0]
@@ -883,7 +883,7 @@ def test_event_gc_preserves_unreported_captain_source_until_ack():
     s = _session("live-gc")
     _register_live("sid-gc", s)
     claims = []
-    texts = _collect_kanban_notifications(s, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(s, claim_records=claims)
     assert len(texts) == 1
     assert "survives event gc" in texts[0]
     server._settle_kanban_notification_claims(claims, accepted=True)
@@ -966,7 +966,7 @@ def test_mixed_case_profile_session_claims_its_own_rows():
 
     assert _profile_for(session) == "otto"
     claims = []
-    texts = _collect_kanban_notifications(session, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(session, claim_records=claims)
     assert len(texts) == 1
     server._settle_kanban_notification_claims(claims, accepted=True)
     assert _inbox_states() == {"acked": 1}
@@ -1037,7 +1037,7 @@ def test_collector_without_claim_records_never_consumes_pending():
     _register_live("sid-none", s)
 
     # No settlement list supplied → the helper must not lease/ack the row.
-    _collect_kanban_notifications(s)  # claim_records defaults to None
+    _captain_collect_kanban_notifications(s)  # claim_records defaults to None
     assert _inbox_states() == {"pending": 1}
 
     # Direct helper call with claim_records=None is likewise inert.
@@ -1052,7 +1052,7 @@ def test_collector_without_claim_records_never_consumes_pending():
 
     # A properly settled poll still delivers exactly once afterwards.
     claims = []
-    texts = _collect_kanban_notifications(s, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(s, claim_records=claims)
     assert len(texts) == 1
     server._settle_kanban_notification_claims(claims, accepted=True)
     assert _inbox_states() == {"acked": 1}
@@ -1075,6 +1075,9 @@ class _EmptyCompletionQueue:
 
     def empty(self):
         return True
+
+    def qsize(self):  # upstream's poller loop sizes its ready snapshot and shutdown drain
+        return 0
 
 
 def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
@@ -1395,7 +1398,7 @@ def test_reconciliation_ack_failures_do_not_stop_poller_or_receiver_heartbeats(
         conn.close()
 
     seed_claims = []
-    seed_texts = _collect_kanban_notifications(session, claim_records=seed_claims)
+    seed_texts = _captain_collect_kanban_notifications(session, claim_records=seed_claims)
     completion_id = server._captain_completion_id(seed_claims, seed_texts)
     server._settle_kanban_notification_claims(seed_claims, accepted=False)
     db.append_messages_batch(
@@ -1489,19 +1492,19 @@ def test_cross_process_live_origin_wins_shared_captain_claim():
     server._sessions.clear()
     _register_live("sid-sibling", sibling)
     sibling_claims = []
-    assert _collect_kanban_notifications(sibling, claim_records=sibling_claims) == []
+    assert _captain_collect_kanban_notifications(sibling, claim_records=sibling_claims) == []
     assert sibling_claims == []
 
     # Process A likewise sees only itself and wins the ONE shared Captain lease.
     server._sessions.clear()
     _register_live("sid-origin", origin)
     origin_claims = []
-    texts = _collect_kanban_notifications(origin, claim_records=origin_claims)
+    texts = _captain_collect_kanban_notifications(origin, claim_records=origin_claims)
     assert len(texts) == 1
     assert tid in texts[0]
     assert sum(len(r.get("deliveries") or []) for r in origin_claims) == 1
     server._settle_kanban_notification_claims(origin_claims, accepted=True)
-    assert _collect_kanban_notifications(origin, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(origin, claim_records=[]) == []
 
 
 def test_busy_origin_heartbeat_stays_fresh_before_any_event(monkeypatch):
@@ -1579,13 +1582,13 @@ def test_lease_rechecks_origin_liveness_atomically_after_candidate_read(monkeypa
     monkeypatch.setattr(kb, "lease_captain_reports", refresh_origin_then_lease)
     server._sessions.clear()
     _register_live("sid-sibling", sibling)
-    assert _collect_kanban_notifications(sibling, claim_records=[]) == []
+    assert _captain_collect_kanban_notifications(sibling, claim_records=[]) == []
     assert _inbox_states() == {"pending": 1}
 
     server._sessions.clear()
     _register_live("sid-origin", origin)
     claims = []
-    texts = _collect_kanban_notifications(origin, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(origin, claim_records=claims)
     assert len(texts) == 1 and "origin still owns this" in texts[0]
     server._settle_kanban_notification_claims(claims, accepted=True)
 
@@ -1610,7 +1613,7 @@ def test_tenant_tagged_unattached_report_has_no_fallback_without_session_identit
     for sid, candidate in (("u", unscoped), ("b", wrong), ("a", fabricated_matching)):
         server._sessions.clear()
         _register_live(sid, candidate)
-        assert _collect_kanban_notifications(candidate, claim_records=[]) == []
+        assert _captain_collect_kanban_notifications(candidate, claim_records=[]) == []
         assert _inbox_states() == {"pending": 1}
 
 
@@ -1632,7 +1635,7 @@ def test_exact_origin_preserved_for_tenant_task_without_receiver_binding():
 
     _register_live("origin", origin)
     claims = []
-    assert len(_collect_kanban_notifications(origin, claim_records=claims)) == 1
+    assert len(_captain_collect_kanban_notifications(origin, claim_records=claims)) == 1
     server._settle_kanban_notification_claims(claims, accepted=True)
 
 
@@ -1656,7 +1659,7 @@ def test_backlog_is_paged_under_strict_row_and_byte_caps():
     page_sizes = []
     while True:
         claims = []
-        texts = _collect_kanban_notifications(session, claim_records=claims)
+        texts = _captain_collect_kanban_notifications(session, claim_records=claims)
         if not texts:
             break
         page_sizes.append(len(texts))
@@ -1691,7 +1694,7 @@ def test_row_cap_is_global_across_multiple_boards():
     session = _session("global-cap")
     _register_live("global-cap", session)
     claims = []
-    texts = _collect_kanban_notifications(session, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(session, claim_records=claims)
 
     assert len(texts) == server._CAPTAIN_TURN_ROW_CAP
     assert sum(
@@ -1723,7 +1726,7 @@ def test_ineligible_first_page_cannot_starve_later_fallback_report():
     fallback = _session("fallback-reader")
     _register_live("fallback-reader", fallback)
     claims = []
-    texts = _collect_kanban_notifications(fallback, claim_records=claims)
+    texts = _captain_collect_kanban_notifications(fallback, claim_records=claims)
     assert len(texts) == 1
     assert "must not starve" in texts[0]
     server._settle_kanban_notification_claims(claims, accepted=True)
@@ -1744,7 +1747,7 @@ def test_byte_cap_releases_unrendered_rows_for_next_page(monkeypatch):
 
     monkeypatch.setattr(
         server,
-        "_format_kanban_event_text",
+        "_captain_format_kanban_event_text",
         lambda _sub, _task, ev, _slug, **_kwargs: (
             f"event:{ev.id}:" + "x" * server._CAPTAIN_POLL_BYTE_CAP
         ),
@@ -1753,12 +1756,12 @@ def test_byte_cap_releases_unrendered_rows_for_next_page(monkeypatch):
     _register_live("byte-cap", session)
 
     first_claims = []
-    first = _collect_kanban_notifications(session, claim_records=first_claims)
+    first = _captain_collect_kanban_notifications(session, claim_records=first_claims)
     assert len(first) == 1
     server._settle_kanban_notification_claims(first_claims, accepted=True)
 
     second_claims = []
-    second = _collect_kanban_notifications(session, claim_records=second_claims)
+    second = _captain_collect_kanban_notifications(session, claim_records=second_claims)
     assert len(second) == 1
     assert second[0] != first[0]
     server._settle_kanban_notification_claims(second_claims, accepted=True)
@@ -1777,7 +1780,7 @@ def test_gc_compacts_old_acked_rows_and_reopen_gets_new_event():
     session = _session("gc-acked")
     _register_live("gc-acked", session)
     claims = []
-    assert len(_collect_kanban_notifications(session, claim_records=claims)) == 1
+    assert len(_captain_collect_kanban_notifications(session, claim_records=claims)) == 1
     server._settle_kanban_notification_claims(claims, accepted=True)
 
     conn = kbc.connect()
@@ -1805,10 +1808,67 @@ def test_gc_compacts_old_acked_rows_and_reopen_gets_new_event():
         conn.close()
 
     claims = []
-    first = _collect_kanban_notifications(session, claim_records=claims)
+    first = _captain_collect_kanban_notifications(session, claim_records=claims)
     assert len(first) == 1 and "→ ready" in first[0]
     server._settle_kanban_notification_claims(claims, accepted=True)
     claims = []
-    second = _collect_kanban_notifications(session, claim_records=claims)
+    second = _captain_collect_kanban_notifications(session, claim_records=claims)
     assert len(second) == 1
     assert "second" in second[0]
+
+
+# ── seam integrity: the Captain inbox extends upstream's poller, never shadows it ──
+_UPSTREAM_POLLER_SEAMS = (
+    "_notification_poller_loop",
+    "_notification_poller_scoped_loop",
+    "_notif_poll_kanban",
+    "_collect_kanban_notifications",
+    "_format_kanban_event_text",
+    "_maybe_fire_tui_loop_tick",
+    "_maybe_fire_tui_heartbeat_tick",
+    "_async_delegation_display_metadata",
+    "_start_notification_poller",
+    "_wire_desktop_sinks",
+)
+
+
+@pytest.mark.parametrize("name", _UPSTREAM_POLLER_SEAMS)
+def test_server_publishes_upstream_poller_seam(name):
+    """``bind_module`` publishes every module-level name onto ``server`` and the later
+    registration wins, so a same-named Captain copy silently replaced upstream's poller.
+    Rebound bodies carry server's globals (``__module__`` reads ``tui_gateway.server``),
+    so the code object is what proves whose body is live."""
+    from tui_gateway import captain_inbox, session_notifications
+
+    assert name not in vars(captain_inbox)
+    assert getattr(server, name).__code__ is getattr(session_notifications, name).__code__
+
+
+def test_captain_inbox_defines_no_name_that_session_notifications_owns():
+    from tui_gateway import captain_inbox, session_notifications
+
+    def own_names(module):
+        return {
+            name
+            for name, value in vars(module).items()
+            if not name.startswith("__")
+            and getattr(value, "__module__", module.__name__) == module.__name__
+            and not isinstance(value, type(threading))
+        } - {"register", "bind_module", "logger"}
+
+    assert own_names(captain_inbox) & own_names(session_notifications) == set()
+    assert server._notification_pollers is session_notifications._notification_pollers
+
+
+def test_upstream_poller_loop_takes_its_kanban_step_through_captain_seam(monkeypatch):
+    calls: list[str] = []
+    for name in ("_poll_bot_live_delivery_guarded", "_maybe_fire_tui_loop_tick",
+                 "_maybe_fire_tui_heartbeat_tick"):
+        monkeypatch.setattr(server, name, lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_notif_poll_kanban", lambda *_a: calls.append("upstream"))
+    monkeypatch.setattr(server, "_captain_poll_kanban", lambda *_a: calls.append("captain"))
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
+    server._notification_poller_loop(_StopAfterOnePoll(), "sid-seam", _session("seam-origin"))
+    assert calls == ["captain"]
