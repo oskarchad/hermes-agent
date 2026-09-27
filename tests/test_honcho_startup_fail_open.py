@@ -7,6 +7,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from plugins.memory.honcho import HonchoMemoryProvider
 
 
@@ -386,6 +388,80 @@ def test_honcho_sync_turn_skips_anchored_gateway_notifications():
 
         assert provider._sync_thread is None, f"wrapper not suppressed: {wrapper[:60]!r}"
         assert manager_calls == [], f"wrapper not suppressed: {wrapper[:60]!r}"
+
+
+def _sync_attempted(user_content: str) -> bool:
+    """True when sync_turn would write ``user_content`` to Honcho."""
+    provider = HonchoMemoryProvider()
+    manager_calls = []
+
+    class Manager:
+        def get_or_create(self, session_key):
+            manager_calls.append(session_key)
+            return SimpleNamespace(add_message=lambda *a, **k: None)
+
+        def resolve_author_peer_id(self, session_key, author_id, author_name=None):
+            return None
+
+        def save(self, session):
+            pass
+
+    provider._config = _configured_tools_config(init_on_session_start=True)
+    provider._manager = Manager()
+    provider._session_key = "test-session"
+    provider._session_initialized = True
+    provider.sync_turn(user_content, "assistant reply")
+    if provider._sync_thread is not None:
+        provider._sync_thread.join(timeout=5)
+    return bool(manager_calls)
+
+
+@pytest.mark.parametrize("notice", [
+    # Real formats from tools/process_registry_notifications.format_process_notification.
+    "[IMPORTANT: Background process proc_ab12 completed normally (exit code 0).\nCommand: x\nOutput:\n]",
+    "[IMPORTANT: Background process proc_ab12 exited (exit code 1).\nCommand: x\nOutput:\n]",
+    "[IMPORTANT: Background process proc_ab12 terminated by Hermes (exit code -15, SIGTERM).\nCommand: x]",
+    "[IMPORTANT: Background process proc_ab12 matched watch pattern \"ready\".\nCommand: x]",
+    # Shared group/thread sessions prefix the sender (gateway/run_inbound.py).
+    "[chadzynsky] [IMPORTANT: Background process proc_ab12 completed normally (exit code 0).\nCommand: x]",
+    "[chadzynsky] [ASYNC DELEGATION BATCH COMPLETE — deleg_1]\nworker results follow",
+    "[chadzynsky] [ASYNC DELEGATION TASK FAILED — deleg_1, task 2/3]\nOne subagent failed",
+    "[chadzynsky] A background subagent you dispatched earlier has finished.",
+    "[Oskar | Slack user <@U123>] [ASYNC DELEGATION COMPLETE — deleg_2]",
+    # Discord puts the triggering-message header in front of the sender tag.
+    "[Triggering message id: `1548770390824976536` — use as `message_id` for reply/react/pin via the "
+    "discord tools.]\n\n[chadzynsky] [IMPORTANT: Background process proc_232c completed normally (exit code 0).]",
+])
+def test_honcho_sync_turn_skips_notifications_behind_sender_prefix_and_completions(notice):
+    assert not _sync_attempted(notice)
+
+
+@pytest.mark.parametrize("msg", [
+    "[chadzynsky] please check the landing page copy",
+    "[chadzynsky] what does [ASYNC DELEGATION BATCH COMPLETE] mean in my log?",
+    "[chadzynsky] my background process proc_1 completed normally, is that ok?",
+    "I saw [IMPORTANT: Background process proc_1 exited (exit code 1).] earlier — why?",
+    "[Triggering message id: `1` — use as `message_id` for reply/react/pin via the discord tools.]\n\n"
+    "[chadzynsky] i jak idzie?",
+])
+def test_honcho_sync_turn_still_stores_human_messages_with_sender_prefix(msg):
+    assert _sync_attempted(msg)
+
+
+def test_honcho_initialize_skips_kanban_worker_like_cron(monkeypatch):
+    """A dispatcher-spawned Kanban worker (platform=cli, agent_context=primary) is not Oskar speaking."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+    provider = HonchoMemoryProvider()
+    provider.initialize("session-1", platform="cli", agent_context="primary")
+    assert provider._cron_skipped
+    assert not provider._writes_enabled()
+
+
+def test_honcho_initialize_does_not_skip_without_kanban_task(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    provider = HonchoMemoryProvider()
+    provider.initialize("session-1", platform="cli", agent_context="primary")
+    assert not provider._cron_skipped
 
 
 def test_honcho_sync_turn_skips_prose_gateway_notifications():
