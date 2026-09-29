@@ -1010,7 +1010,7 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
     def finalize_preloaded_skills(self) -> None:
         """Join the background --skills preload and fold it into the prompt (idempotent).
 
-        Raises ``ValueError`` only when EVERY requested skill was unknown.
+        Review workers require every requested skill; ordinary CLI preloads may be partial.
         """
         if getattr(self, "_preload_skills_finalized", False):
             return
@@ -1019,7 +1019,6 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             self._preload_skills_finalized = True
             return
         thread.join(timeout=120)
-        self._preload_skills_finalized = True
         err = getattr(self, "_preload_skills_error", None)
         if err is not None:
             raise err
@@ -1030,11 +1029,15 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         self.preloaded_skills = list(auto_result[1]) if auto_result else []
         result = getattr(self, "_preload_skills_result", None)
         if not result:
+            self._preload_skills_finalized = True
             return
         skills_prompt, loaded_skills, missing_skills = result
         if missing_skills:
+            from hermes_cli.kanban_review_skills import require_review_preloads
+
+            require_review_preloads(missing_skills)
             missing_display = ", ".join(missing_skills)
-            # A typo'd name must not crash a kanban worker; only a fully-missing set fails loudly.
+            # Ordinary optional preloads retain their partial-availability behavior.
             if loaded_skills:
                 logger.warning(
                     "Unknown skill(s) requested, skipping: %s. "
@@ -1048,6 +1051,7 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         if skills_prompt:
             self.system_prompt = "\n\n".join(p for p in (self.system_prompt, skills_prompt) if p).strip()
         self.preloaded_skills += [name for name in loaded_skills if name not in self.preloaded_skills]
+        self._preload_skills_finalized = True
 
     def _show_tool_availability_warnings(self):
         """Warn about toolsets switched off at startup (missing API keys, unusable terminal backend)."""

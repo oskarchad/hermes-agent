@@ -1074,6 +1074,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
+            review_skills=getattr(args, "review_skills", None),
             expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")

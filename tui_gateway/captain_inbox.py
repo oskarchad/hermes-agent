@@ -1030,13 +1030,11 @@ def _captain_poll_kanban(sid: str, session: dict) -> None:
     kanban_claims: list[dict] = []
     kanban_texts: list[str] = []
     kb_exc = None
-    # Upstream's turn admission (backend retirement gate + history_lock). Hold it through the
-    # DB claim: a concurrent user submit waits here instead of observing a transient busy state
-    # on empty polls; when events exist, running=True is already reserved before their cursor
-    # advances.
+    # Admission excludes competing submits through the DB claim. Publish busy only
+    # for a real dispatch: lock-free session snapshots must not see an empty poll
+    # as a running turn and lose the turn's final idle event.
     with _session_turn_admission(session) as admitted:
         if admitted and not session.get("running"):
-            session["running"] = True
             reserved = True
             try:
                 kanban_texts = _captain_collect_kanban_notifications(
@@ -1051,13 +1049,13 @@ def _captain_poll_kanban(sid: str, session: dict) -> None:
                     _settle_kanban_notification_claims(kanban_claims, accepted=False)
                 except Exception as settle_exc:
                     kb_exc = settle_exc
-                session["running"] = False
             elif not kanban_texts:
                 try:
                     _settle_kanban_notification_claims(kanban_claims, accepted=True)
                 except Exception as settle_exc:
                     kb_exc = settle_exc
-                session["running"] = False
+            else:
+                session["running"] = True
     if not reserved:
         return
     if kb_exc is not None:

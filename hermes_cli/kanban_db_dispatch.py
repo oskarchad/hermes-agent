@@ -2504,6 +2504,12 @@ def _dispatch_lane_task(
             per_profile_running[name] = per_profile_running.get(name, 0) + 1
 
     if dry_run:
+        if lane == "review":
+            from hermes_cli.kanban_review_skills import review_dispatchable
+
+            if not review_dispatchable(conn, task_id):
+                result.skipped_nonspawnable.append(task_id)
+                return False
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
@@ -2528,10 +2534,6 @@ def _dispatch_lane_task(
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -2715,6 +2717,8 @@ def _any_spawnable_review(
     """
     if not review_rows:
         return False
+    from hermes_cli.kanban_review_skills import review_dispatchable
+
     profile_exists = _profile_exists_fn()
     running = per_profile_running or {}
     for row in review_rows:
@@ -2725,7 +2729,8 @@ def _any_spawnable_review(
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
-        if check_respawn_guard(conn, row["id"], lane="review") is None:
+        if (review_dispatchable(conn, row["id"])
+                and check_respawn_guard(conn, row["id"], lane="review") is None):
             return True
     return False
 

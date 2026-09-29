@@ -826,6 +826,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
+                review_skills=args.get("review_skills"),
                 expected_run_id=_worker_run_id(tid), with_reason=True)
         except kb.ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
