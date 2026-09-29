@@ -6,7 +6,7 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 # Kanban — Multi-Agent Profile Collaboration
 
-> **Want a walkthrough?** Read the [Kanban tutorial](./kanban-tutorial) — four user stories (solo dev, fleet farming, role pipeline with retry, circuit breaker) with dashboard screenshots of each. This page is the reference; the tutorial is the narrative.
+> **Want a walkthrough?** Read the [Kanban tutorial](./kanban-tutorial.md) — four user stories (solo dev, fleet farming, role pipeline with retry, circuit breaker) with dashboard screenshots of each. This page is the reference; the tutorial is the narrative.
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
@@ -742,7 +742,7 @@ The judge gate on `kanban complete` / `kanban request-review` (and the matching 
 A goal-mode worker's **Worker log** (dashboard drawer, `hermes kanban log <id>`) carries the same live tool feed as any other worker's, plus one `kanban goal loop: turn N/M verdict=…` line per judged turn, so you can follow what the loop is doing while the card is running.
 
 :::note Goal-mode cards borrow the `/goal` engine — they don't connect to it
-`--goal` runs the continuation loop *inside that one card's worker session*. It shares the engine with the [`/goal` slash command](./goals), not the state: setting a `/goal` in a chat session never creates, claims, or moves a kanban card, and a goal-mode card's loop is invisible to any chat session's `/goal status`. If you want this conversation to keep iterating, use [`/goal`](./goals); if you want work on the board, create a card.
+`--goal` runs the continuation loop *inside that one card's worker session*. It shares the engine with the [`/goal` slash command](./goals.md), not the state: setting a `/goal` in a chat session never creates, claims, or moves a kanban card, and a goal-mode card's loop is invisible to any chat session's `/goal status`. If you want this conversation to keep iterating, use [`/goal`](./goals.md); if you want work on the board, create a card.
 :::
 
 ### How the orchestrator behaves
@@ -776,7 +776,7 @@ For best results, pair it with a profile whose toolsets are restricted to board 
 
 ## Dashboard (GUI)
 
-The `/kanban` CLI and slash command are enough to run the board headlessly, but a visual board is often the right interface for humans-in-the-loop: triage, cross-profile supervision, reading comment threads, and dragging cards between columns. Hermes ships this as a **bundled dashboard plugin** at `plugins/kanban/` — not a core feature, not a separate service — following the model laid out in [Extending the Dashboard](./extending-the-dashboard).
+The `/kanban` CLI and slash command are enough to run the board headlessly, but a visual board is often the right interface for humans-in-the-loop: triage, cross-profile supervision, reading comment threads, and dragging cards between columns. Hermes ships this as a **bundled dashboard plugin** at `plugins/kanban/` — not a core feature, not a separate service — following the model laid out in [Extending the Dashboard](./extending-the-dashboard.md).
 
 Open it with:
 
@@ -952,7 +952,7 @@ Each key is optional and falls back to the shown default.
 
 ### Security model
 
-The dashboard's HTTP auth middleware [explicitly skips `/api/plugins/`](./extending-the-dashboard#backend-api-routes) — plugin routes are unauthenticated by design because the dashboard binds to localhost by default. That means the kanban REST surface is reachable from any process on the host.
+The dashboard's HTTP auth middleware [explicitly skips `/api/plugins/`](./extending-the-dashboard.md#backend-api-routes) — plugin routes are unauthenticated by design because the dashboard binds to localhost by default. That means the kanban REST surface is reachable from any process on the host.
 
 The WebSocket takes one additional step: it requires the dashboard's ephemeral session token as a `?token=…` query parameter (browsers can't set `Authorization` on an upgrade request), matching the pattern used by the in-browser PTY bridge.
 
@@ -966,7 +966,7 @@ Tasks in `~/.hermes/kanban.db` are profile-agnostic on purpose (that's the coord
 
 ### Extending it
 
-The plugin uses the standard Hermes dashboard plugin contract — see [Extending the Dashboard](./extending-the-dashboard) for the full manifest reference, shell slots, page-scoped slots, and the Plugin SDK. Extra columns, custom card chrome, tenant-filtered layouts, or full `tab.override` replacements are all expressible without forking this plugin.
+The plugin uses the standard Hermes dashboard plugin contract — see [Extending the Dashboard](./extending-the-dashboard.md) for the full manifest reference, shell slots, page-scoped slots, and the Plugin SDK. Extra columns, custom card chrome, tenant-filtered layouts, or full `tab.override` replacements are all expressible without forking this plugin.
 
 To disable without removing: add `dashboard.plugins.kanban.enabled: false` to `config.yaml` (or delete `plugins/kanban/dashboard/manifest.json`).
 
