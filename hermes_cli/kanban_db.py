@@ -3985,7 +3985,7 @@ def request_review(
 
             try:
                 implementation_skills = json.loads(trow["skills"]) if trow["skills"] is not None else None
-                phase_skills = handoff_skills(
+                phase_skills, skills_explicit = handoff_skills(
                     conn, task_id, implementation_skills, implementer, reviewer, review_skills,
                 )
             except (ValueError, TypeError) as exc:
@@ -4028,9 +4028,7 @@ def request_review(
                 "reviewer": reviewer,
                 "implementation_skills": implementation_skills,
                 "review_skills": phase_skills,
-                "review_skills_explicit": review_skills is not None or (
-                    reviewer is not None and reviewer != implementer
-                ),
+                "review_skills_explicit": skills_explicit,
             }
             staged = _cleaned_artifact_paths(metadata)
             if staged:

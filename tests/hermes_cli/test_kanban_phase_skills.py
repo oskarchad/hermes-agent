@@ -136,3 +136,76 @@ def test_ambiguous_legacy_review_cannot_claim_or_reserve_capacity(homes):
         assert kb.assign_task(conn, implicit, "gauge")
         author = kb.claim_task(conn, implicit)
         assert not kb.request_review(conn, implicit, reviewer="wrench", expected_run_id=author.current_run_id)
+
+
+@pytest.mark.parametrize("unavailable", [None, "missing-review-skill", "hermes-agent", "sdlc-review"])
+def test_review_startup_requires_every_skill(homes, monkeypatch, unavailable):
+    from types import SimpleNamespace
+    from threading import Thread
+    from cli import HermesCLI
+    from agent.skill_commands import build_preloaded_skills_prompt
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    profile = homes / "profiles" / "gauge"
+    if unavailable in REVIEW:
+        (profile / "config.yaml").write_text(f"skills:\n  disabled: [{unavailable}]\n")
+    required = REVIEW + ([unavailable] if unavailable == "missing-review-skill" else [])
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="Startup boundary", assignee="wrench", skills=AUTHOR)
+        assert kb.request_review(conn, tid, reviewer="gauge", review_skills=required)
+        task = kb.claim_review_task(conn, tid)
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+        argv = dispatch._worker_argv(task, task.assignee, str(profile))
+        requested = [argv[i + 1] for i, value in enumerate(argv) if value == "--skills"]
+        token = set_hermes_home_override(str(profile))
+        try:
+            result = build_preloaded_skills_prompt(requested)
+            thread = Thread(target=lambda: None)
+            thread.start()
+            worker = SimpleNamespace(_preload_skills_thread=thread,
+                                     _preload_skills_result=result, system_prompt="base")
+            if unavailable:
+                with pytest.raises(ValueError, match=unavailable):
+                    HermesCLI.finalize_preloaded_skills(worker)
+                with pytest.raises(ValueError, match=unavailable):
+                    HermesCLI.finalize_preloaded_skills(worker)
+                assert worker.system_prompt == "base"
+                # The same optional CLI preload still tolerates partial availability.
+                monkeypatch.delenv("HERMES_KANBAN_TASK")
+                worker = SimpleNamespace(_preload_skills_thread=thread,
+                                         _preload_skills_result=result, system_prompt="base")
+            HermesCLI.finalize_preloaded_skills(worker)
+            assert worker.preloaded_skills == [s for s in required if s != unavailable]
+            assert worker.system_prompt != "base"
+            prompt = worker.system_prompt
+            HermesCLI.finalize_preloaded_skills(worker)
+            assert worker.system_prompt == prompt
+            if unavailable:
+                # A later author run must not inherit strictness from the review history.
+                assert kb.request_changes(conn, tid, reason="fixture repair", expected_run_id=task.current_run_id)[0]
+                author = kb.claim_task(conn, tid)
+                monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+                monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(author.current_run_id))
+                worker = SimpleNamespace(_preload_skills_thread=thread,
+                                         _preload_skills_result=result, system_prompt="base")
+                HermesCLI.finalize_preloaded_skills(worker)
+                assert worker.preloaded_skills == [s for s in required if s != unavailable]
+        finally:
+            reset_hermes_home_override(token)
+
+
+def test_explicit_same_profile_review_skills_survive_repeated_reuse(homes):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="Explicit reuse", assignee="wrench", skills=AUTHOR)
+        for index in range(3):
+            author = kb.claim_task(conn, tid)
+            kwargs = {"reviewer": "wrench", "review_skills": REVIEW} if index == 0 else {}
+            assert kb.request_review(conn, tid, expected_run_id=author.current_run_id, **kwargs)
+            payload = kb._json_dict(kb._latest_event(conn, tid, "review_requested")["payload"])
+            assert payload["review_skills_explicit"] is True
+            review = kb.claim_review_task(conn, tid)
+            assert review.skills == REVIEW
+            assert kb.get_task(conn, tid).skills == AUTHOR
+            assert kb.request_changes(conn, tid, reason="fixture round", expected_run_id=review.current_run_id) == (True, "wrench")

@@ -18,17 +18,17 @@ def handoff_skills(conn, task_id, author_skills, implementer, reviewer, explicit
     author_skills = _skills(author_skills)
     if explicit is not None:
         _skills(explicit)
-        return kb._normalize_task_skills(explicit)
+        return kb._normalize_task_skills(explicit), True
     previous = kb._latest_event(conn, task_id, "review_requested")
     payload = kb._json_dict(kb._row_get(previous, "payload"))
     if (payload.get("reviewer") == reviewer and "review_skills" in payload
             and payload.get("review_skills_explicit") is True):
-        return _skills(payload["review_skills"])
+        return _skills(payload["review_skills"]), True
     if reviewer is None or reviewer == implementer:
-        return author_skills
+        return author_skills, False
     if author_skills:
         raise ValueError("cross-profile review requires explicit review_skills; author skills are not reviewer requirements")
-    return None
+    return None, False
 
 
 def review_skills(conn, task_id):
@@ -59,3 +59,23 @@ def review_dispatchable(conn, task_id):
     except (ValueError, TypeError):
         return False
     return True
+
+
+def require_review_preloads(missing_skills):
+    """Only the owned review run makes CLI preloads mandatory; never initialize a DB."""
+    import os
+    import sqlite3
+    from contextlib import closing
+    from agent.delegation_context import owned_kanban_task
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    task_id = owned_kanban_task()
+    if not task_id:
+        return
+    run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
+    path = kb.kanban_db_path().resolve()
+    with closing(connect_tracked(path.as_uri() + "?mode=ro", tracking_path=path, uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        if kb._retry_status_for_run(conn, task_id, run_id) == "review":
+            raise ValueError(f"Missing or disabled required review skill(s): {', '.join(missing_skills)}")
