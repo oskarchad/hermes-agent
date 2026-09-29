@@ -128,3 +128,11 @@ def test_ambiguous_legacy_review_cannot_claim_or_reserve_capacity(homes):
             assert not kb.request_review(conn, fresh, reviewer="gauge", review_skills=bad)
             assert kb.get_task(conn, fresh).status == "ready"
         assert kb.claim_review_task(conn, "t_missing") is None
+
+        implicit = kb.create_task(conn, title="Changed author", assignee="wrench", skills=AUTHOR)
+        author = kb.claim_task(conn, implicit)
+        assert kb.request_review(conn, implicit, reviewer="wrench", expected_run_id=author.current_run_id)
+        assert kb.reopen_review_task(conn, implicit)
+        assert kb.assign_task(conn, implicit, "gauge")
+        author = kb.claim_task(conn, implicit)
+        assert not kb.request_review(conn, implicit, reviewer="wrench", expected_run_id=author.current_run_id)

@@ -21,7 +21,8 @@ def handoff_skills(conn, task_id, author_skills, implementer, reviewer, explicit
         return kb._normalize_task_skills(explicit)
     previous = kb._latest_event(conn, task_id, "review_requested")
     payload = kb._json_dict(kb._row_get(previous, "payload"))
-    if payload.get("reviewer") == reviewer and "review_skills" in payload:
+    if (payload.get("reviewer") == reviewer and "review_skills" in payload
+            and payload.get("review_skills_explicit") is True):
         return _skills(payload["review_skills"])
     if reviewer is None or reviewer == implementer:
         return author_skills
