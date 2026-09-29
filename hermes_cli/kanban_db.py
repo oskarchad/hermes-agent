@@ -2768,12 +2768,27 @@ def claim_review_task(
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
             return None
+        if get_task(conn, task_id) is None:
+            return None
+        from hermes_cli.kanban_review_skills import review_skills
+
+        try:
+            phase_skills = review_skills(conn, task_id)
+        except (ValueError, TypeError) as exc:
+            payload = {"reason": str(exc)}
+            prior = _latest_event(conn, task_id, "review_dispatch_refused")
+            if _json_dict(_row_get(prior, "payload")) != payload:
+                _append_event(conn, task_id, "review_dispatch_refused", payload)
+            return None
         run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
+            conn, task_id, "review", lock, expires, now,
+            event_extra={"source_status": "review", "review_skills": phase_skills},
         )
         if run_id is None:
             return None
-        return get_task(conn, task_id)
+        task = get_task(conn, task_id)
+        task.skills = phase_skills
+        return task
 
 
 def _retry_status_for_run(
@@ -3887,6 +3902,7 @@ def redact_review_value(value: Any) -> Any:
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
+    review_skills: Optional[list[str]] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
@@ -3926,7 +3942,7 @@ def request_review(
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-                "worker_started_at FROM tasks WHERE id = ?", (task_id,),
+                "worker_started_at, skills FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
@@ -3965,6 +3981,15 @@ def request_review(
                 implementer = arow["profile"] if arow else None
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
+            from hermes_cli.kanban_review_skills import handoff_skills
+
+            try:
+                implementation_skills = json.loads(trow["skills"]) if trow["skills"] is not None else None
+                phase_skills = handoff_skills(
+                    conn, task_id, implementation_skills, implementer, reviewer, review_skills,
+                )
+            except (ValueError, TypeError) as exc:
+                return _ret(False, str(exc))
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
@@ -4001,6 +4026,11 @@ def request_review(
                 "summary": _first_line(summary, 400) or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "implementation_skills": implementation_skills,
+                "review_skills": phase_skills,
+                "review_skills_explicit": review_skills is not None or (
+                    reviewer is not None and reviewer != implementer
+                ),
             }
             staged = _cleaned_artifact_paths(metadata)
             if staged:

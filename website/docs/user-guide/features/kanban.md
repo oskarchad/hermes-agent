@@ -652,6 +652,30 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+#### Same-card review skills
+
+Task `skills` belong to implementation and remain unchanged during review. Pass
+`review_skills=[...]` to `kanban_request_review`, or repeat `--review-skill NAME`
+on `hermes kanban request-review`. This list is required when handing a task with
+implementation skills to another profile. Include every review requirement
+(including any repository/verification gates); `sdlc-review` is always added.
+An explicit empty array means only `sdlc-review`. Missing/disabled skills still
+fail the reviewer's normal preload; nothing is silently filtered or installed.
+
+The handoff event stores both lists. `request-changes` returns the card to its
+original implementer with its unchanged skills; the next `request-review`
+reuses the prior review list when the reviewer is unchanged. An implicit
+same-profile handoff shares implementation skills, but a later reassignment
+cannot turn that implicit list into cross-profile review requirements.
+
+Ambiguous legacy cross-profile reviews with nonempty skills are refused before
+claim and do not reserve dispatch capacity. Recover using `reopen-review`, then
+`request-review --reviewer NAME --review-skill ...`. For an implementation-origin
+blocked card, use `unblock` then `request-review` with the explicit review list.
+Normal run ownership and parent gates still apply; no database editing is needed.
+No schema migration is introduced. Before rolling back the runtime, park affected
+review cards: older dispatchers do not understand the new event projection.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:
