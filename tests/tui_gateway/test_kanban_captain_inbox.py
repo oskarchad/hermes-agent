@@ -1117,7 +1117,7 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
         monkeypatch.setattr(server, "_run_prompt_submit", submit)
         monkeypatch.setattr(server, "_stamp_captain_reply",
-                            lambda _s, completion_id, _t: completion_ids.append(completion_id))
+                            lambda _s, completion_id: completion_ids.append(completion_id))
         server._notification_poller_loop(_StopAfterOnePoll(), "sid-loop", session)
 
     # Poll 1 — rejection releases the row to pending and clears the reservation.
@@ -1208,6 +1208,7 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
     monkeypatch, ack_failure
 ):
     """A profile-wide receipt moves to the fallback session without a new turn."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
     from hermes_state import SessionDB
     from tools.process_registry import process_registry
 
@@ -1256,7 +1257,10 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
                 {"role": "assistant", "content": "fallback ordinary answer"},
             ],
         )
-        db.append_message(active_session_id, "assistant", content="Captain durable report")
+        row_id = db.append_message(active_session_id, "assistant", content="Captain durable report")
+        active_session["agent"]._session_messages = [{
+            "role": "assistant", "content": "Captain durable report",
+            "_row_id": row_id, _DB_PERSISTED_MARKER: True}]
         # The terminal callback stamps the persisted reply with its completion id.
         kwargs["terminal_callback"]({"status": "settled", "text": "Captain durable report"})
         return True

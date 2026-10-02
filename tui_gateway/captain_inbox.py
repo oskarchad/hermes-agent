@@ -867,23 +867,30 @@ def _captain_completion_id(
     )
 
 
-def _stamp_captain_reply(session: dict, completion_id: str, text: object) -> None:
-    """Bind the turn's persisted final reply to ``completion_id``: the receipt reconciliation reads."""
+def _stamp_captain_reply(session: dict, completion_id: str) -> None:
+    """Bind the turn's persisted final reply to ``completion_id``: the receipt reconciliation reads.
+
+    The row is the agent's final persisted assistant message, selected structurally: ``final_response``
+    can differ from the stored bytes (storage redaction, post-persist file-mutation footer, Bot Mode
+    silence), so matching on the reply text would fail and loop the claim through paid retries."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+
     agent = session.get("agent")
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None) or session.get("session_key")
+    final = (getattr(agent, "_session_messages", None) or [{}])[-1]
+    final = final if isinstance(final, dict) else {}
+    content = final.get("content")
     metadata = {_CAPTAIN_COMPLETION_METADATA_KEY: completion_id}
-    if not (db and session_id and isinstance(text, str) and text.strip()
+    if not (db and session_id and final.get("role") == "assistant" and not final.get("tool_calls")
+            and final.get(_DB_PERSISTED_MARKER) and isinstance(content, str) and content.strip()
             and db.set_latest_matching_message_display_kind(
-                session_id, role="assistant", content=text,
+                session_id, role="assistant", content=content,
                 display_kind=_CAPTAIN_TURN_PURPOSE, display_metadata=metadata)):
         raise RuntimeError("Captain reply is not durable")
     # Keep live history in step with the row (display markers align memory and DB positions).
     with session["history_lock"]:
-        for message in reversed(session.get("history") or ()):
-            if isinstance(message, dict) and message.get("role") == "assistant" and message.get("content") == text:
-                message.update(display_kind=_CAPTAIN_TURN_PURPOSE, display_metadata=metadata)
-                break
+        final.update(display_kind=_CAPTAIN_TURN_PURPOSE, display_metadata=metadata)
 
 
 def _persisted_captain_report(session: dict, completion_id: str):
@@ -1172,7 +1179,7 @@ def _captain_poll_kanban(sid: str, session: dict) -> None:
         succeeded = receipt.get("status") == "settled"
         if succeeded and has_captain_claim:
             try:
-                _stamp_captain_reply(session, completion_id, receipt.get("text"))
+                _stamp_captain_reply(session, completion_id)
             except Exception:
                 _settle_after_terminal(False)
                 raise

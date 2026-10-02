@@ -3,12 +3,16 @@
 Regression: ``captain_inbox`` called ``_run_prompt_submit(on_terminal=..., completion_id=...,
 require_persisted=..., turn_purpose=...)`` against upstream's prompt_turn, which only takes
 ``terminal_callback``. Every Captain batch raised ``TypeError`` and was released for retry forever.
+The reply row is selected structurally (the turn's persisted final assistant message), never by
+matching ``final_response`` text: storage redacts secrets and the file-mutation footer is appended
+after persistence, so the two legitimately differ.
 """
 import threading
 from types import SimpleNamespace
 
 import pytest
 
+from agent.context_compressor import _DB_PERSISTED_MARKER
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_state import SessionDB
@@ -16,10 +20,12 @@ from tui_gateway import server
 from tests.tui_gateway.test_auto_continue import turn_env, marker_home, _session  # noqa: F401
 from tests.tui_gateway.test_kanban_captain_inbox import _inbox_states
 
+FINAL = "Captain explains the result"
 
-@pytest.mark.parametrize("persist_reply", [True, False])
+
+@pytest.mark.parametrize("stored", [FINAL, "Captain explains the *** (redacted)", None])
 def test_captain_report_runs_real_turn_and_acks_only_after_durable_reply(
-        turn_env, monkeypatch, persist_reply):  # noqa: F811
+        turn_env, monkeypatch, stored):  # noqa: F811
     db = SessionDB()
     db.create_session(session_id="captain-real", source="tui", model="test")
     frames, acked_at_complete = [], []
@@ -36,10 +42,17 @@ def test_captain_report_runs_real_turn_and_acks_only_after_durable_reply(
                         lambda *a: (threading.Event(), SimpleNamespace(join=lambda: None)))
 
     def run(message, **kwargs):
-        db.append_message("captain-real", "user", content=message)
-        if persist_reply:
-            db.append_message("captain-real", "assistant", content="Captain explains the result")
-        return {"final_response": "Captain explains the result", "messages": []}
+        user = {"role": "user", "content": message,
+                "_row_id": db.append_message("captain-real", "user", content=message),
+                _DB_PERSISTED_MARKER: True}
+        messages = [user]
+        if stored is not None:
+            # The persisted row may differ from final_response (redaction / post-persist footer).
+            messages.append({"role": "assistant", "content": stored,
+                             "_row_id": db.append_message("captain-real", "assistant", content=stored),
+                             _DB_PERSISTED_MARKER: True})
+        agent._session_messages = messages
+        return {"final_response": FINAL, "messages": messages}
 
     agent = SimpleNamespace(session_id="captain-real", _session_db=db,
                             clear_interrupt=lambda: None, run_conversation=run)
@@ -59,7 +72,7 @@ def test_captain_report_runs_real_turn_and_acks_only_after_durable_reply(
 
     statuses = [p["payload"].get("status") for p in frames if p.get("type") == "message.complete"]
     assert session["running"] is False
-    if persist_reply:
+    if stored is not None:
         # Settled exactly once, durably, and acked before the client saw success.
         assert _inbox_states() == {"acked": 1}
         assert statuses == ["complete"] and acked_at_complete == [{"acked": 1}]
@@ -67,7 +80,7 @@ def test_captain_report_runs_real_turn_and_acks_only_after_durable_reply(
         completion_id = (db.get_messages_as_conversation("captain-real")[-1]
                          .get("display_metadata") or {}).get("captain_completion_id")
         receipt = server._persisted_captain_report(session, completion_id)
-        assert receipt is not None and receipt["report"]["content"] == "Captain explains the result"
+        assert receipt is not None and receipt["report"]["content"] == stored
     else:
         # No durable reply: no visible success, claim released for a retry.
         assert _inbox_states() == {"pending": 1}
