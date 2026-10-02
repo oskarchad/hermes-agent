@@ -1,6 +1,7 @@
 # cron/ (+ kanban) — scheduled jobs and the multi-agent work queue
 
-Applies on top of the root `AGENTS.md`. Long-form: `website/docs/developer-guide/cron-internals.md`;
+Applies on top of the root `AGENTS.md`. Long-form: [cron internals](../website/docs/developer-guide/cron-internals.md);
+accepted fork contracts: [ADR index](../docs/adr/README.md);
 user docs `website/docs/user-guide/features/cron.md`, `kanban.md`.
 
 ## Cron

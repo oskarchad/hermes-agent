@@ -330,6 +330,17 @@ def _stdin_is_console() -> bool:
         return False
 
 
+def _paste_callback_available() -> bool:
+    """True only when stdin itself can take the pasted redirect.
+
+    ``_is_interactive()`` is also true for a forced GUI-driven flow (the user is present, but not on
+    stdin). A paste reader there consumes another surface's stdin and turns an immediate EOF into a
+    lost flow, so the paste channel needs a real console, nothing less."""
+    if not _oauth_interactive_enabled.get():
+        return False
+    return _stdin_is_console()
+
+
 def _is_interactive() -> bool:
     """True if we can reasonably expect to interact with a user."""
     if not _oauth_interactive_enabled.get():
@@ -670,11 +681,20 @@ def _result_taken(result: dict) -> bool:
     return result.get("auth_code") is not None or result.get("error") is not None
 
 
+# A client that opens the callback socket and never finishes its request line must not hold the
+# single-threaded listener (and the flow's port) past the OAuth timeout.
+_CALLBACK_REQUEST_TIMEOUT_SECONDS = 0.5
+_PASTE_READER_POLL_INTERVAL_SECONDS = 0.05
+_PASTE_READER_JOIN_TIMEOUT_SECONDS = 1.0
+
+
 def _make_callback_handler() -> tuple[type, dict]:
     """Fresh ``(HandlerClass, result_dict)`` per flow so concurrent flows don't stomp on each other."""
     result: dict[str, Any] = {"auth_code": None, "state": None, "error": None, "iss": None}
 
     class _Handler(BaseHTTPRequestHandler):
+        timeout = _CALLBACK_REQUEST_TIMEOUT_SECONDS
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = _parse_redirect_query(urlparse(self.path).query)
             status = 200
@@ -703,12 +723,50 @@ def _make_callback_handler() -> tuple[type, dict]:
     return _Handler, result
 
 
-def _paste_callback_reader(result: dict) -> None:
+def _read_paste_line(stop_event: threading.Event) -> str | None:
+    """Wait for one stdin line while staying cancellable through *stop_event* (None when cancelled).
+
+    A bare ``sys.stdin.readline()`` cannot be cancelled: after the HTTP listener wins, the reader
+    thread stays parked on stdin and swallows the NEXT flow's (or the CLI's) input. Without a real
+    POSIX file descriptor to poll, this falls back to the blocking read."""
+    try:
+        stdin_fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        stdin_fd = None
+    if os.name == "nt" or not isinstance(stdin_fd, int):
+        return sys.stdin.readline()
+
+    import select
+
+    line = bytearray()
+    while not stop_event.is_set():
+        try:
+            readable, _, _ = select.select([stdin_fd], [], [], _PASTE_READER_POLL_INTERVAL_SECONDS)
+        except (OSError, ValueError):
+            return None
+        if stop_event.is_set():
+            return None
+        if not readable:
+            continue
+        try:
+            char = os.read(stdin_fd, 1)
+        except OSError:
+            return None
+        if not char:
+            return ""  # EOF
+        line.extend(char)
+        if char in {b"\r", b"\n"}:
+            return line.decode(getattr(sys.stdin, "encoding", None) or "utf-8", errors="replace")
+    return None
+
+
+def _paste_callback_reader(result: dict, stop_event: threading.Event | None = None) -> None:
     """Read one stdin line as an OAuth redirect (full URL, bare query, or a ``_SKIP_TOKENS`` word that
     exits without auth) into *result*. Parse failures, EOF and interrupts are swallowed — best-effort
-    fallback racing the HTTP listener, which stays primary."""
+    fallback racing the HTTP listener, which stays primary. With *stop_event* the read is cancellable,
+    so the finished flow retires this thread instead of leaving it parked on stdin."""
     try:
-        line = sys.stdin.readline()
+        line = sys.stdin.readline() if stop_event is None else _read_paste_line(stop_event)
     except (KeyboardInterrupt, OSError, ValueError):
         return
     line = (line or "").strip()
@@ -890,18 +948,26 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
         threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True).start()
         # Paste fallback races the HTTP listener; whichever fills result first wins (no stdin reader
         # under a dashboard flow — the gateway's stdin is not the user's).
-        if _is_interactive() and dashboard_flow is None:
+        # Only a real console gets a reader: a forced (GUI-driven) flow's stdin is not the user's.
+        paste_thread: threading.Thread | None = None
+        paste_stop = threading.Event()
+        if dashboard_flow is None and _paste_callback_available():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` portion) and press Enter. "
                 "Type ``skip`` + Enter to continue without this server:",
                 file=sys.stderr, flush=True)
-            threading.Thread(target=_paste_callback_reader, args=(result,), daemon=True).start()
+            paste_thread = threading.Thread(target=_paste_callback_reader, args=(result, paste_stop), daemon=True)
+            paste_thread.start()
         elapsed = 0.0
         try:
             while elapsed < timeout and not _result_taken(result):
                 await asyncio.sleep(0.5)
                 elapsed += 0.5
         finally:
+            # Retire the paste reader before returning so it cannot swallow the next flow's input.
+            paste_stop.set()
+            if paste_thread is not None:
+                paste_thread.join(timeout=_PASTE_READER_JOIN_TIMEOUT_SECONDS)
             server.shutdown()  # returns once the serve loop exits (≤ poll_interval) — the port is free after close
             server.server_close()
         return _callback_outcome(result, cimd_url)

@@ -722,7 +722,10 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
                     _notif_log_failure(f"{what} poll failed", tick_exc)
         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
             last_kanban_poll = now
-            _notif_poll_kanban(sid, session)
+            # Fork seam (ADR 0002; docs/custom-delta-v2026.9.24.md, Captain inbox): the durable Captain inbox and
+            # exact-origin route (tui_gateway/captain_inbox.py) take the kanban step instead of the RAM-buffered
+            # _notif_poll_kanban. Runs inside this loop's profile runtime scope.
+            _captain_poll_kanban(sid, session)
         try:
             evt = queue.get(timeout=0.5)
         except Exception:

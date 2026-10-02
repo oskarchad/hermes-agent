@@ -159,6 +159,255 @@ def test_line_budget_fails_closed_before_tokenizing_every_line(
     assert 0 < lexers < 10
 
 
+def test_python_data_operands_do_not_spend_script_read_budget(monkeypatch, tmp_path):
+    """A Python call argument is not a shell command after an opening parenthesis."""
+    data = tmp_path / "large.data"
+    with data.open("wb") as stream:
+        stream.truncate(lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1)
+    reads = []
+    original = lifecycle_guard._read_referenced_script
+
+    def spy(path, *, max_bytes=None):
+        reads.append(path)
+        return original(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(lifecycle_guard, "_read_referenced_script", spy)
+    command = (
+        "python3 - <<'PY'\n"
+        "from pathlib import Path\n"
+        f"conn=connect(db_path=Path({str(data)!r}))\n"
+        f"prefix=Path({str(data)!r}).read_text()\n"
+        "PY"
+    )
+    # Classification only: never execute this input or open a real database.
+    assert guard(command, cwd=str(tmp_path)) is False
+    assert data not in reads
+    # UTF-8 AST columns are byte offsets; retain the command after the terminator.
+    unicode_command = command.replace("conn=", "é = 1; conn=") + "\n"
+    assert guard(unicode_command, cwd=str(tmp_path)) is False
+    assert data not in reads
+    # Unknown call operands and incomplete Python retain fail-closed behavior.
+    assert guard(command.replace("Path(", "unknown("), cwd=str(tmp_path)) is True
+    assert guard(command.replace("conn=", "conn=("), cwd=str(tmp_path)) is True
+    # The same bytes in an executable position must still fail closed.
+    assert guard(f"sh {data}", cwd=str(tmp_path)) is True
+    assert data in reads
+
+
+def test_python_argv_data_and_script_positions_share_bounded_walk(monkeypatch, tmp_path):
+    data = tmp_path / "large.data"
+    with data.open("wb") as stream:
+        stream.truncate(lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1)
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text("hermes gateway stop\n", encoding="utf-8")
+
+    def classify(argv):
+        return guard(
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run(" + repr(argv) + ")\nPY",
+            cwd=str(tmp_path),
+        )
+
+    reads = []
+    original = lifecycle_guard._read_referenced_script
+
+    def spy(path, *, max_bytes=None):
+        reads.append(path)
+        return original(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(lifecycle_guard, "_read_referenced_script", spy)
+    assert classify(["printf", "%s", f"({data}) hermes gateway stop"]) is False
+    assert data not in reads
+    for argv in ([str(wrapper)], ["sh", str(wrapper)], ["sudo", "sh", str(wrapper)], ["sh", str(data)]):
+        assert classify(argv) is True
+    assert wrapper in reads and data in reads
+    # No subprocess-wide exemption: executable paths retain the shared limits.
+    benign = tmp_path / "benign.sh"
+    benign.write_text("echo ok\n", encoding="utf-8")
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_PATHS", 0)
+        assert classify(["sh", str(benign)]) is True
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_REFERENCED_SCRIPT_DEPTH", 1)
+        assert classify(["sh", str(benign)]) is True
+    with monkeypatch.context() as m:
+        m.setattr(lifecycle_guard, "_MAX_LIFECYCLE_SCAN_REMOTE_READS", 0)
+        assert guard(
+            "python3 - <<'PY'\nsubprocess.run(['sh', '/remote/absent.sh'])\nPY",
+            read_remote_script=lambda path: pytest.fail("exhausted remote reader called"),
+        ) is True
+
+
+@pytest.mark.parametrize("argv", [
+    ["python3", "-c", "print('ok')"],
+    ["python3.12", "-I", "-cprint('ok')"],
+    ["python3", "benign.py"],
+    ["node", "--eval=console.log('ok')"],
+    ["perl", "-e", "print 'ok'"],
+    ["ruby", "-e", "puts 'ok'"],
+    ["php", "-r", "print('ok');"],
+    ["pwsh", "-command", "Write-Output ok"],
+    ["osascript", "-e", 'return "ok"'],
+    ["xargs", "printf"],
+    ["eval", "printf ok"],
+    ["env", "--split-string=printf ok"],
+    ["timeout", "10", "env", "-Sprintf ok"],
+    ["timeout", "10", "su", "--command=printf ok", "nobody"],
+    ["sudo", "runuser", "-c", "printf ok", "nobody"],
+    ["sh", "-lc", "printf ok"],
+    ["sh", "--command=printf ok"],
+    ["sh", "-c"],
+    ["source"],
+    ["env"],
+    ["timeout", "10"],
+    ["env"] * (lifecycle_guard._MAX_PREFIX_PEELS + 1) + ["printf", "ok"],
+])
+def test_python_argv_unowned_execution_is_refusal_not_detection(argv, tmp_path, caplog):
+    from tools import process_registry
+    from tools.terminal_tool_guards import gateway_lifecycle_block
+    from unittest.mock import patch
+
+    command = "python3 - <<'PY'\nsubprocess.run(" + repr(argv) + ")\nPY"
+    # Innocuous, unsupported execution is still refused, not certified as data.
+    with caplog.at_level("WARNING", logger=lifecycle_guard.logger.name):
+        assert guard(command, cwd=str(tmp_path)) is True
+    assert "incomplete process argv inspection" in caplog.text
+    assert "falling back to direct-scan verdict" not in caplog.text
+    with patch.object(process_registry, "_is_supervised_gateway_process", return_value=True):
+        assert gateway_lifecycle_block(
+            command=command, env=object(), env_type="local", cwd=str(tmp_path),
+            workdir=str(tmp_path), session_key="coverage-refusal",
+        ) is not None
+    # The new boundary applies only inside the complete quoted Python stdin lane.
+    assert guard("python3 -c \"print('ok')\"", cwd=str(tmp_path)) is False
+    assert guard("python3 - <<'PY'\nsubprocess.run(['sh', '-c', 'printf ok'])\nPY",
+                 cwd=str(tmp_path)) is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["su", "report-user", "--command=printf ok"],
+    ["runuser", "report-user", "-c", "printf ok"],
+    ["su", "report-user"],
+    ["runuser", "-u", "report-user", "--", "printf", "ok"],
+    ["nsenter", "--root", "printf", "ok"],
+    ["nsenter", "-S", "printf", "ok"],
+    ["ionice", "-p", "123", "456"],
+])
+@pytest.mark.parametrize("prefix", [[], ["timeout", "10"], ["env", "nice", "-n", "2"]])
+def test_python_argv_unsupported_wrapper_grammar_refuses_before_peeling(
+    argv, prefix, tmp_path, caplog,
+):
+    import shlex
+
+    argv = prefix + argv
+    command = "python3 - <<'PY'\nsubprocess.run(" + repr(argv) + ")\nPY"
+    with caplog.at_level("WARNING", logger=lifecycle_guard.logger.name):
+        assert guard(command, cwd=str(tmp_path)) is True
+    assert "incomplete process argv inspection (unsupported wrapper grammar)" in caplog.text
+    assert "falling back to direct-scan verdict" not in caplog.text
+    # Benign unsupported invocations are not detected lifecycle actions, and
+    # legacy string callers do not acquire the new literal-argv refusal policy.
+    assert guard(shlex.join(argv), cwd=str(tmp_path)) is False
+
+
+# --- F1: every Python heredoc body the inert masker hides is inspected ------------------
+
+_F1_STOP = "subprocess.run(['hermes', 'gateway', 'stop'])"
+_F1_SYSTEMCTL = "os.system('systemctl --user stop hermes-gateway')"
+
+
+def _f1_heredoc(body, *, opener="python3 - <<'EOF'"):
+    return f"{opener}\nimport os, subprocess\nfrom pathlib import Path\n{body}\nEOF"
+
+
+@pytest.mark.parametrize("opener, body", [
+    # Gauge F1 probes: output redirection / prefix after or before the opener.
+    ("python3 - <<'EOF' 2>&1", _F1_STOP),
+    ("cd /tmp && python3 - <<'EOF' 2>&1", _F1_STOP),
+    ("python3 - <<'EOF' 2>&1", _F1_SYSTEMCTL),
+    ("python3 - <<'EOF'", _F1_STOP),
+    ("env python3 - <<'PY'", _F1_STOP),
+    ("VAR=x python3 - <<'PY'", _F1_STOP),
+    # Same family: pipes after the opener, flags, no dash, other redirections.
+    ("python3 - <<'EOF' 2>&1 | tail -5", _F1_STOP),
+    ("python3 <<'EOF' >/dev/null", _F1_STOP),
+    ("python3 -u - <<'EOF'", _F1_STOP),
+    ("env VAR=x python3 - <<'EOF'", _F1_STOP),
+    ("python3 - <<EOF", _F1_STOP),
+    ("timeout 60 python3 - <<'EOF'", _F1_STOP),
+    # Not the stdin program (script -c operand): still inspected, literal lifecycle call blocks.
+    ("python3 -c 'import sys; exec(sys.stdin.read())' <<'EOF'", _F1_STOP),
+    # Callables resolved through imports, and string-command callables beyond os.system.
+    ("python3 - <<'EOF'", "from os import system\nsystem('hermes gateway stop')"),
+    ("python3 - <<'EOF'", "import subprocess as sp\nsp.run(['hermes', 'gateway', 'stop'])"),
+    ("python3 - <<'EOF'", "os.popen('hermes gateway stop')"),
+    ("python3 - <<'EOF'", "subprocess.run(['hermes gateway stop'], shell=True)"),
+])
+def test_f1_python_heredoc_lifecycle_calls_block(opener, body, tmp_path):
+    command = _f1_heredoc(body, opener=opener)
+    unsafe, _refusal = lifecycle_guard.scan_gateway_lifecycle(command, cwd=str(tmp_path))
+    assert unsafe is True
+
+
+@pytest.mark.parametrize("body", [
+    "os.popen(str(Path({script!r})))",
+    "os.execv(str(Path({script!r})), ['x'])",
+    "import subprocess as sp\np = Path({script!r})\nsp.run(['sh', str(p)])",
+    "subprocess.run(['sh', str(Path({script!r}))])",
+])
+@pytest.mark.parametrize("opener", ["python3 - <<'EOF'", "python3 - <<'EOF' 2>&1"])
+def test_f1_path_operand_of_a_process_call_is_never_blanked(body, opener, tmp_path):
+    script = tmp_path / "restart.sh"
+    script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+    command = _f1_heredoc(body.format(script=str(script)), opener=opener)
+    assert guard(command, cwd=str(tmp_path)) is True
+
+
+def test_f1_path_blanking_only_without_process_capable_names(monkeypatch, tmp_path):
+    data = tmp_path / "large.data"
+    with data.open("wb") as stream:
+        stream.truncate(lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1)
+    reads = []
+    original = lifecycle_guard._read_referenced_script
+
+    def spy(path, *, max_bytes=None):
+        reads.append(path)
+        return original(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(lifecycle_guard, "_read_referenced_script", spy)
+    data_body = f"import os, json\nfrom pathlib import Path\nprint(os.environ.get('X'))\nPath({str(data)!r}).stat()\n"
+    for opener in ("python3 - <<'EOF'", "python3 - <<'EOF' 2>&1", "cd /tmp && python3 - <<'EOF' 2>&1 | tail -3",
+                   "env python3 - <<'EOF'", "VAR=x python3 -u - <<'EOF' >/dev/null"):
+        assert guard(f"{opener}\n{data_body}EOF", cwd=str(tmp_path)) is False, opener
+    assert data not in reads
+    # A process-capable name anywhere in the body keeps the Path operand on the executed walk.
+    assert guard(f"python3 - <<'EOF'\nimport subprocess\n{data_body}EOF", cwd=str(tmp_path)) is True
+    assert data in reads
+
+
+@pytest.mark.parametrize("command", [
+    "python3 script.py <<'EOF'\nnot ( python data\nEOF",
+    "python3 - <<'EOF' 2>&1\nimport subprocess\nsubprocess.run(['printf', 'ok'])\nEOF",
+    "env python3 - <<'PY'\nprint(1)\nPY",
+    "python3 -c 'import sys; print(sys.stdin.read())' <<'EOF'\nsubprocess.run(cmd)\nEOF",
+])
+def test_f1_benign_python_heredocs_stay_allowed(command, tmp_path):
+    assert guard(command, cwd=str(tmp_path)) is False
+
+
+def test_f1_splitter_covers_every_python_body_the_masker_hides():
+    from tools.shell_heredoc import split_python_heredoc_bodies, strip_inert_heredoc_bodies
+
+    body = "subprocess.run(['hermes', 'gateway', 'stop'])\n"
+    for opener in ("python3 - <<'EOF' 2>&1", "cd /tmp && python3 - <<'EOF'", "env python3 - <<'EOF'",
+                   "VAR=x python3 - <<'EOF'", "python3 -u - <<'EOF' >/dev/null", "python3 x.py <<'EOF'",
+                   "python3 -c pass <<'EOF'", "PYTHON3 - <<'EOF'"):
+        command = f"{opener}\n{body}EOF"
+        masked = strip_inert_heredoc_bodies(command)
+        _shell, program, other = split_python_heredoc_bodies(command)
+        if body not in masked:
+            assert body in program + other, opener
+
+
 # --- scheduler entry point --------------------------------------------------
 
 
