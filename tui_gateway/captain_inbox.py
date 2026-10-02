@@ -867,6 +867,25 @@ def _captain_completion_id(
     )
 
 
+def _stamp_captain_reply(session: dict, completion_id: str, text: object) -> None:
+    """Bind the turn's persisted final reply to ``completion_id``: the receipt reconciliation reads."""
+    agent = session.get("agent")
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None) or session.get("session_key")
+    metadata = {_CAPTAIN_COMPLETION_METADATA_KEY: completion_id}
+    if not (db and session_id and isinstance(text, str) and text.strip()
+            and db.set_latest_matching_message_display_kind(
+                session_id, role="assistant", content=text,
+                display_kind=_CAPTAIN_TURN_PURPOSE, display_metadata=metadata)):
+        raise RuntimeError("Captain reply is not durable")
+    # Keep live history in step with the row (display markers align memory and DB positions).
+    with session["history_lock"]:
+        for message in reversed(session.get("history") or ()):
+            if isinstance(message, dict) and message.get("role") == "assistant" and message.get("content") == text:
+                message.update(display_kind=_CAPTAIN_TURN_PURPOSE, display_metadata=metadata)
+                break
+
+
 def _persisted_captain_report(session: dict, completion_id: str):
     """Return the profile-wide canonical receipt for a Captain event."""
     agent = session.get("agent")
@@ -1112,7 +1131,7 @@ def _captain_poll_kanban(sid: str, session: dict) -> None:
     lease_renewer = _start_captain_lease_renewer(kanban_claims)
 
     def _settle_after_terminal(
-        succeeded: Optional[bool],
+        succeeded: bool,
         *,
         _claim_records=list(kanban_claims),
         _completion_id=completion_id,
@@ -1128,20 +1147,11 @@ def _captain_poll_kanban(sid: str, session: dict) -> None:
             try:
                 _stop_captain_lease_renewer(_lease_handle)
             except Exception:
-                if succeeded is None:
-                    _settled_event.set()
-                    raise
                 try:
                     _settle_kanban_notification_claims(_claim_records, accepted=False)
                 finally:
                     _settled_event.set()
                 raise
-            if succeeded is None:
-                # Rollback of the crash-staged input failed. Leave the claim leased rather
-                # than making a dirty retry immediately eligible; normal lease expiry
-                # provides the bounded retry.
-                _settled_event.set()
-                return
             try:
                 _settle_captain_turn_claims(
                     session,
@@ -1156,6 +1166,18 @@ def _captain_poll_kanban(sid: str, session: dict) -> None:
                 # success frame.
                 _settled_event.set()
 
+    def _terminal_receipt(receipt: dict) -> None:
+        # Upstream's terminal_callback runs before message.complete; raising here turns the
+        # frame into an error, so success is never visible before the durable stamp + ack.
+        succeeded = receipt.get("status") == "settled"
+        if succeeded and has_captain_claim:
+            try:
+                _stamp_captain_reply(session, completion_id, receipt.get("text"))
+            except Exception:
+                _settle_after_terminal(False)
+                raise
+        _settle_after_terminal(succeeded)
+
     try:
         _emit("message.start", sid)
         accepted = _run_prompt_submit(
@@ -1163,12 +1185,7 @@ def _captain_poll_kanban(sid: str, session: dict) -> None:
             sid,
             session,
             "\n".join(kanban_texts),
-            on_terminal=_settle_after_terminal,
-            completion_id=completion_id,
-            require_persisted=has_captain_claim,
-            turn_purpose=(
-                _CAPTAIN_TURN_PURPOSE if has_captain_claim else "ordinary"
-            ),
+            terminal_callback=_terminal_receipt,
         )
         if accepted is False:
             raise RuntimeError("synthetic turn was not accepted")

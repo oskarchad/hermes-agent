@@ -1101,15 +1101,12 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
 
     attempts: list[str] = []
     completion_ids: list[str | None] = []
-    turn_purposes: list[str | None] = []
 
     def submit(_rid, _sid, _session, text, **kwargs):
         attempts.append(text)
-        completion_ids.append(kwargs.get("completion_id"))
-        turn_purposes.append(kwargs.get("turn_purpose"))
         if len(attempts) == 1:
             return False
-        kwargs["on_terminal"](True)
+        kwargs["terminal_callback"]({"status": "settled", "text": "report"})
         return True
 
     def run_once():
@@ -1119,6 +1116,8 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
         monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
         monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
         monkeypatch.setattr(server, "_run_prompt_submit", submit)
+        monkeypatch.setattr(server, "_stamp_captain_reply",
+                            lambda _s, completion_id, _t: completion_ids.append(completion_id))
         server._notification_poller_loop(_StopAfterOnePoll(), "sid-loop", session)
 
     # Poll 1 — rejection releases the row to pending and clears the reservation.
@@ -1132,9 +1131,7 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     run_once()
     assert len(attempts) == 2
     assert attempts[1] == attempts[0]
-    assert completion_ids[0]
-    assert completion_ids[1] == completion_ids[0]
-    assert turn_purposes == ["captain_report", "captain_report"]
+    assert len(completion_ids) == 1 and completion_ids[0]
     assert _inbox_states() == {"acked": 1}
 
     # Turn finishes; a later idle poll must not replay the acked report.
@@ -1143,42 +1140,6 @@ def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):
     run_once()
     assert len(attempts) == 2
     assert _inbox_states() == {"acked": 1}
-
-
-def test_poller_keeps_lease_when_failed_turn_could_not_rollback_input(monkeypatch):
-    from tools.process_registry import process_registry
-
-    loop_key = "captain-rollback-failed"
-    session = {
-        "session_key": loop_key,
-        "history_lock": threading.Lock(),
-        "running": False,
-    }
-    profile = _profile_for(session)
-    conn = kbc.connect()
-    try:
-        tid = kb.create_task(conn, title="cap-rollback", assignee="worker")
-        kb.register_captain_owner(conn, tid, profile=profile, origin_session_key=None)
-        kb.complete_task(conn, tid, summary="rollback failed")
-    finally:
-        conn.close()
-
-    terminal_values = []
-
-    def submit(_rid, _sid, _session, _text, **kwargs):
-        terminal_values.append(None)
-        kwargs["on_terminal"](None)
-        return True
-
-    monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
-    monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_a: None)
-    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_run_prompt_submit", submit)
-
-    server._notification_poller_loop(_StopAfterOnePoll(), "sid-rollback", session)
-
-    assert terminal_values == [None]
-    assert _inbox_states() == {"leased": 1}
 
 
 def test_poller_defers_captain_claim_for_codex_app_server(monkeypatch):
@@ -1280,8 +1241,7 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
         return real_ack(conn, **kwargs)
 
     def submit(_rid, _sid, active_session, text, **kwargs):
-        completion_id = kwargs["completion_id"]
-        attempts.append(completion_id)
+        attempts.append(text)
         submitted_prompts.append(text)
         active_session_id = active_session["agent"].session_id
         # Persist the source turn across separate writes so ordinary rows from
@@ -1296,13 +1256,9 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
                 {"role": "assistant", "content": "fallback ordinary answer"},
             ],
         )
-        db.append_message(
-            active_session_id,
-            "assistant",
-            content="Captain durable report",
-            display_metadata={"captain_completion_id": completion_id},
-        )
-        kwargs["on_terminal"](True)
+        db.append_message(active_session_id, "assistant", content="Captain durable report")
+        # The terminal callback stamps the persisted reply with its completion id.
+        kwargs["terminal_callback"]({"status": "settled", "text": "Captain durable report"})
         return True
 
     monkeypatch.setattr(kb, "ack_captain_reports", fail_first_ack)
@@ -1347,7 +1303,6 @@ def test_persisted_captain_report_reconciles_across_same_profile_sessions(
         for row in [*first_rows, *fallback_rows]
         if row.get("role") == "assistant"
         and (row.get("display_metadata") or {}).get("captain_completion_id")
-        == attempts[0]
     ]
     assert [row["content"] for row in captain_rows] == ["Captain durable report"]
     assert all(row.get("content") != "Captain durable report" for row in first_rows)
