@@ -56,11 +56,9 @@ logger = logging.getLogger(__name__)
 _hermes_home = _HERMES_HOME_AT_IMPORT = get_hermes_home()
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env")
 
-
 # ── Panic logger: crashes otherwise leave no forensics (stdout is the JSON-RPC pipe, stderr doesn't
 # flush before exit) → append every unhandled exception to the crash log + one-line stderr summary.
 _CRASH_LOG = os.path.join(_hermes_home, "logs", "tui_gateway_crash.log")
-
 
 def _record_crash(kind: str, exc_type, exc_value, exc_tb, *, thread_name: str | None = None) -> None:
     import traceback
@@ -76,11 +74,9 @@ def _record_crash(kind: str, exc_type, exc_value, exc_tb, *, thread_name: str | 
     who = f"thread {thread_name} raised " if thread_name is not None else ""
     print(f"[gateway-crash] {who}{exc_type.__name__}: {first}", file=sys.stderr, flush=True)
 
-
 def _panic_hook(exc_type, exc_value, exc_tb):
     _record_crash("unhandled exception", exc_type, exc_value, exc_tb)
     sys.__excepthook__(exc_type, exc_value, exc_tb)  # chain so the process still terminates normally
-
 
 sys.excepthook = _panic_hook
 threading.excepthook = lambda args: _record_crash(
@@ -3689,4 +3685,8 @@ for _m in (
     _methods_connectors_account, _methods_display, _methods_display_watch, _methods_onboarding,
     _methods_i18n, _methods_shared_metrics, _methods_start_chat):
     _m.register(sys.modules[__name__])
+from . import captain_turn as _captain_turn
+_captain_turn.register(sys.modules[__name__])
+from . import captain_inbox as _captain_inbox
+_captain_inbox.register(sys.modules[__name__])
 del _m

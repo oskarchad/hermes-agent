@@ -12,6 +12,9 @@ import shlex
 import tempfile
 import unicodedata
 
+from tools.approval_python_data import is_safe_python_data_code
+
+
 logger = logging.getLogger("tools.approval")
 
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute
@@ -895,6 +898,100 @@ def _iter_top_level_shell_segments(command: str):
         yield command[start:]
 
 
+def _python_c_payload(args: list[str]) -> tuple[bool, str | None]:
+    """Return whether Python ``-c`` occurs and the code payload it owns.
+
+    One shared left-to-right option parser matching Python CLI invocation grammar:
+    - Short options with arguments: -W <arg>, -X <arg> (separate or attached: -Wignore, -Xdev).
+    - Long options with arguments: --check-hash-based-pycs <arg> (separate or =val).
+    - Short boolean options: -B, -u, -s, -E, etc.
+    - Flag -c: separate (-c CODE) or attached (-cCODE).
+    - Bundled short flags preceding -c: e.g. -Bc CODE, -BcCODE (where B takes no arg).
+    - If an option with arg precedes -c in a bundle (e.g. -BWcfoo), the argument-taking
+      option owns the remainder of the bundle; -c is NOT matched there.
+    - Stop parsing on '--' or first non-option token.
+    """
+    index = 0
+    short_with_arg = {"-W", "-X"}
+    long_with_arg = {"--check-hash-based-pycs"}
+
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            return False, None
+        if not token.startswith("-") or token == "-":
+            return False, None
+
+        # Long options: --opt or --opt=val
+        if token.startswith("--"):
+            opt_name, equals, _ = token.partition("=")
+            if opt_name in long_with_arg:
+                if equals:
+                    index += 1
+                else:
+                    index += 2
+                continue
+            else:
+                index += 1
+                continue
+
+        # Short options bundle: token starts with '-'
+        chars = token[1:]
+        consumed_token = False
+        for i, ch in enumerate(chars):
+            opt_ch = f"-{ch}"
+            if opt_ch in short_with_arg:
+                rest_of_token = chars[i + 1:]
+                if rest_of_token:
+                    # Attached argument: e.g. -Wignore or -BWcfoo
+                    index += 1
+                    consumed_token = True
+                    break
+                else:
+                    # Separate argument: e.g. -W ignore
+                    index += 2
+                    consumed_token = True
+                    break
+            elif ch == "c":
+                # -c option found!
+                rest_of_token = chars[i + 1:]
+                if rest_of_token:
+                    # Attached code: e.g. -cCODE or -BcCODE
+                    return True, rest_of_token
+                else:
+                    # Separate code: e.g. -c CODE or -Bc CODE
+                    payload = args[index + 1] if index + 1 < len(args) else None
+                    return True, payload
+            elif ch == "m":
+                # -m mod terminates option list
+                return False, None
+            else:
+                continue
+
+        if not consumed_token:
+            index += 1
+
+    return False, None
+
+
+def _is_safe_python_data_code(code_str: str) -> bool:
+    """Return True if code_str is proven to be a safe data-reading/parsing script.
+
+    Carveout for issue #136: commands like `gh api ... | python3 -c 'import sys; print(sys.stdin.read()[-5500:])'`
+    or `python3 -c 'import json,pathlib; print(json.loads(pathlib.Path(...).read_text()))'` only read and format
+    data. They do NOT execute downloaded code, spawn subprocesses, make network calls, or write files.
+    Positive verification of operations:
+    - Imports restricted strictly to _SAFE_PYTHON_DATA_MODULES (sys, json, pathlib, ast, re).
+    - No aliasing to arbitrary callable objects.
+    - Calls restricted strictly to known safe operations on proven safe receivers:
+      * Builtins: print, len, str, int, etc.
+      * Receiver methods: sys.stdin.read(), pathlib.Path(...).read_text(), json.loads(), etc.
+    - Forbid all definitions, mutations, dunder attributes, and unknown call targets.
+    - Must contain at least one recognized safe read/parse operation.
+    """
+    return is_safe_python_data_code(code_str)
+
+
 def _interpreter_exec_flag(family: str, args: list[str]) -> str | None:
     """Return an execution-bearing interpreter option, if present."""
     flags, with_arg = _INTERPRETER_EXEC_FLAGS[family], _INTERPRETER_WITH_ARG[family]
@@ -1005,7 +1102,16 @@ def _execution_flag_findings(command: str):
             if not tokens:
                 continue
             args = tokens[1:]
-            if family and _interpreter_exec_flag(family, args):
+            if family == "python":
+                c_found, code_payload = _python_c_payload(args)
+                if c_found:
+                    if code_payload and _is_safe_python_data_code(code_payload):
+                        pass
+                    else:
+                        yield ("script execution via -e/-c flag", None)
+                elif any(token.startswith("<<") for token in args):
+                    yield ("script execution via heredoc", None)
+            elif family and _interpreter_exec_flag(family, args):
                 yield ("script execution via -e/-c flag", None)
             elif family and any(token.startswith("<<") for token in args):
                 yield ("script execution via heredoc", None)

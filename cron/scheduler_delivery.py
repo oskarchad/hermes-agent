@@ -1325,6 +1325,7 @@ class _TargetDelivery:
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
+    explicit_route: bool = False
     live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
 
     @property
@@ -1352,61 +1353,6 @@ def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool) -> None:
         logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
 
 
-def _resolve_target_transport(
-    job: dict, platform, platform_name: str, target: dict, adapters, config):
-    """Resolve ``(transport, pconfig, runtime_adapter, target_adapters)`` for one target, or
-    ``(None, error)`` when it cannot be served (relay-fronted with no live transport, or not
-    configured/enabled)."""
-    from gateway.delivery import DeliveryTransport, resolve_delivery_transport
-    target_adapters = adapters
-    transport = None
-    if isinstance(adapters, _preflight.SharedRouteAdapters):
-        # Credentialless satellite: the primary adapter serves THIS target only when an exact
-        # primary route maps it to this profile; a miss fails closed below.
-        # See #101113.
-        shared = adapters.get(platform, target)
-        target_adapters = {platform: shared} if shared is not None else {}
-        if shared is not None:
-            # The PRIMARY's route authorized this exact native adapter. The satellite's own
-            # ``platforms.<p>`` block describes a connector it never runs (no credential), so
-            # neither its absence nor ``enabled: false`` may veto the shared transport; only its
-            # non-credential settings (continuable surface, reply mode) are kept (#89302, #103701).
-            from dataclasses import replace
-            from gateway.config import PlatformConfig
-            own = config.platforms.get(platform)
-            transport = DeliveryTransport(
-                shared, replace(own, enabled=True) if own is not None else PlatformConfig(enabled=True),
-                platform)
-    if transport is None:
-        transport = resolve_delivery_transport(platform, config, target_adapters)
-    if transport is not None:
-        pconfig = transport.config
-        runtime_adapter = transport.adapter
-    else:
-        # Relay-fronted platforms have NO standalone fallback (the connector owns the credential),
-        # so surface that instead of the native configured/enabled gate, which misdiagnoses them.
-        from gateway.relay import relay_fronted_platforms
-        if platform_name in relay_fronted_platforms():
-            return None, (
-                f"platform '{platform_name}' is relay-fronted and has no "
-                "live gateway transport; start the gateway (its ticker "
-                "owns relay-fronted delivery and will fire the job on "
-                "schedule)"
-            )
-        pconfig = config.platforms.get(platform)
-        runtime_adapter = None
-
-    if transport is not None and (transport.is_relay or pconfig is None):
-        # Relay transport carries the RELAY adapter's config (enablement already checked): the
-        # logical platform is deliberately NOT natively enabled. A live NATIVE adapter with no
-        # ``platforms.<p>`` block is the same shape — the owning process already authorized the
-        # adapter; "no config" is not "disabled" (#89302).
-        if pconfig is None:
-            from gateway.config import PlatformConfig
-            pconfig = PlatformConfig(enabled=True)
-    elif not pconfig or not pconfig.enabled:
-        return None, f"platform '{platform_name}' not configured/enabled"
-    return (transport, pconfig, runtime_adapter, target_adapters), None
 
 
 def _inchannel_surface_supported(runtime_adapter, platform_name: str) -> bool:
@@ -1809,6 +1755,9 @@ def _deliver_standalone(
 ) -> None:
     """Standalone fallback for a target the live lane did not deliver."""
     job = t.job
+    if t.explicit_route:
+        delivery_errors.extend(target_errors or [f"explicit cron delivery to {t.where} failed"])
+        return
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
@@ -1880,6 +1829,17 @@ def _prepare_target_delivery(
     # seed can create a resolvable session (_inchannel_seed_allowed).
     inchannel_continuable = origin_target or (
         mirror_this_target and _inchannel_seed_allowed(is_dm=is_dm_target, user_id=origin_user_id))
+    from cron.delivery_routes import configured_routes, route_for
+    try:
+        routes = configured_routes()
+    except Exception:
+        logger.debug("explicit cron route resolution failed", exc_info=True)
+        _note_target_error(job, "explicit cron delivery route configuration unavailable or invalid", delivery_errors)
+        return None
+    explicit_route = route_for(target, routes) is not None
+    if explicit_route:
+        # Cross-profile transport does not transfer conversation ownership or open new threads.
+        mirror_this_target = inchannel_continuable = False
 
     # Plugin platform names create dynamic members via Platform._missing_().
     try:
@@ -1889,11 +1849,17 @@ def _prepare_target_delivery(
         return None
 
     resolved, resolve_err = _resolve_target_transport(
-        job, platform, platform_name, target, adapters, config)
+        job, platform, platform_name, target, adapters, config, routes=routes)
     if resolved is None:
         _note_target_error(job, resolve_err, delivery_errors)
         return None
     transport, pconfig, runtime_adapter, target_adapters = resolved
+    if explicit_route:
+        # Only this validated platform block travels with the live transport. All other
+        # delivery settings remain the owner's; no target-profile config is loaded.
+        import copy
+        config = copy.copy(config)
+        config.platforms = {**config.platforms, platform: pconfig}
 
     # Live send needs a RUNNING loop, not just an adapter. Computed ONCE so the in_channel
     # thread_id clear below stays in lockstep with the seed (standalone cannot seed flat).
@@ -1944,7 +1910,8 @@ def _prepare_target_delivery(
         origin=origin, origin_target=origin_target, origin_user_id=origin_user_id,
         is_dm_target=is_dm_target, mirror_text=mirror_text, mirror_this_target=mirror_this_target,
         in_channel_surface=in_channel_surface, inchannel_continuable=inchannel_continuable,
-        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
+        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready,
+        explicit_route=explicit_route)
 
 
 def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
@@ -1977,6 +1944,10 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    from cron.delivery_routes import bind_delivery_routes
+    if "_cron_delivery_route_bindings" not in job:
+        # Attempt state belongs to this caller's job object; do not rebind a copy.
+        job.update(bind_delivery_routes(job))
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
@@ -2129,3 +2100,7 @@ from cron import scheduler as _sched
 from cron import scheduler_delivery_origin as _origin
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script
+
+from cron.scheduler_delivery_transport import (
+    _resolve_target_transport,
+)

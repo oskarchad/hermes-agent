@@ -19048,6 +19048,18 @@
               }
             ],
             "default": null
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Id"
           }
         },
         "title": "MessageCompletePayload",

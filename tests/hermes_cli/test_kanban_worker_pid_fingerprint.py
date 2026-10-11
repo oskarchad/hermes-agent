@@ -136,8 +136,9 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     assert kb.release_stale_claims(conn, signal_fn=sig) == 0
     assert killed == []
     assert kb.get_task(conn, tid).status == "running"
-    # An explicit operator reclaim releases the claim (human override) but still sends nothing.
-    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is True
+    # The retained cleanup contract also holds a manual reclaim beside an unverified live worker.
+    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is False
+    assert kb.get_task(conn, tid).status == "running"
     assert killed == []
 
     # The process is gone (a dead PID): the row is reclaimed like any dead worker, still no signal.

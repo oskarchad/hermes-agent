@@ -133,3 +133,40 @@ def test_snapshot_does_not_turn_later_commands_into_delegated_children(tmp_path)
         assert "[]" in parent["output"], f"parent command inherited the marker: {parent!r}"
     finally:
         env.cleanup()
+
+
+@pytest.mark.platforms("posix")
+def test_delegated_child_marker_never_persists_in_shared_snapshot(tmp_path):
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    env = None
+    try:
+        with delegated_child_context():
+            env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+            env.init_session()
+            with open(env._snapshot_path) as snapshot:
+                initial_snapshot = snapshot.read()
+
+            child = env.execute(
+                'printf "child=[%s]\\n" "${HERMES_DELEGATED_CHILD_CONTEXT-unset}"'
+            )
+            with open(env._snapshot_path) as snapshot:
+                refreshed_snapshot = snapshot.read()
+
+        controller = env.execute(
+            'printf "controller=[%s]\\n" "${HERMES_DELEGATED_CHILD_CONTEXT-unset}"'
+        )
+
+        assert child["returncode"] == 0
+        # Upstream now sets this marker to the delegated child's context PATH, not the
+        # literal "1" it used to carry. What this test guards is unchanged: the marker is
+        # present in the child, and never leaks into the shared snapshot or the controller.
+        assert "child=[" in child["output"] and "child=[unset]" not in child["output"]
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in initial_snapshot
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in refreshed_snapshot
+        assert controller["returncode"] == 0
+        assert "controller=[unset]" in controller["output"]
+    finally:
+        if env is not None:
+            env.cleanup()

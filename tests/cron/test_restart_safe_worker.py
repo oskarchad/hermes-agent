@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import cron.scheduler_worker as worker
 
 
 @pytest.fixture
@@ -164,7 +165,7 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
     monkeypatch.setattr("cron.executions.adopt_claimed_execution", adopted)
     monkeypatch.setattr(scheduler, "run_one_job", run)
 
-    assert scheduler._run_external_worker_payload(payload, ack) is True
+    assert worker._run_external_worker_payload(payload, ack) is True
 
     adopted.assert_called_once_with("exec-1")
     run.assert_called_once()
@@ -233,7 +234,7 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
     run = Mock()
     monkeypatch.setattr(scheduler, "run_one_job", run)
 
-    assert scheduler._run_external_worker_payload(payload, ack) is False
+    assert worker._run_external_worker_payload(payload, ack) is False
 
     run.assert_not_called()
     assert not ack.exists()
@@ -392,7 +393,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
 
     set_multiplex_active(True)
     try:
-        assert scheduler._launch_external_cron_worker(job) is True
+        assert worker._launch_external_cron_worker(job) is True
     finally:
         clear_env_passthrough()
         set_multiplex_active(False)
@@ -591,7 +592,7 @@ def test_launch_external_worker_stays_in_process_outside_managed_gateway(
     popen = Mock()
     monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
 
-    assert scheduler._launch_external_cron_worker(
+    assert worker._launch_external_cron_worker(
         {"id": "job-1", "execution_id": "exec-1"}
     ) is False
     assert command_calls
@@ -933,13 +934,14 @@ def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
 
     launch = Mock(return_value=True)
     run = Mock(side_effect=AssertionError("agent ran inside gateway"))
-    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
+    monkeypatch.setattr(worker, "_launch_external_cron_worker", launch)
     monkeypatch.setattr(scheduler, "run_job", run)
     job = {"id": "job-1", "execution_id": "exec-1"}
 
-    assert scheduler.run_one_job(job, adapters={"discord": object()}) is True
+    adapters = {"discord": object()}
+    assert scheduler.run_one_job(job, adapters=adapters) is True
 
-    launch.assert_called_once_with(job)
+    launch.assert_called_once_with(job, adapters=adapters)
     run.assert_not_called()
 
 
@@ -952,7 +954,7 @@ def test_dispatch_failure_opens_incident_and_delivers_failure_notice(
     from cron import incidents
     from cron import scheduler
 
-    def _handoff_boom(_job):
+    def _handoff_boom(_job, **_kwargs):
         raise RuntimeError("worker exited before ownership acknowledgement")
 
     monkeypatch.setattr(scheduler, "_launch_external_cron_worker", _handoff_boom)
@@ -1010,13 +1012,13 @@ def test_dispatch_failure_notice_resolves_the_owning_profiles_home_channel(
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
     monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
 
-    def _handoff_boom(_job):
+    def _handoff_boom(_job, **_kwargs):
         raise RuntimeError("worker exited before ownership acknowledgement")
 
     if failing_stage == "handoff":
         monkeypatch.setattr(scheduler, "_launch_external_cron_worker", _handoff_boom)
     else:
-        monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+        monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job, **_kwargs: False)
         monkeypatch.setattr(scheduler, "claim_dispatch", _handoff_boom)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_a, **_k: True)
     resolved = []
@@ -1119,7 +1121,7 @@ def test_gateway_tool_run_without_adapter_objects_hands_off(monkeypatch):
     launch = Mock(return_value=True)
     run = Mock(side_effect=AssertionError("agent ran inside gateway"))
     monkeypatch.setattr(scheduler, "create_execution", created)
-    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
+    monkeypatch.setattr(worker, "_launch_external_cron_worker", launch)
     monkeypatch.setattr(scheduler, "run_job", run)
     job = {"id": "tool-job"}
 
@@ -1127,7 +1129,7 @@ def test_gateway_tool_run_without_adapter_objects_hands_off(monkeypatch):
 
     created.assert_called_once_with("tool-job", source="direct", scheduled_instant=None)
     assert job["execution_id"] == "exec-tool"
-    launch.assert_called_once_with(job)
+    launch.assert_called_once_with(job, adapters=None)
     run.assert_not_called()
 
 
@@ -1308,7 +1310,7 @@ def test_post_handoff_waiter_failure_records_bookkeeping_without_alert(
     monkeypatch.setattr(scheduler, "_wait_for_external_cron_worker_body", _body_boom)
     monkeypatch.setattr(
         scheduler, "_launch_external_cron_worker",
-        lambda job: scheduler._wait_for_external_cron_worker(
+        lambda job, **_kwargs: scheduler._wait_for_external_cron_worker(
             object(), execution_id=job["execution_id"]))
     marks = []
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **k: marks.append((a, k)) or True)

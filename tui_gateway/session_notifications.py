@@ -167,7 +167,7 @@ def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwa
         with _session_profile_runtime_scope(session):
             render_notification(lambda: _emit("message.start", sid), platform="tui",
                                 diagnostic=(kwargs.get("display_metadata") or {}).get("notification_category") == "diagnostic")
-        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        return _run_prompt_submit(rid, sid, session, text, **kwargs)
     except Exception as exc:
         _notif_log_failure(what, exc)
         _notif_release_turn(session)
@@ -353,17 +353,15 @@ _KANBAN_EVENT_FORMATTERS = {
 }
 
 
-def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
-    """Single-line notification text for one kanban event; wording mirrors gateway/kanban_watchers.py (reads the same
-    as on Telegram). None for silent kinds."""
-    if (entry := _KANBAN_EVENT_FORMATTERS.get(getattr(ev, "kind", ""))) is None:
-        return None
-    glyph, fmt = entry
-    task_id = sub.get("task_id", "")
-    title = (getattr(task, "title", None) or task_id)[:120]
-    who = getattr(task, "assignee", None) or ""
-    prefix = f"{glyph} " + (f"[{board_slug}] " if board_slug else "") + (f"@{who} " if who else "")
-    return f"{prefix}Kanban {task_id}{fmt(task, getattr(ev, 'payload', None) or {}, title)}"
+def _format_kanban_event_text(sub: dict, task, ev, board_slug: str, latest_run=None, *, include_error_detail=True) -> Optional[str]:
+    """Render retained Kanban lineage with the native diagnostic presentation type."""
+    text = _captain_format_kanban_event_text(sub, task, ev, board_slug, latest_run, include_error_detail=include_error_detail)
+    if text:
+        from gateway.kanban_watchers_notifier import diagnostic_event
+        from gateway.warning_notifications import DiagnosticText
+        if diagnostic_event(ev):
+            return DiagnosticText(text)
+    return text
 
 
 def _kb_board_key(_kb, board_meta) -> tuple[str, str]:
@@ -418,32 +416,9 @@ def _kb_poll_board(_kb, slug: str, session_key: str) -> list:
     return texts
 
 
-def _collect_kanban_notifications(session: dict) -> list:
-    """Claim unseen terminal kanban events for this session's ``platform="tui"`` subscriptions (``kanban_create``
-    auto-subscribes with ``chat_id=HERMES_SESSION_KEY``; no "tui" messaging adapter exists, so this poller is the
-    delivery path). Same atomic cursor-claim as the gateway notifier: exactly-once even if a gateway polls the same DB.
-
-    See #59890.
-    """
-    session_key = str(session.get("session_key") or "")
-    if not session_key or session.get("_finalized"):
-        return []
-    try:
-        from hermes_cli import kanban_db as _kb
-    except Exception:
-        return []
-    try:
-        boards = _kb.list_boards(include_archived=False)
-    except Exception:
-        try:
-            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-        except Exception:
-            return []
-    # dict keyed by resolved DB identity: first slug per DB wins (a pinned HERMES_KANBAN_DB aliases slugs).
-    unique = {}
-    for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
-        unique.setdefault(resolved, slug)
-    return [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key)]
+def _collect_kanban_notifications(session: dict, claim_records=None, *, include_captain=True) -> list:
+    """Claim fenced durable subscriptions and Captain reports for this profile."""
+    return _captain_collect_kanban_notifications(session, claim_records=claim_records, include_captain=include_captain)
 
 
 def _notif_poll_kanban(sid: str, session: dict) -> None:
@@ -452,32 +427,11 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
 
 
 def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
-    """One kanban poll: emit new texts, buffer them, and run the buffered batch as a turn if idle. Events are
-    cursor-claimed (never re-queued), so they wait in the buffer instead of dropping the agent turn."""
-    try:
-        texts = _collect_kanban_notifications(session)
-    except Exception as exc:
-        _notif_log_failure("kanban notification poll failed", exc)
-        texts = []
-    for text in texts:
-        from gateway.warning_notifications import DiagnosticText, render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
-                            platform="tui", diagnostic=isinstance(text, DiagnosticText))
-    if texts:
-        session.setdefault("_kanban_pending", []).extend(texts)
-    if not session.get("_kanban_pending") or not _notif_claim_turn(session):
+    """Reserve idle admission before advancing a durable Kanban cursor."""
+    if session.get('_kanban_pending'):
+        _dispatch_native_kanban_pending(sid, session)
         return
-    with session["history_lock"]:
-        pending = session.get("_kanban_pending") or []
-        from gateway.warning_notifications import DiagnosticText, warning_notifications_enabled
-        split = not warning_notifications_enabled("tui")
-        diagnostic = split and isinstance(pending[0], DiagnosticText)
-        batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
-        session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
-    with contextlib.suppress(Exception):
-        _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
-                      "kanban notification dispatch failed",
-                      **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
+    _poll_captain_notifications(sid, session)
 
 
 def _background_notifications_off(session: dict) -> bool:
