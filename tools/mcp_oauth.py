@@ -740,6 +740,8 @@ def _make_callback_handler() -> tuple[type, dict]:
 
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
+            # A handshake queued before the listener's post-listen option inherited reuse disabled.
+            self.request.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.request.settimeout(_CALLBACK_REQUEST_TIMEOUT_SECONDS)
             super().setup()
 
@@ -948,9 +950,9 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None, redirect_
 
 def _start_callback_server(port: int, handler_cls: type) -> ThreadingHTTPServer:
     """Bind the callback listener on *port*, adopting a parked reserved socket (closes the select→bind
-    TOCTOU window). Parked sockets remain exclusive until adoption; before listening, apply the
-    address-reuse option normally set by ``server_bind`` so accepted TCP connections do not block
-    the next flow while in TIME_WAIT.
+    TOCTOU window). Parked sockets remain exclusive through ``listen``; then apply the address-reuse
+    option normally set by ``server_bind`` so accepted TCP connections do not block the next flow
+    while in TIME_WAIT.
 
     Threading: one stalled or slow client must not make the redirect that actually carries the code
     wait behind it, nor hold the port past the flow's timeout."""
@@ -960,11 +962,12 @@ def _start_callback_server(port: int, handler_cls: type) -> ThreadingHTTPServer:
         if reserved is not None:
             server.socket.close()
             server.socket, server.server_address = reserved, reserved.getsockname()
-            server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         else:
             server.allow_reuse_address = True
             server.server_bind()
         server.server_activate()
+        if reserved is not None:
+            server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     except OSError as exc:  # genuinely in use (concurrent flow / leftover listener / colliding redirect_port): say so, not "timed out"
         raise OAuthNonInteractiveError(
             f"OAuth callback port {port} is already in use ({exc}). Close any other in-progress login, "
