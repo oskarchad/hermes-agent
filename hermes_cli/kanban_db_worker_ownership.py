@@ -16,8 +16,6 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import hermes_cli.kanban_db_dispatch as _kbd
-from hermes_cli import kanban_db as _kb
-from hermes_cli import kanban_db_connect as _kbc
 
 
 logger = logging.getLogger(__name__)
@@ -503,3 +501,6 @@ def _worker_scope_unit(conn: sqlite3.Connection, task_id: str, run_id: Optional[
     if isinstance(persisted, str) and persisted and (persisted != expected):
         _kb._log.debug('kanban: ignoring persisted scope unit %r for %s run %s (expected %r)', persisted, task_id, resolved_run, expected)
     return expected
+
+# Late owner namespace: either public import order must finish defining worker helpers first.
+from hermes_cli import kanban_db as _kb

@@ -72,12 +72,10 @@ def _json_or(value: Any, default: Any = None) -> Any:
     except Exception:
         return default
 
-
 def _json_dict(value: Any) -> dict:
     """Decode a JSON text column that must be an object; anything else yields ``{}``."""
     parsed = _json_or(value, {})
     return parsed if isinstance(parsed, dict) else {}
-
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     """Integer env override: absent/empty/non-integer/below ``minimum`` falls back to ``default``."""
@@ -90,7 +88,6 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         if parsed >= minimum:
             return parsed
     return default
-
 
 def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
     """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
@@ -4380,13 +4377,16 @@ from hermes_cli.kanban_db_dispatch import (
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
-    _terminate_reclaimed_worker,
-    _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    _SpawnedWorkerPid,
+)
+from hermes_cli.kanban_db_worker_ownership import (
+    _terminate_reclaimed_worker,
+    _worker_alive,
     _systemd_worker_scope_required, _stop_kanban_worker_scope,
     _worker_scope_expected, _worker_scope_unit, _systemd_worker_scope_unloaded,
-    _kanban_worker_scope_unit, _systemd_worker_scope_inactive, _SpawnedWorkerPid,
+    _kanban_worker_scope_unit, _systemd_worker_scope_inactive,
 )
 
 from hermes_cli.kanban_db_captain import (

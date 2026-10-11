@@ -54,7 +54,6 @@ from agent.turn_failure_copy import is_max_iteration_handoff
 
 logger = logging.getLogger(__name__)
 
-
 def _set_cron_session_title(session_db, session_id, base_title):
     """Persist a non-blank, unique title for a finished cron session; returns it (None if unset).
     Runs BEFORE end_session()/close() so no write races the close. Duplicate title (unique-index
@@ -87,12 +86,10 @@ def _set_cron_session_title(session_db, session_id, base_title):
         session_db.set_session_title(session_id, deduped)
         return deduped
 
-
 def _job_route_pinned(job: dict) -> bool:
     """True when the job carries its own provider, model or endpoint. Unpinned jobs store none of
     these (they follow the main model at fire time), so any value is an explicit operator pin."""
     return any(isinstance(job.get(k), str) and job[k].strip() for k in ("provider", "model", "base_url"))
-
 
 def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     """The fallback chain this job may walk, at credential resolution AND mid-run (#100437).
@@ -104,7 +101,6 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
     """
     return scoped_fallback_chain(
         get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
-
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
     """Backup-provider clause for a provider-failure notice: "pinned, no fallback" vs "the backups
@@ -128,7 +124,6 @@ def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
         "No backup provider is configured — add one with `hermes fallback add`, "
         "or set a cron-wide default via `cron.model` + `cron.model_provider` in config.yaml."
     )
-
 
 def _failure_streak_nudge(job: dict) -> str:
     """Review nudge when a recurring job keeps failing, else "". The failure message is delivered
@@ -1726,12 +1721,7 @@ def _preflight_or_block(job: dict, job_id: str, job_name: str, cfg: dict) -> Opt
 
 
 def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple:
-    """The ``blocked_config`` failure tuple for *_pf_reason*, alerting once per job.
-
-    Delegates to the shared implementation in ``cron.scheduler_preflight``, which is a
-    superset: it serves both the optional preflight and the mandatory route checks
-    (ADR docs/adr/0001-explicit-cron-delivery-binding.md) from one code path.
-    """
+    """Share optional preflight and mandatory route blocking (ADR0001), alerting once per job."""
     from cron.scheduler_preflight import _blocked_config_result as _shared
     return _shared(job_id, job_name, _pf_reason)
 
