@@ -948,8 +948,9 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None, redirect_
 
 def _start_callback_server(port: int, handler_cls: type) -> ThreadingHTTPServer:
     """Bind the callback listener on *port*, adopting a parked reserved socket (closes the select→bind
-    TOCTOU window). ``allow_reuse_address`` is set BEFORE binding (a no-op afterwards) so a lingering
-    TIME_WAIT socket from a previous flow cannot block the next.
+    TOCTOU window). Parked sockets remain exclusive until adoption; before listening, apply the
+    address-reuse option normally set by ``server_bind`` so accepted TCP connections do not block
+    the next flow while in TIME_WAIT.
 
     Threading: one stalled or slow client must not make the redirect that actually carries the code
     wait behind it, nor hold the port past the flow's timeout."""
@@ -959,6 +960,7 @@ def _start_callback_server(port: int, handler_cls: type) -> ThreadingHTTPServer:
         if reserved is not None:
             server.socket.close()
             server.socket, server.server_address = reserved, reserved.getsockname()
+            server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         else:
             server.allow_reuse_address = True
             server.server_bind()

@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler
 from unittest.mock import MagicMock
 
 import pytest
@@ -40,6 +41,36 @@ def _assert_port_released(port: int) -> None:
         probe.bind(("127.0.0.1", port))
     finally:
         probe.close()
+
+
+def test_reserved_callback_listener_preserves_exclusion_and_enables_address_reuse():
+    """Adoption retains the reservation and gives accepted TCP sockets reuse semantics."""
+    import tools.mcp_oauth as oauth
+
+    port = oauth._reserve_callback_port()
+    reserved = oauth._reserved_sockets[port]
+    server = None
+    try:
+        assert reserved.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with pytest.raises(OSError):
+                contender.bind(("127.0.0.1", port))
+
+        server = oauth._start_callback_server(port, BaseHTTPRequestHandler)
+        assert server.socket is reserved
+        assert server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with pytest.raises(OSError):
+                contender.bind(("127.0.0.1", port))
+    finally:
+        if server is not None:
+            server.server_close()
+        leftover = oauth._reserved_sockets.pop(port, None)
+        if leftover is not None:
+            leftover.close()
+    _assert_port_released(port)
 
 
 def _callback_pair(result) -> tuple[str, str | None]:
