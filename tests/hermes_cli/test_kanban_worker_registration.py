@@ -109,3 +109,39 @@ def test_recycled_worker_still_requires_owned_scope_cleanup(monkeypatch):
     assert stopped == ['owned.scope']
     assert result['pid_recycled']
     assert not result['cleanup_verified']
+
+
+@pytest.mark.parametrize('recorded', ['epoch|1234.0', 1234.0, None])
+def test_native_cleanup_keeps_recorded_start_witness(monkeypatch, recorded):
+    from gateway import status
+    from hermes_cli import kanban_db_worker_cleanup as cleanup
+    from tools.process_registry import ProcessRegistry
+
+    live, seen = [True], []
+    monkeypatch.setattr(kb, '_pid_alive', lambda pid: live[0])
+    monkeypatch.setattr(kbd, '_pid_recycled', lambda *args: False)
+    monkeypatch.setattr(cleanup, '_owned_group_snapshot', lambda pid: None)
+    monkeypatch.setattr(status, 'get_process_start_time', lambda pid: 5678.0)
+
+    def terminate(pid, *, expected_start):
+        seen.append(expected_start)
+        live[0] = False
+
+    monkeypatch.setattr(ProcessRegistry, '_terminate_host_pid', terminate)
+    result = kb._terminate_reclaimed_worker(4321, kb._host_prefix() + 'claim',
+        started_at=recorded, scope_expected=False)
+    assert result['terminated']
+    assert seen == [None if recorded is None else 1234.0]
+
+
+def test_recycled_parent_does_not_certify_a_foreign_group_snapshot(monkeypatch):
+    from hermes_cli import kanban_db_worker_cleanup as cleanup
+    from tools.process_registry import ProcessRegistry
+
+    seen = []
+    monkeypatch.setattr(cleanup, '_owned_group_snapshot', lambda pid: ('foreign', ['stranger']))
+    monkeypatch.setattr(ProcessRegistry, '_host_pid_is_ours', lambda pid, expected: False)
+    monkeypatch.setattr(ProcessRegistry, '_terminate_host_pid', lambda pid, expected_start: seen.append(expected_start))
+    monkeypatch.setattr(cleanup, '_finish_owned_group', lambda snapshot, info: seen.append(snapshot))
+    cleanup._terminate_native_worker_tree(4321, 'epoch|1234', {})
+    assert seen == [1234, None]

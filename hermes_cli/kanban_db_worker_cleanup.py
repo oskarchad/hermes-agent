@@ -73,11 +73,19 @@ def _finish_owned_group(snapshot, info):
 
 
 def _terminate_native_worker_tree(pid, started_at, info):
-    from gateway.status import get_process_start_time
     from tools.process_registry import ProcessRegistry
+    try:
+        raw = str(started_at).rsplit('|', 1)[-1] if started_at is not None else None
+        expected_start = None if raw is None else int(raw) if raw.isdecimal() else float(raw)
+    except (TypeError, ValueError):
+        info.update(signal_refused=True, group_cleanup_verified=False)
+        return
     snapshot = _owned_group_snapshot(pid)
     # The caller already verified the composed boot epoch + start fingerprint;
-    # the native helper independently checks the numeric kernel start witness.
-    expected_start = get_process_start_time(pid)
+    # every subsequent check must use that recorded witness, never certify a
+    # replacement PID from its freshly read identity. Discard a group snapshot
+    # captured during a recycle before it can authorize group signalling.
+    if expected_start is not None and not ProcessRegistry._host_pid_is_ours(pid, expected_start):
+        snapshot = None
     ProcessRegistry._terminate_host_pid(pid, expected_start=expected_start)
     _finish_owned_group(snapshot, info)

@@ -35,7 +35,9 @@ def _resolve_target_transport(job: dict, platform, platform_name: str, target: d
         logger.debug('runtime boundary failed', exc_info=True)
         return (None, 'explicit cron delivery route configuration unavailable or invalid')
     expected = route_for(target, job.get('_cron_delivery_route_bindings', []))
-    if expected is not None and (route is None or route['adapter_profile'] != expected['adapter_profile']):
+    expected_profile = expected['adapter_profile'] if expected is not None else None
+    live_profile = route['adapter_profile'] if route is not None else None
+    if '_cron_delivery_route_bindings' in job and live_profile != expected_profile:
         return (None, 'explicit cron delivery route changed since dispatch')
     if route is not None:
         adapter = adapters.get_explicit(platform, route) if isinstance(adapters, ExplicitRouteAdapters) else None

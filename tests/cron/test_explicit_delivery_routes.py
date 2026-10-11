@@ -249,3 +249,37 @@ def test_mandatory_route_block_alerts_once_then_rearms_after_recovery(route_env,
             assert scheduler.run_job(get_job(job['id']))[0] is True
         assert not get_job(job['id']).get('preflight_alerted')
         assert scheduler.run_job(get_job(job['id']))[3].startswith(BLOCKED_CONFIG_MARKER)
+
+
+@pytest.mark.parametrize('snapshot, live_profile, accepted', [
+    ([], 'secondary', False),
+    ([], None, True),
+    ('secondary', None, False),
+    ('secondary', 'other', False),
+    ('secondary', 'secondary', True),
+    (None, 'secondary', True),
+    (None, None, True),
+])
+def test_attempt_route_snapshot_binds_presence_and_absence(snapshot, live_profile, accepted):
+    from cron.delivery_routes import ExplicitRouteAdapters
+
+    target = {'platform': 'discord', 'chat_id': 'channel'}
+    route = {**target, 'adapter_profile': 'secondary'}
+    original = SimpleNamespace(config=PlatformConfig(enabled=True), is_connected=True)
+    secondary = SimpleNamespace(config=PlatformConfig(enabled=True), is_connected=True)
+    other = SimpleNamespace(config=PlatformConfig(enabled=True), is_connected=True)
+    view = ExplicitRouteAdapters({Platform.DISCORD: original},
+        {'secondary': {Platform.DISCORD: secondary}, 'other': {Platform.DISCORD: other}},
+        lambda: {'secondary', 'other'})
+    config = GatewayConfig(platforms={Platform.DISCORD: original.config})
+    job = {}
+    if snapshot is not None:
+        job['_cron_delivery_route_bindings'] = [{**route, 'available': True}] if snapshot else []
+    routes = [{**target, 'adapter_profile': live_profile}] if live_profile else []
+    result, error = _resolve_target_transport(job, Platform.DISCORD, 'discord', target,
+        view, config, routes=routes)
+    if not accepted:
+        assert result is None and 'changed since dispatch' in error
+    else:
+        assert error is None
+        assert result[2] is (secondary if live_profile else original)
