@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_worker_ownership as kbwo
 from hermes_cli import kanban_db_workspace as kbw
 
 
@@ -40,10 +41,11 @@ def _prepare_spawn(monkeypatch, tmp_path):
 
     root = tmp_path / ".hermes"
     (root / "profiles" / "patch").mkdir(parents=True)
+    (root / "profiles" / "patch" / "config.yaml").write_text("{}\n", encoding="utf-8")
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
 
     workspace = tmp_path / "workspace"
@@ -73,7 +75,7 @@ def test_systemd_owned_dispatcher_spawns_worker_in_sibling_scope(monkeypatch, tm
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
 
-    pid = kb._default_spawn(_make_task(kb), str(workspace))
+    pid = kbd._default_spawn(_make_task(kb), str(workspace))
 
     assert pid == 4242
     assert captured["cmd"][:4] == [
@@ -108,7 +110,7 @@ def test_systemd_owned_dispatcher_fails_closed_when_scope_is_unavailable(
     monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
 
     with pytest.raises(RuntimeError, match="systemd scope.*unavailable"):
-        kb._default_spawn(_make_task(kb), str(workspace))
+        kbd._default_spawn(_make_task(kb), str(workspace))
 
 
 @pytest.mark.platforms("linux")
@@ -1565,7 +1567,7 @@ def test_handoff_guard_derives_shared_scope_when_spawn_payload_lacks_unit(monkey
             reviewer="gauge",
             expected_run_id=implementation.current_run_id,
         )
-        assert kb._handoff_worker_teardown_pending(conn, task_id) is True
+        assert kbwo._handoff_worker_teardown_pending(conn, task_id) is True
         assert probed == [
             kb._kanban_worker_scope_unit(task_id, implementation.current_run_id)
         ]
@@ -1870,7 +1872,7 @@ def test_handoff_guard_ignores_foreign_persisted_scope(monkeypatch, tmp_path):
             lambda unit: probed.append(unit) or unit == foreign,
         )
 
-        assert kb._handoff_worker_teardown_pending(conn, task_id) is True
+        assert kbwo._handoff_worker_teardown_pending(conn, task_id) is True
         assert probed == [expected]
     finally:
         conn.close()
@@ -1912,7 +1914,7 @@ def test_handoff_guard_fails_closed_without_exact_scope(monkeypatch, tmp_path):
             lambda unit: probed.append(unit) or True,
         )
 
-        assert kb._handoff_worker_teardown_pending(conn, task_id) is True
+        assert kbwo._handoff_worker_teardown_pending(conn, task_id) is True
         assert probed == []
     finally:
         conn.close()

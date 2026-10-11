@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler
 from unittest.mock import MagicMock
 
 import pytest
@@ -40,6 +41,83 @@ def _assert_port_released(port: int) -> None:
         probe.bind(("127.0.0.1", port))
     finally:
         probe.close()
+
+
+def test_reserved_callback_listener_preserves_exclusion_and_enables_address_reuse(monkeypatch):
+    """Adoption retains the reservation and gives accepted TCP sockets reuse semantics."""
+    import tools.mcp_oauth as oauth
+
+    port = oauth._reserve_callback_port()
+    reserved = oauth._reserved_sockets[port]
+    activate = oauth.ThreadingHTTPServer.server_activate
+
+    def activate_while_exclusive(server):
+        assert server.socket is reserved
+        assert server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        activate(server)
+        assert server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+
+    monkeypatch.setattr(oauth.ThreadingHTTPServer, "server_activate", activate_while_exclusive)
+    server = None
+    try:
+        assert reserved.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with pytest.raises(OSError):
+                contender.bind(("127.0.0.1", port))
+
+        server = oauth._start_callback_server(port, BaseHTTPRequestHandler)
+        assert server.socket is reserved
+        assert server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+            contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with pytest.raises(OSError):
+                contender.bind(("127.0.0.1", port))
+    finally:
+        if server is not None:
+            server.server_close()
+        leftover = oauth._reserved_sockets.pop(port, None)
+        if leftover is not None:
+            leftover.close()
+    _assert_port_released(port)
+
+
+def test_callback_connection_queued_before_reuse_enabled_is_reusable(monkeypatch):
+    """A queued handshake inherits old listener options before user-space accept."""
+    import tools.mcp_oauth as oauth
+
+    port = oauth._reserve_callback_port()
+    handler, result = oauth._make_callback_handler()
+    activate = oauth.ThreadingHTTPServer.server_activate
+    clients = []
+
+    def activate_and_queue_connection(server):
+        assert server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        activate(server)
+        client = socket.create_connection(server.server_address, timeout=5)
+        clients.append(client)
+        client.sendall(b"GET /callback?code=queued-code&state=queued-state HTTP/1.0\r\n\r\n")
+
+    monkeypatch.setattr(oauth.ThreadingHTTPServer, "server_activate", activate_and_queue_connection)
+    server = accepted = None
+    try:
+        server = oauth._start_callback_server(port, handler)
+        accepted, address = server.get_request()
+        assert accepted.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+        handler(accepted, address, server)
+        assert accepted.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
+        assert result["auth_code"] == "queued-code"
+    finally:
+        if accepted is not None:
+            accepted.close()
+        for client in clients:
+            client.close()
+        if server is not None:
+            server.server_close()
+        leftover = oauth._reserved_sockets.pop(port, None)
+        if leftover is not None:
+            leftover.close()
+    _assert_port_released(port)
 
 
 def _callback_pair(result) -> tuple[str, str | None]:
