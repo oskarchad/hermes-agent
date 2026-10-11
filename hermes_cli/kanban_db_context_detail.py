@@ -88,5 +88,3 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
         if meta_line:
             lines.append(meta_line)
         lines.append('')
-
-

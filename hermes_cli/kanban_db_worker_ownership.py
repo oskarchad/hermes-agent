@@ -503,5 +503,3 @@ def _worker_scope_unit(conn: sqlite3.Connection, task_id: str, run_id: Optional[
     if isinstance(persisted, str) and persisted and (persisted != expected):
         _kb._log.debug('kanban: ignoring persisted scope unit %r for %s run %s (expected %r)', persisted, task_id, resolved_run, expected)
     return expected
-
-

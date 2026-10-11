@@ -268,5 +268,3 @@ def test_delete_task_cas_refusal_preserves_all_relations_and_task(kanban_home, m
         assert conn1.execute("SELECT COUNT(*) FROM kanban_task_bindings WHERE task_id = ?", (t_unrelated,)).fetchone()[0] == 1
         assert conn1.execute("SELECT COUNT(*) FROM kanban_dispositions WHERE task_id = ?", (t_unrelated,)).fetchone()[0] == 1
         assert conn1.execute("SELECT COUNT(*) FROM kanban_invocations WHERE task_id = ?", (t_unrelated,)).fetchone()[0] == 1
-
-

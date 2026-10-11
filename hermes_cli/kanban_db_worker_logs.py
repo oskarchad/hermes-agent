@@ -34,5 +34,3 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict]=None) -> tuple[int, in
     max_bytes = _kbd._positive_int(kanban_cfg.get('worker_log_rotate_bytes'), _kbd.DEFAULT_LOG_ROTATE_BYTES, minimum=1)
     backup_count = _kbd._positive_int(kanban_cfg.get('worker_log_backup_count'), _kbd.DEFAULT_LOG_BACKUP_COUNT, minimum=0)
     return (max_bytes, backup_count)
-
-

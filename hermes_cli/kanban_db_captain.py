@@ -336,5 +336,3 @@ def count_captain_pending(db_path: Optional[Path]=None, *, board: Optional[str]=
         return int(row[0]) if row else 0
     finally:
         conn.close()
-
-

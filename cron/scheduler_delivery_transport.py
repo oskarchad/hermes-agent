@@ -73,5 +73,3 @@ def _resolve_target_transport(job: dict, platform, platform_name: str, target: d
     elif not pconfig or not pconfig.enabled:
         return (None, f"platform '{platform_name}' not configured/enabled")
     return ((transport, pconfig, runtime_adapter, target_adapters), None)
-
-

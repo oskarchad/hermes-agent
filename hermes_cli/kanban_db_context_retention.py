@@ -89,5 +89,3 @@ def read_worker_log(task_id: str, *, tail_bytes: Optional[int]=None, board: Opti
             return f.read().decode('utf-8', errors='replace')
     except OSError:
         return None
-
-

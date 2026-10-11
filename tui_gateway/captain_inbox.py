@@ -1178,7 +1178,7 @@ def _poll_captain_notifications(sid: str, session: dict) -> None:
                     session['running'] = False
                 return
             _lease_renewer = _start_captain_lease_renewer(_kanban_claims)
-    
+
             def _settle_after_terminal(succeeded: Optional[bool], *, _claim_records=tuple(_kanban_claims), _completion_id=completion_id, _lease_handle=_lease_renewer, _settled_event=_settled, _settlement_lock=_settled_lock) -> None:
                 with _settlement_lock:
                     if _settled_event.is_set():

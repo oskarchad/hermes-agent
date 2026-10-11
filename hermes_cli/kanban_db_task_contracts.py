@@ -249,5 +249,3 @@ def effective_task_toolsets(requested: Optional[Iterable[str]]) -> Optional[list
         if name not in effective:
             effective.append(name)
     return effective
-
-

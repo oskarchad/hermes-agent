@@ -174,4 +174,3 @@ class CaptainMessagesMixin:
                 (self._encode_display_metadata(metadata), row_id))
             return True
         return self._execute_write(_do)
-
