@@ -1318,7 +1318,19 @@ def _wire_desktop_ui() -> None:
 _notification_pollers: list = []
 
 
+def _collect_kanban_notifications(session, claim_records=None, *, include_captain=True):
+    """Retained module entry point; the native scoped notification owner composes Captain delivery."""
+    from . import server
+    return server._collect_kanban_notifications(session, claim_records=claim_records, include_captain=include_captain)
+
+
+def _format_kanban_event_text(sub, task, ev, board_slug, latest_run=None, *, include_error_detail=True):
+    """Retained module entry point with native diagnostic presentation preserved."""
+    from . import server
+    return server._format_kanban_event_text(sub, task, ev, board_slug, latest_run, include_error_detail=include_error_detail)
+
+
 def register(server) -> None:
     """Publish this module's helpers onto ``server``, rebound to its globals."""
-    bind_module(globals(), server, skip=("_maybe_fire_tui_loop_tick", "_notification_poller_loop",
+    bind_module(globals(), server, skip=("_collect_kanban_notifications", "_format_kanban_event_text", "_maybe_fire_tui_loop_tick", "_notification_poller_loop",
         "_async_delegation_display_metadata", "_desktop_ui_wired", "_notification_pollers"))

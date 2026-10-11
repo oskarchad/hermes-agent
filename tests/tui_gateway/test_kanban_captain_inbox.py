@@ -156,7 +156,8 @@ def test_live_origin_owns_report_sibling_gets_none():
 
     # Sibling must not claim while the exact origin is live.
     sib_claims = []
-    assert _collect_kanban_notifications(sibling, claim_records=sib_claims) == []
+    from tui_gateway import captain_inbox
+    assert captain_inbox._collect_kanban_notifications(sibling, claim_records=sib_claims) == []
     assert sib_claims == []
 
     orig_claims = []
