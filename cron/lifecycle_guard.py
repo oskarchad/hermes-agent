@@ -1158,6 +1158,35 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 
 # --- recursive walk ---------------------------------------------------------------------------
 
+def _python_subprocess_shell_mode(node: ast.Call) -> Optional[bool]:
+    """Only a known shell modifier can assign literal operands to data/source."""
+    if any(keyword.arg is None for keyword in node.keywords):
+        return None
+    modifiers = [keyword.value for keyword in node.keywords if keyword.arg == "shell"]
+    # run/call/check_* forward popenargs; Popen's shell is positional argument 9.
+    if len(node.args) > 8:
+        modifiers.append(node.args[8])
+    if not modifiers:
+        return False
+    if len(modifiers) != 1:
+        return None
+    value = modifiers[0]
+    return value.value if isinstance(value, ast.Constant) and isinstance(value.value, bool) else None
+
+
+def _python_literal_process_operand(argument, is_subprocess: bool, shell_mode: bool):
+    if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+        return argument.value
+    if not is_subprocess or not isinstance(argument, (ast.List, ast.Tuple)) or not argument.elts:
+        return None
+    if not all(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in argument.elts):
+        return None
+    argv = [item.value for item in argument.elts]
+    # This lane owns complete POSIX quoted Python stdin. With shell=True,
+    # /bin/sh -c executes argv[0]; the remaining items are shell argument data.
+    return argv[0] if shell_mode else argv
+
+
 def _python_process_payloads(source: str) -> Optional[tuple[list[str | list[str]], str]]:
     """Inspect literal process operands, never execute Python or infer aliases/dataflow.
 
@@ -1198,27 +1227,24 @@ def _python_process_payloads(source: str) -> Optional[tuple[list[str | list[str]
         }
         if not (is_system or is_subprocess):
             continue
+        shell_mode = _python_subprocess_shell_mode(node) if is_subprocess else True
+        if shell_mode is None:
+            return None
         argument = node.args[0] if node.args else next(
             (kw.value for kw in node.keywords if kw.arg == ("command" if is_system else "args")),
             None,
         )
-        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-            payloads.append(argument.value)
-        elif is_subprocess and isinstance(argument, (ast.List, ast.Tuple)) and argument.elts:
-            argv = []
-            for item in argument.elts:
-                if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
-                    return None
-                argv.append(item.value)
+        payload = _python_literal_process_operand(argument, is_subprocess, shell_mode)
+        if payload is None:
+            return None
+        payloads.append(payload)
+        if isinstance(argument, (ast.List, ast.Tuple)):
             if argument.end_lineno is None or argument.end_col_offset is None:
                 return None
-            payloads.append(argv)
             # Keep data out of shell re-tokenization. This is not a coverage
             # verdict: the consumer must finish inspection or explicitly refuse.
             data_spans.append((offsets[argument.lineno - 1] + argument.col_offset,
                                offsets[argument.end_lineno - 1] + argument.end_col_offset))
-        else:
-            return None
     raw = source.encode("utf-8")
     parts = []
     previous = 0

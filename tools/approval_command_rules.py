@@ -11,9 +11,13 @@ import shlex
 from tools.approval_detection import (
     _bash_exec_payload,
     _BASH_OPTIONS_WITH_ARG,
+    _COMMAND_WRAPPER_NON_EXECUTING_OPTIONS,
+    _COMMAND_WRAPPER_OPTIONS_WITH_ARG,
+    _COMMAND_WRAPPER_POSITIONAL_ARGS,
     _COMMAND_WRAPPER_WORDS,
     _command_parser_limit_exceeded,
     _ENV_ASSIGNMENT_RE,
+    _env_split_payload,
     _iter_shell_command_starts,
     _iter_top_level_shell_segments,
     _MALFORMED_EXEC_DESCRIPTION,
@@ -21,7 +25,6 @@ from tools.approval_detection import (
     _scan_shell,
     _shell_tokens_with_spans,
     _splice,
-    _SUDO_OPTIONS_WITH_ARG,
 )
 
 _SHELLS = {"bash", "sh", "zsh", "ksh", "dash"}
@@ -67,6 +70,55 @@ def _command_tokens(command: str, start: int) -> list[str]:
     return [command[start + a:start + b] for _, a, b, _ in tokens]
 
 
+def _wrapper_option_ownership(wrapper: str, word: str, source: str, start: int):
+    """Use native wrapper ownership; split argv never becomes shell source."""
+    option = word.split("=", 1)[0]
+    if wrapper == "env" and (option == "--split-string" or word.startswith("-S")):
+        tokens = [_literal_word(raw) for raw in _command_tokens(source, start)]
+        if _env_split_payload(tokens) is None:
+            raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+        return True, False
+    query = option in _COMMAND_WRAPPER_NON_EXECUTING_OPTIONS.get(wrapper, set())
+    query |= wrapper == "command" and not option.startswith("--") and bool(set(option[1:]) & {"v", "V"})
+    skip_arg = "=" not in word and option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG.get(wrapper, set())
+    return query, skip_arg
+
+
+def _walk_command_words(source: str, start: int, tokens: list):
+    wrapper, wrapper_start, positionals = None, start, 0
+    options, skip_arg = True, False
+    for index, (_, a, b, _) in enumerate(tokens):
+        if index >= 12:
+            raise CommandDenyParseError(_PARSER_LIMIT_DESCRIPTION)
+        raw = source[start + a:start + b]
+        word = _literal_word(raw)
+        if skip_arg:
+            skip_arg = False
+            continue
+        if wrapper and options and word == "--":
+            options = False
+            continue
+        if wrapper and options and word.startswith("-"):
+            stop, skip_arg = _wrapper_option_ownership(wrapper, word, source, wrapper_start)
+            if stop:
+                break
+            continue
+        if positionals:
+            positionals -= 1
+            continue
+        if raw in _CONTROL_PREFIXES or _ENV_ASSIGNMENT_RE.fullmatch(word):
+            continue
+        yield start + a, start + b, raw
+        name = os.path.basename(word)
+        if name not in _COMMAND_WRAPPER_WORDS:
+            break
+        wrapper, wrapper_start, options = name, start + a, True
+        positionals = _COMMAND_WRAPPER_POSITIONAL_ARGS.get(name, 0)
+    else:
+        if skip_arg or positionals:
+            raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+
+
 def _command_words(source: str):
     # A case arm's closing delimiter starts a command, just like a subshell's
     # opening delimiter. Keep this stricter traversal local to the opt-in rule.
@@ -82,34 +134,7 @@ def _command_words(source: str):
         tokens = _shell_tokens_with_spans(source[start:end], 0)
         if tokens is None:
             raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
-        wrapper = None
-        skip_arg = False
-        for index, (_, a, b, _) in enumerate(tokens):
-            if index >= 12:
-                raise CommandDenyParseError(_PARSER_LIMIT_DESCRIPTION)
-            raw = source[start + a:start + b]
-            word = _literal_word(raw)
-            if skip_arg:
-                skip_arg = False
-                continue
-            if wrapper and word == "--":
-                wrapper = None
-                continue
-            if wrapper and word.startswith("-"):
-                if wrapper == "command" and word in {"-v", "-V"}:
-                    break  # Lookup, not invocation.
-                skip_arg = wrapper in {"sudo", "env"} and word in _SUDO_OPTIONS_WITH_ARG
-                continue
-            if raw in _CONTROL_PREFIXES or _ENV_ASSIGNMENT_RE.fullmatch(word):
-                continue
-            yield start + a, start + b, raw
-            name = os.path.basename(word)
-            if name not in _COMMAND_WRAPPER_WORDS:
-                break
-            wrapper = name
-        else:
-            if skip_arg:
-                raise CommandDenyParseError(_MALFORMED_EXEC_DESCRIPTION)
+        yield from _walk_command_words(source, start, tokens)
 
 
 def _shell_stdin_source(header: str) -> bool:
@@ -428,13 +453,17 @@ def match_command_deny(command: str, selectors: list[str]) -> str | None:
                 name = os.path.basename(_literal_word(raw_word))
                 selected = [(selector, matcher) for selector in selectors
                             for names, matcher in [COMMAND_DENY_SELECTORS[selector]] if name in names]
-                if not selected and name not in {"eval"} | _SHELLS:
+                if not selected and name not in {"eval", "env"} | _SHELLS:
                     continue
                 tokens = _command_tokens(payload, start)
                 for selector, matcher in selected:
                     if matcher(tokens[1:]):
                         return selector
-                if name in _SHELLS:
+                if name == "env":
+                    nested = _env_split_payload([_literal_word(arg) for arg in tokens])
+                    if nested is not None:
+                        pending.append(nested)
+                elif name in _SHELLS:
                     found, nested = _bash_exec_payload([_literal_word(arg) for arg in tokens[1:]])
                     if found:
                         if nested is None:

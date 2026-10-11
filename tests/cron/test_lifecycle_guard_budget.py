@@ -366,3 +366,31 @@ def test_default_budget_admits_a_wide_benign_wrapper_graph(tmp_path):
     evil.write_text("hermes gateway restart\n", encoding="utf-8")
     hub.write_text(hub.read_text() + f"bash {shlex.quote(str(evil))}\n", encoding="utf-8")
     assert guard(f"bash {shlex.quote(str(hub))}") is True
+
+
+@pytest.mark.parametrize("callee", ["run", "Popen", "call", "check_call", "check_output"])
+@pytest.mark.parametrize("modifier", ["shell=True", "shell=use_shell", "**options"])
+def test_python_subprocess_shell_ownership_cannot_certify_literal_list(
+    callee, modifier, tmp_path,
+):
+    call = f"subprocess.{callee}(['hermes gateway restart'], {modifier})"
+    command = "python3 - <<'PY'\nimport subprocess\n" + call + "\nPY"
+    assert guard(command, cwd=str(tmp_path)) is True
+
+
+@pytest.mark.parametrize("callee", ["run", "Popen", "call", "check_call", "check_output"])
+def test_python_subprocess_false_shell_keeps_argument_text_as_data(callee, tmp_path):
+    call = f"subprocess.{callee}(['printf', '%s', 'hermes gateway restart'], shell=False)"
+    command = "python3 - <<'PY'\nimport subprocess\n" + call + "\nPY"
+    assert guard(command, cwd=str(tmp_path)) is False
+
+
+@pytest.mark.platforms("posix")
+def test_python_true_shell_sequence_only_executes_first_operand(tmp_path):
+    command = "python3 - <<'PY'\nsubprocess.run(['printf ok', 'hermes gateway restart'], shell=True)\nPY"
+    assert guard(command, cwd=str(tmp_path)) is False
+
+
+def test_python_subprocess_positional_shell_modifier_is_execution(tmp_path):
+    command = "python3 - <<'PY'\nsubprocess.Popen(['hermes gateway restart'], -1, None, None, None, None, None, True, True)\nPY"
+    assert guard(command, cwd=str(tmp_path)) is True
