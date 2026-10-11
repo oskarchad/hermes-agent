@@ -41,10 +41,11 @@ def _prepare_spawn(monkeypatch, tmp_path):
 
     root = tmp_path / ".hermes"
     (root / "profiles" / "patch").mkdir(parents=True)
+    (root / "profiles" / "patch" / "config.yaml").write_text("{}\n", encoding="utf-8")
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
 
     workspace = tmp_path / "workspace"
@@ -74,7 +75,7 @@ def test_systemd_owned_dispatcher_spawns_worker_in_sibling_scope(monkeypatch, tm
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
 
-    pid = kb._default_spawn(_make_task(kb), str(workspace))
+    pid = kbd._default_spawn(_make_task(kb), str(workspace))
 
     assert pid == 4242
     assert captured["cmd"][:4] == [
@@ -109,7 +110,7 @@ def test_systemd_owned_dispatcher_fails_closed_when_scope_is_unavailable(
     monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
 
     with pytest.raises(RuntimeError, match="systemd scope.*unavailable"):
-        kb._default_spawn(_make_task(kb), str(workspace))
+        kbd._default_spawn(_make_task(kb), str(workspace))
 
 
 @pytest.mark.platforms("linux")
