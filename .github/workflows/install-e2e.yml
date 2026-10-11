@@ -1,110 +1,178 @@
-name: Install & Update E2E
-
-# Can a user on a released version get to this commit?
-#
-# For each release we sample, a leg installs that release through the real
-# `curl | install.sh` one-liner (uv, a managed Python, Node, the venv) inside
-# scripts/dev-sandbox.sh, then applies one update route and requires the
-# checkout to land on this commit with a working `hermes`.
-#
-# The starting versions are chosen at runtime from the repo's release tags
-# (scripts/sandbox/pick-release-tags.sh): newest, oldest, and a spread between.
-# A hardcoded list would stop covering the newest release the day after it
-# ships, and would pin an "oldest" that nobody still runs.
-#
-# Triggers:
-#   * every 12 hours, so upstream drift (a new uv, a Node bump, a PyPI change)
-#     surfaces on a schedule rather than in someone's review cycle;
-#   * when a release tag is created -- the moment the set of versions users can
-#     update FROM changes, and the moment a broken updater would strand them;
-#   * manually, where you can pick the route and how many releases to sample.
-#
-# Deliberately NOT on pull_request: a leg takes ~11 minutes of real toolchain
-# installation, and the matrix multiplies that. Updating is release-shaped work,
-# so it is gated on releases and the clock instead.
-
+# DRAFT: replace ONLY .github/workflows/install-e2e.yml on a temporary
+# validation-carrier branch based on the fork's default branch. Do not put this
+# file on candidate/main; do not dispatch ci.yaml or reusable tests.yml.
+name: Focused Hermes Linux validation
 on:
   workflow_dispatch:
     inputs:
-      route:
-        description: 'Which update route to exercise.'
-        required: false
-        type: choice
-        default: both
-        options: [both, update, installer]
-      tag-count:
-        description: 'How many release tags to sample (newest, oldest, and a spread between).'
-        required: false
+      candidate-sha:
+        description: Immutable full 40-character integrated candidate SHA in this public fork
         type: string
-        default: '5'
-  schedule:
-    # Every 12 hours, off the hour to avoid the top-of-hour runner crunch.
-    - cron: '20 7,19 * * *'
-  push:
-    tags:
-      # Release tags only: the repo also carries backup/* and one-off tags.
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+'
-
+        required: true
 permissions:
   contents: read
-
 concurrency:
-  group: install-e2e-${{ github.ref }}
-  cancel-in-progress: true
-
+  group: hermes-focused-linux-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  # Which released versions do we test updating FROM? Resolved once and shared
-  # by both route matrices, so the two routes cover the same set.
-  pick-releases:
-    name: Pick release tags
+  focused-linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      tags: ${{ steps.pick.outputs.tags }}
+    timeout-minutes: 30
+    env:
+      HERMES_CANDIDATE_SHA: ${{ inputs.candidate-sha }}
     steps:
-      # This job only reads tag names and runs one script, so take the cheap
-      # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
-      # -- they are the whole input, and the default shallow checkout has none.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          filter: blob:none
-          fetch-tags: true
-          sparse-checkout: scripts/sandbox/pick-release-tags.sh
-          sparse-checkout-cone-mode: false
-      - id: pick
+      - name: Validate immutable input
+        shell: bash
         run: |
           set -euo pipefail
-          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
-          echo "Testing updates from: $tags"
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          [[ "$HERMES_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - name: Checkout exact candidate; never persist authentication
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          repository: oskarchad/hermes-agent
+          ref: ${{ inputs.candidate-sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Provision pinned PM Python and isolated test environment
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: python
+          extras: '["all","messaging"]'
+          test-environment: 'true'
+          archive-inputs: 'false'
+          cache: 'false'
+          cache-python: 'false'
+          cache-node: 'false'
+          save-tools-cache: 'false'
+          save-python-cache: 'false'
+          save-node-cache: 'false'
+      - name: Run only retained overlay Linux contracts
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          # Draft runner for a disposable GitHub-hosted Linux job. Never run on Hermes.
+          set -euo pipefail
+          : "${HERMES_CANDIDATE_SHA:?full candidate SHA is required}"
+          : "${HERMES_PYTHON:?canonical setup-pm test interpreter is required}"
+          : "${RUNNER_TEMP:?disposable GitHub runner is required}"
+          : "${RUNNER_ENVIRONMENT:?runner environment is required}"
+          [[ "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "${RUNNER_OS:-}" == Linux ]]
+          [[ "$HERMES_CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$HERMES_CANDIDATE_SHA" ]]
+          [[ ! -e "$HOME/.hermes" ]]
+          [[ "${HERMES_HOME:-}" == "$RUNNER_TEMP/setup-pm" ]]
+          [[ "${HERMES_RUNTIME_DIR:-}" == "$RUNNER_TEMP/setup-pm/tools" ]]
+          git diff --quiet
+          git diff --cached --quiet
 
-  # `hermes update` -- the route most users take.
-  update:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'installer'
-    needs: pick-releases
-    strategy:
-      # One release breaking is worth knowing about even if another already
-      # failed, so let every leg report.
-      fail-fast: false
-      matrix:
-        install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
-    uses: ./.github/workflows/install-e2e-run.yml
-    with:
-      route: update
-      install-ref: ${{ matrix.install-ref }}
+          # Do not print process environments, profile config, credentials or histories.
+          "$HERMES_PYTHON" - <<'PY_PREFLIGHT'
+          import os, sqlite3, sys
+          from pathlib import Path
+          import pytest
+          import hermes_state_wal
+          assert sys.platform == "linux", sys.platform
+          assert sys.version_info[:2] == (3, 14), sys.version_info[:2]
+          assert Path(sys.executable).resolve().is_relative_to(Path(os.environ["RUNNER_TEMP"]).resolve())
+          assert not hermes_state_wal.is_sqlite_wal_reset_vulnerable()
+          print(f"Python {sys.version.split()[0]}; SQLite {sqlite3.sqlite_version}; WAL-reset safe")
+          PY_PREFLIGHT
 
-  # Re-running the curl one-liner over an existing checkout: autostash + pull
-  # rather than the updater's own git handling.
-  installer:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'update'
-    needs: pick-releases
-    strategy:
-      fail-fast: false
-      max-parallel: 3
-      matrix:
-        install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
-    uses: ./.github/workflows/install-e2e-run.yml
-    with:
-      route: installer
-      install-ref: ${{ matrix.install-ref }}
+          selected=(
+            tests/hermes_cli/test_kanban_worker_registration.py
+            tests/hermes_cli/test_kanban_worker_cgroup_isolation.py
+            tests/hermes_cli/test_kanban_worker_pid_fingerprint.py
+            tests/hermes_cli/test_kanban_worker_spawn_toolsets.py
+            tests/hermes_cli/test_kanban_task_toolsets.py
+            tests/hermes_cli/test_kanban_review_lifecycle_complete.py
+            tests/hermes_cli/test_gateway_restart_loop.py
+            tests/hermes_cli/test_kanban_gateway_restart_handoff.py
+            tests/tools/test_process_registry.py
+            tests/tools/test_process_registry_completion_races.py
+            tests/tui_gateway/test_kanban_captain_inbox.py
+            tests/tui_gateway/test_kanban_captain_signals.py
+            tests/tui_gateway/test_captain_prompt_contract.py
+            tests/cron/test_explicit_delivery_routes.py
+            tests/cron/test_cron_multiplex_shared_route_delivery.py
+            tests/cron/test_cron_relay_delivery_guards.py
+            tests/cron/test_bot_chat_delivery_child_env.py
+            tests/cron/test_lifecycle_guard_live_db.py
+            tests/cron/test_lifecycle_guard_heredoc_walk.py
+            tests/cron/test_lifecycle_guard_budget.py
+            tests/tools/test_approval_command_rules.py
+            tests/tools/test_execution_flag_detection.py
+            tests/tools/test_headless_helper_flow.py
+            tests/tools/test_mcp_oauth.py
+            tests/tools/test_mcp_oauth_single_attempt.py
+            tests/tools/test_mcp_oauth_callback_latch.py
+            tests/tools/test_mcp_oauth_stdin_console.py
+            tests/gateway/test_gateway_mcp_oauth_unattended.py
+            tests/tui_gateway/test_mcp_oauth_cancel.py
+            tests/tools/test_snapshot_session_id_leak.py
+          )
+          for selected_path in "${selected[@]}"; do
+            [[ -f "$selected_path" ]] || { printf 'Missing required test: %s\n' "$selected_path" >&2; exit 1; }
+          done
+
+          # No retries: a first-attempt process/race failure must remain visible.
+          export HERMES_TEST_FILE_RETRIES=0
+          export HERMES_TEST_WORKERS=3
+          export HERMES_TEST_FILE_TIMEOUT=180
+          result_dir="$RUNNER_TEMP/hermes-focused-results"
+          mkdir -p "$result_dir"
+          printf '%s\n' "${selected[@]}" > "$result_dir/selected-tests.txt"
+          printf '%s\n' "$HERMES_CANDIDATE_SHA" > "$result_dir/candidate-sha.txt"
+          # Linux TTY evidence needs JUnit: the native file-parallel runner suppresses
+          # successful per-node stdout. Run this file once, then the other29 once.
+          oauth_file=tests/tools/test_mcp_oauth_single_attempt.py
+          remaining=()
+          for selected_path in "${selected[@]}"; do
+            [[ "$selected_path" == "$oauth_file" ]] || remaining+=("$selected_path")
+          done
+          set +e
+          bash scripts/run_tests.sh -j 1 --file-timeout 180 "$oauth_file" -- -v --tb=short -rA \
+            --junitxml="$result_dir/oauth-tty.xml" 2>&1 | tee "$result_dir/oauth-tty.log"
+          oauth_status=${PIPESTATUS[0]}
+          bash scripts/run_tests.sh -j 3 --file-timeout 180 "${remaining[@]}" -- -v --tb=short -rA \
+            2>&1 | tee "$result_dir/test.log"
+          test_status=${PIPESTATUS[0]}
+          set -e
+          # Require the two Linux-only callback/TTY nodes to pass, not skip or vanish.
+          if [[ "$oauth_status" == 0 ]]; then
+            "$HERMES_PYTHON" - "$result_dir/oauth-tty.xml" <<'PY_TTY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          expected = {
+              "test_tty_paste_callback_completes_and_releases_listener",
+              "test_loopback_callback_stops_tty_reader_before_next_flow_input",
+          }
+          observed = set()
+          for case in root.iter("testcase"):
+              if case.get("name") in expected:
+                  assert not any(case.find(tag) is not None for tag in ("skipped", "failure", "error")), case.get("name")
+                  observed.add(case.get("name"))
+          assert observed == expected, observed
+          print("Both required Linux TTY nodes passed")
+          PY_TTY
+          fi
+          [[ "$oauth_status" == 0 ]] || test_status="$oauth_status"
+          # A green job must still represent the immutable candidate's tracked bytes.
+          git diff --quiet || test_status=1
+          git diff --cached --quiet || test_status=1
+          printf '%s\n' "$test_status" > "$result_dir/exit-status.txt"
+          {
+            printf 'Candidate: `%s`\n\n' "$HERMES_CANDIDATE_SHA"
+            printf 'Workflow carrier: `%s`\n\n' "${GITHUB_SHA:-unavailable}"
+            printf 'Run: `%s`, attempt `%s`\n\n' "${GITHUB_RUN_ID:-unavailable}" "${GITHUB_RUN_ATTEMPT:-unavailable}"
+            printf 'Focused files: %s; workers: 3; retries: 0; exit: %s\n' "${#selected[@]}" "$test_status"
+          } >> "${GITHUB_STEP_SUMMARY:-$result_dir/summary.md}"
+          exit "$test_status"
+      - name: Preserve only focused result receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-focused-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hermes-focused-results/
+          if-no-files-found: ignore
+          retention-days: 7
