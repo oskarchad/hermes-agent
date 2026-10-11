@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -24,6 +25,10 @@ from typing import Iterable
 from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
+
+_WorkerIdentity = tuple[str, Optional[int], Optional[int], Optional[str]]
+
+from toolsets import KANBAN_TASK_TOOLSETS_BOUNDED_ENV
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
@@ -364,56 +369,6 @@ def _pid_alive(pid: Optional[int]) -> bool:
 UNVERIFIED_WORKER_FINGERPRINT = "unverified"
 
 
-def _process_fingerprint(pid: int) -> Optional[str]:
-    """Restart-stable identity of a live process: ``"<instantiation epoch>|<start time>"``. The start
-    time alone (``/proc/<pid>/stat`` field 22 on Linux) is clock ticks since THIS boot, so a row that
-    survives a reboot could match an unrelated process with the same PID and the same tick value;
-    ``gateway.drain_control.current_instantiation_epoch`` (``boot_id`` + PID-1 start) changes on every
-    reboot / container recreate, so the composed value never survives one. ``None`` when unreadable."""
-    from gateway.drain_control import current_instantiation_epoch
-    from gateway.status import get_process_start_time
-    start = get_process_start_time(int(pid))
-    if start is None:
-        return None
-    return f"{current_instantiation_epoch()}|{start}"
-
-
-def _worker_alive(pid: Optional[int], started_at) -> bool:
-    """True when ``pid`` is live AND is still the worker we spawned. ``started_at`` is the fingerprint
-    recorded by ``_set_worker_pid``; after a reboot (or any PID recycle) an unrelated process can own
-    the number, so bare existence is never enough to extend a claim or to signal. A legacy row without
-    a fingerprint keeps the existence answer: killing it is the pre-fingerprint behaviour and the row is
-    rewritten with a fingerprint on its next spawn. An UNVERIFIED spawn also keeps the existence answer
-    (a claim is never released beside a possibly-live worker) but ``_terminate_reclaimed_worker``
-    refuses to signal it."""
-    if not _kb._pid_alive(pid):
-        return False
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        return True
-    return not _pid_recycled(pid, started_at)
-
-
-def _pid_recycled(pid: Optional[int], started_at) -> bool:
-    """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
-    longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
-    if started_at is None or not pid:
-        return False
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        return True
-    if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
-    from gateway.status import _start_times_agree, get_process_start_time
-    current = get_process_start_time(int(pid))
-    if current is None:
-        return True
-    try:
-        return not _start_times_agree(current, started_at)
-    except (TypeError, ValueError):
-        return True
-
-
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
     """``signal_fn`` test hook, else ``os.kill`` when the platform has one."""
     if signal_fn is not None:
@@ -438,67 +393,6 @@ def _sigkill(kill, pid: int) -> bool:
         return True
     except (ProcessLookupError, OSError):
         return False
-
-
-def _terminate_reclaimed_worker(
-    pid: Optional[int],
-    claim_lock: Optional[str],
-    *,
-    signal_fn=None,
-    started_at=None,
-) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
-    fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
-    signalled — the worker is gone, which is what the reclaim wanted (``terminated`` = True). An
-    UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
-    it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
-    spawning a duplicate beside it."""
-    info: dict[str, Any] = {
-        "prev_pid": int(pid) if pid else None,
-        "host_local": False,
-        "termination_attempted": False,
-        "terminated": False,
-        "sigkill": False,
-    }
-    if not pid or pid <= 0 or not claim_lock:
-        return info
-    if not str(claim_lock).startswith(_kb._host_prefix()):
-        return info
-    info["host_local"] = True
-
-    kill = _kill_fn(signal_fn)
-    if kill is None:
-        return info
-    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
-        # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
-        info["signal_refused"] = True
-        info["terminated"] = not _kb._pid_alive(pid)
-        return info
-    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
-        info["terminated"] = True
-        info["pid_recycled"] = True
-        return info
-
-    info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Already gone = successful termination. Leaving terminated=False would
-        # make the reclaim guard misread a dead worker as alive and defer forever.
-        info["terminated"] = True
-        return info
-    except OSError:
-        return info
-
-    if _poll_worker_exit(pid, started_at):
-        info["terminated"] = True
-        return info
-    if _worker_alive(pid, started_at):
-        if not _sigkill(kill, pid):
-            return info
-        info["sigkill"] = True
-    info["terminated"] = not _worker_alive(pid, started_at)
-    return info
 
 
 def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
@@ -570,7 +464,7 @@ def _worker_survived_termination(termination: dict) -> bool:
     return bool(
         termination.get("host_local")
         and (termination.get("termination_attempted") or termination.get("signal_refused"))
-        and not termination.get("terminated")
+        and not _worker_cleanup_verified(termination)
     )
 
 
@@ -582,29 +476,47 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    expected_identity: Optional[_WorkerIdentity] = None,
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
     Extends ``claim_expires`` by ``RECLAIM_DEFER_GRACE_SECONDS`` so the task
-    stays ``running`` (no duplicate spawn) and records ``reclaim_deferred``.
-    The next tick retries the kill; not spawning a duplicate is what lets the
-    throttled worker finally die.
+    stays ``running`` (no duplicate spawn) and records a ``reclaim_deferred``
+    event so the hold is visible in ``hermes kanban tail``. The next dispatch
+    tick retries the kill; this is self-correcting because not spawning a
+    duplicate is what lets the throttled worker finally die.
     """
     grace = now + _kb.RECLAIM_DEFER_GRACE_SECONDS
     with _kb.write_txn(conn):
-        cur = conn.execute(
+        sql = (
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
-            (grace, task_id, claim_lock),
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?"
         )
+        params: list[Any] = [grace, task_id, claim_lock]
+        if expected_identity is not None:
+            expected_task, expected_run, expected_pid, expected_lock = expected_identity
+            if expected_task != task_id or expected_lock != claim_lock:
+                return
+            sql += " AND current_run_id IS ? AND worker_pid IS ?"
+            params.extend((expected_run, expected_pid))
+        cur = conn.execute(sql, tuple(params))
         if cur.rowcount != 1:
             return
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
-            conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (grace, run_id))
-        payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
+            conn.execute(
+                "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                (grace, run_id),
+            )
+        payload = {
+            "reason": reason,
+            "claim_lock": claim_lock,
+            "claim_expires_now": grace,
+        }
         payload.update(termination)
-        _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+        _kb._append_event(
+            conn, task_id, "reclaim_deferred", payload, run_id=run_id,
+        )
 
 
 def heartbeat_worker(
@@ -645,20 +557,18 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
-    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
-
-    SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
-    task's source phase so the next tick re-spawns the same kind of worker —
-    unless the circuit breaker already gave up, leaving it blocked. Host-local
-    only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
-    """
+def enforce_max_runtime(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[str]:
+    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed."""
     timed_out: list[str] = []
     now = int(time.time())
-    host_prefix = _kb._host_prefix()
+    host_prefix = f"{_kb._claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -671,72 +581,69 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
-        # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
-        # so retries must be measured from the active task_runs row.
         elapsed = now - int(row["active_started_at"])
-        limit = int(row["max_runtime_seconds"])
-        if elapsed < limit:
+        if elapsed < int(row["max_runtime_seconds"]):
             continue
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        started_at = _kb._row_get(row, "worker_started_at")
-        if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
-            # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
-            # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
-            _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
-                             "identity; not signalled", tid, pid)
+        run_id: Optional[int] = None
+        snapshot_run = row["current_run_id"]
+        expected_identity: _WorkerIdentity = (tid, snapshot_run, pid, row["claim_lock"])
+        guard_sql, guard_params = _worker_identity_guard(tid, expected_identity)
+        term_fn = getattr(_kb, "_terminate_reclaimed_worker", _terminate_reclaimed_worker)
+        scope_exp_fn = getattr(_kb, "_worker_scope_expected", _worker_scope_expected)
+        scope_unit_fn = getattr(_kb, "_worker_scope_unit", _worker_scope_unit)
+        termination = term_fn(
+            pid,
+            row["claim_lock"],
+            signal_fn=signal_fn,
+            scope_expected=scope_exp_fn(conn, tid, run_id=snapshot_run),
+            scope_unit=scope_unit_fn(conn, tid, run_id=snapshot_run),
+            started_at=_kb._row_get(row, "worker_started_at"),
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                row["claim_lock"],
+                now,
+                termination,
+                reason="max_runtime_worker_alive",
+                expected_identity=expected_identity,
+            )
             continue
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone.
-        killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
-                killed = _sigkill(kill, pid)
 
-        error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ?" + guard_sql,
+                (retry_status, tid, pid, row["claim_lock"], *guard_params),
             )
             if cur.rowcount == 1:
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
-                    "limit_seconds": limit,
-                    "sigkill": killed,
+                    "limit_seconds": int(row["max_runtime_seconds"]),
                     "retry_status": retry_status,
                 }
+                payload.update(termination)
                 run_id = _kb._end_run(
-                    conn, tid, outcome="timed_out", status="timed_out",
-                    error=error, metadata=payload,
+                    conn, tid,
+                    outcome="timed_out", status="timed_out",
+                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
+                    metadata=payload,
                 )
-                _kb._append_event(conn, tid, "timed_out", payload, run_id=run_id)
+                _kb._append_event(
+                    conn, tid, "timed_out", payload, run_id=run_id,
+                )
                 timed_out.append(tid)
-        # Outside the write_txn above because ``_record_task_failure`` opens its
-        # own. If the breaker trips this flips the task to ``blocked`` and emits
-        # ``gave_up`` on top of the ``timed_out`` already emitted.
-        if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=error,
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
-            )
+        if run_id is not None:
+            _record_task_failure(conn, tid, f"max_runtime: elapsed {int(elapsed)}s", outcome="timed_out")
     return timed_out
 
 
@@ -748,58 +655,56 @@ _STALE_HEARTBEAT_GAP_SECONDS = 3600
 def detect_stale_running(
     conn: sqlite3.Connection,
     *,
-    stale_timeout_seconds: int = 0,
+    stale_timeout_seconds: Optional[int] = None,
     signal_fn=None,
 ) -> list[str]:
-    """Reclaim ``running`` tasks with no heartbeat progress; returns their ids.
-
-    Stale = running longer than ``stale_timeout_seconds`` (active run's
-    ``started_at``, else ``tasks.started_at``) AND ``last_heartbeat_at`` NULL or
-    older than ``_STALE_HEARTBEAT_GAP_SECONDS``. Task returns to its source
-    phase, run closes ``outcome='stale'``, a live host-local worker is killed.
-    ``0`` disables the check; ``signal_fn`` is a test hook. Deliberately NOT
-    counted via ``_record_task_failure``: an absent heartbeat is not a worker
-    failure, and counting it would let long-running tasks trip the breaker.
-    """
-    if stale_timeout_seconds <= 0:
-        return []
-
+    """Reclaim tasks whose workers stopped sending heartbeats while running."""
+    timeout = stale_timeout_seconds if stale_timeout_seconds is not None else 14400
+    gap = timeout + _STALE_HEARTBEAT_GAP_SECONDS
     now = int(time.time())
     reclaimed: list[str] = []
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status = 'running' "
+        "  AND t.claim_lock IS NOT NULL "
+        "  AND t.claim_lock LIKE ? "
+        "  AND ( "
+        "    (t.last_heartbeat_at IS NOT NULL AND t.last_heartbeat_at < ?) "
+        "    OR (t.last_heartbeat_at IS NULL AND COALESCE(r.started_at, t.started_at) < ?) "
+        "  )",
+        (f"{_kb._host_prefix()}%", now - gap, now - gap),
     ).fetchall()
 
     for row in rows:
-        if row["active_started_at"] is None:
-            continue
-        elapsed = now - int(row["active_started_at"])
-        if elapsed < stale_timeout_seconds:
-            continue
-
-        last_hb = row["last_heartbeat_at"]
-        hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
-            continue
-
-        pid = row["worker_pid"]
         tid = row["id"]
+        pid = row["worker_pid"]
         lock = row["claim_lock"] or ""
 
-        termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+        snapshot_run = row["current_run_id"]
+        expected_identity: _WorkerIdentity = (tid, snapshot_run, pid, row["claim_lock"])
+        guard_sql, guard_params = _worker_identity_guard(tid, expected_identity)
+        term_fn = getattr(_kb, "_terminate_reclaimed_worker", _terminate_reclaimed_worker)
+        scope_exp_fn = getattr(_kb, "_worker_scope_expected", _worker_scope_expected)
+        scope_unit_fn = getattr(_kb, "_worker_scope_unit", _worker_scope_unit)
+        termination = term_fn(
+            pid,
+            lock,
+            signal_fn=signal_fn,
+            scope_expected=scope_exp_fn(conn, tid, run_id=snapshot_run),
+            scope_unit=scope_unit_fn(conn, tid, run_id=snapshot_run),
+            started_at=_kb._row_get(row, "worker_started_at"),
+        )
 
-        # Never release a claim while our own worker is still alive: that would
-        # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
+                expected_identity=expected_identity,
             )
             continue
 
@@ -807,38 +712,29 @@ def detect_stale_running(
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                "  AND claim_lock IS ?" + guard_sql,
+                (retry_status, tid, row["claim_lock"], *guard_params),
             )
             if cur.rowcount != 1:
                 continue
-
-            payload = {
-                "elapsed_seconds": int(elapsed),
-                "last_heartbeat_at": _kb._opt_int(last_hb),
-                "heartbeat_age_seconds": _kb._opt_int(hb_age),
-                "timeout_seconds": stale_timeout_seconds,
-                "pid": int(pid) if pid else None,
-                "retry_status": retry_status,
-            }
-            payload.update(termination)
-
+            error_msg = f"heartbeat stale: no heartbeat for >{gap}s"
             run_id = _kb._end_run(
                 conn, tid,
-                outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
-                metadata=payload,
+                outcome="heartbeat_timeout", status="timed_out",
+                error=error_msg,
+                metadata={"gap_seconds": gap, "last_heartbeat_at": row["last_heartbeat_at"], **termination},
             )
-            _kb._append_event(conn, tid, "stale", payload, run_id=run_id)
+            _kb._append_event(
+                conn, tid, "heartbeat_timeout",
+                {"gap_seconds": gap, "last_heartbeat_at": row["last_heartbeat_at"], "retry_status": retry_status, **termination},
+                run_id=run_id,
+            )
             reclaimed.append(tid)
 
+        _record_task_failure(conn, tid, f"heartbeat_timeout: {gap}s gap", outcome="timed_out")
     return reclaimed
 
 
@@ -1146,35 +1042,84 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
+    now = int(time.time())
+    host_prefix = _kb._host_prefix()
+    cleanup_ready: dict[str, tuple[_WorkerIdentity, dict[str, Any]]] = {}
+
+    cleanup_rows = conn.execute(
+        "SELECT id, current_run_id, worker_pid, worker_started_at, claim_lock, started_at FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    for row in cleanup_rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        started_at = row["started_at"]
+        grace_fn = getattr(_kb, "_resolve_crash_grace_seconds", _kb._resolve_crash_grace_seconds)
+        if started_at is not None and now - int(started_at) < grace_fn():
+            continue
+        if _worker_alive(row["worker_pid"], row["worker_started_at"]):
+            continue
+        identity = _worker_identity_from_row(row)
+        term_fn = getattr(_kb, "_terminate_reclaimed_worker", _terminate_reclaimed_worker)
+        scope_exp_fn = getattr(_kb, "_worker_scope_expected", _worker_scope_expected)
+        scope_unit_fn = getattr(_kb, "_worker_scope_unit", _worker_scope_unit)
+        termination = term_fn(
+            int(row["worker_pid"]),
+            row["claim_lock"],
+            started_at=row["worker_started_at"],
+            scope_expected=scope_exp_fn(conn, row["id"], identity[1]),
+            scope_unit=scope_unit_fn(conn, row["id"], identity[1]),
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                row["id"],
+                row["claim_lock"],
+                now,
+                termination,
+                reason="crash_scope_cleanup_incomplete",
+                expected_identity=identity,
+            )
+            continue
+        cleanup_ready[row["id"]] = (identity, termination)
+
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, current_run_id, worker_pid, worker_started_at, claim_lock, "
+            "       started_at, assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
-        host_prefix = _kb._host_prefix()
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
             started_at = _kb._row_get(row, "started_at")
-            if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
+            grace_fn = getattr(_kb, "_resolve_crash_grace_seconds", _kb._resolve_crash_grace_seconds)
+            if started_at is not None and time.time() - started_at < grace_fn():
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+                continue
+
+            cleanup_entry = cleanup_ready.get(row["id"])
+            if cleanup_entry is None:
+                continue
+            cleaned_identity, termination = cleanup_entry
+            if _worker_identity_from_row(row) != cleaned_identity:
                 continue
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
+            dead.event_payload.update(termination)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? AND current_run_id IS ?",
+                (retry_status, row["id"], pid, row["claim_lock"], cleaned_identity[1]),
             )
             if cur.rowcount != 1:
                 continue
@@ -1196,11 +1141,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "retry_status": retry_status,
             })
             if dead.rate_limited or dead.protocol_violation:
-                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
-                # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
@@ -1209,7 +1149,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 sweep.rate_limited.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
-                sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
+                sweep.crash_details.append(
+                    (row["id"], pid, row["claim_lock"], dead)
+                )
     return sweep
 
 
@@ -1465,48 +1407,6 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
-    emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
-    decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
-    persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
-    whose bare-PID kill authority a new spawn must not inherit."""
-    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-    with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                     (int(pid), started_at, task_id))
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
-
-
-def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
-    """Worker-side half of ``_set_worker_pid``, run by the worker before its first model call.
-
-    A dispatcher killed between spawning the worker and ``_set_worker_pid`` leaves the run with no
-    pid: no liveness check can see the worker, so a TTL expiry reclaims the card and spawns a second
-    worker beside it. The worker fills the missing pid itself (``worker_registered``). False when
-    ``run_id`` is no longer the card's live run: the card was reclaimed before this worker got here,
-    and it must exit without working it."""
-    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-    with _kb.write_txn(conn):
-        row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
-                           (task_id,)).fetchone()
-        if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
-            return False
-        # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
-        if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
-            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, task_id))
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, int(run_id)))
-            _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
-                              run_id=int(run_id))
-    return True
-
-
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 
@@ -1551,6 +1451,8 @@ def check_respawn_guard(
         return None
 
     now = int(time.time())
+    if _handoff_worker_teardown_pending(conn, task_id):
+        return "prior_worker_teardown"
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
@@ -1619,31 +1521,28 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    # Only an explicit, unconsumed handoff after the checkpoint permits a
+    # new claim. Comments, recovery and same-second ambiguity grant no authority.
+    continuation = conn.execute(
+        "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind IN ('specified', 'unblocked', 'promoted_manual', 'review_reopened', "
+        "'changes_requested', 'assigned') "
+        "AND (kind != 'specified' OR (json_type(payload, '$.author') = 'text' "
+        "AND TRIM(json_extract(payload, '$.author')) NOT IN ('', 'auto-decomposer'))) "
+        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'claimed'), 0) "
+        "ORDER BY id DESC",
+        (task_id, task_id),
+    ).fetchall()
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
+    for comment in conn.execute(
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
-            continue
-        events = conn.execute(
-            # Strictly after: a same-second tie stays guarded (fail closed).
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
-        ).fetchall()
-        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
-            return None
-        return "active_pr"
+        body = _kb._lossy_text(comment["body"])
+        if body and _RESPAWN_GUARD_PR_URL_RE.search(body):
+            if not any(event["created_at"] > comment["created_at"] and
+                       _is_handoff_event(event["kind"], event["payload"]) for event in continuation):
+                return "active_pr"
 
     return None
 
@@ -2022,6 +1921,42 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _guard_task_toolsets(conn, row, assignee, result, dry_run):
+    task_id = row["id"]
+    _effective_toolsets, _toolsets_error = _validate_task_toolsets_for_spawn(
+        row["enabled_toolsets"], assignee=assignee
+    )
+    if _toolsets_error is not None:
+        blocked = dry_run or _audit_and_block_invalid_task_toolsets(
+            conn,
+            task_id,
+            expected_status=row["status"],
+            expected_assignee=assignee,
+            expected_enabled_toolsets=row["enabled_toolsets"],
+            expected_claim_lock=row["claim_lock"],
+            expected_run_id=row["current_run_id"],
+            expected_worker_pid=row["worker_pid"],
+        )
+        if blocked:
+            result.auto_blocked.append(task_id)
+        return False
+    return True
+
+def _record_nonspawnable_task(conn, task_id, assignee, dry_run):
+    # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
+    # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
+    # condition never expires on its own, so write it once: a repeat only when something
+    # else happened on the card since (reassign, comment) — not one row per tick forever,
+    # and not one row per foreign home per tick on a shared board (#101015).
+    if not dry_run:
+        with _kb.write_txn(conn):
+            last = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+            if (last is None or last["kind"] != "skipped_nonspawnable"
+                    or last["payload"] != _kb._json_or_null({"assignee": assignee})):
+                _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2049,19 +1984,9 @@ def _dispatch_lane_task(
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
-        # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
-        # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
-        # condition never expires on its own, so write it once: a repeat only when something
-        # else happened on the card since (reassign, comment) — not one row per tick forever,
-        # and not one row per foreign home per tick on a shared board (#101015).
-        if not dry_run:
-            with _kb.write_txn(conn):
-                last = conn.execute(
-                    "SELECT kind, payload FROM task_events WHERE task_id = ? "
-                    "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-                if (last is None or last["kind"] != "skipped_nonspawnable"
-                        or last["payload"] != _kb._json_or_null({"assignee": assignee})):
-                    _kb._append_event(conn, task_id, "skipped_nonspawnable", {"assignee": assignee})
+        _record_nonspawnable_task(conn, task_id, assignee, dry_run)
+        return False
+    if not _guard_task_toolsets(conn, row, assignee, result, dry_run):
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
@@ -2123,9 +2048,17 @@ def _dispatch_lane_task(
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+            if not _set_worker_pid(
+                conn,
+                claimed.id,
+                pid,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+            ):
+                _stop_spawn_after_pid_persistence_loss(conn, claimed, pid)
+                return False
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), _kb.get_task(conn, claimed.id).worker_pid if pid else pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
         # spawn would let a task that keeps timing out loop forever. Cleared
         # only on successful completion (complete_task).
@@ -2269,7 +2202,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, status, assignee, enabled_toolsets, claim_lock, current_run_id, worker_pid FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2435,24 +2368,6 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
-
-
-def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
-    """Return ``(rotate_bytes, backup_count)`` for worker log rotation.
-    Defaults: rotate at 2 MiB, keep one backup (``.log.1``); both overridable
-    from ``config.yaml``.
-    """
-    if kanban_cfg is None:
-        try:
-            from hermes_cli.config import load_config
-
-            kanban_cfg = (load_config().get("kanban") or {})
-        except Exception:
-            kanban_cfg = {}
-    kanban_cfg = kanban_cfg or {}
-    max_bytes = _positive_int(kanban_cfg.get("worker_log_rotate_bytes"), DEFAULT_LOG_ROTATE_BYTES, minimum=1)
-    backup_count = _positive_int(kanban_cfg.get("worker_log_backup_count"), DEFAULT_LOG_BACKUP_COUNT, minimum=0)
-    return max_bytes, backup_count
 
 
 def _rotated_log_path(log_path: Path, generation: int) -> Path:
@@ -2743,7 +2658,7 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
-        *_resolve_hermes_argv(),
+        *getattr(_kb, '_resolve_hermes_argv', _resolve_hermes_argv)(),
         "-p", profile_arg,
         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
         # exits 0 without doing the task → "protocol violation" every attempt.
@@ -2768,7 +2683,14 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     # model at a different depth.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
+    if getattr(task, "enabled_toolsets", None) is not None:
+        requested_toolsets = _kb.normalize_enabled_toolsets(
+            task.enabled_toolsets,
+            hermes_home=hermes_home,
+        )
+        worker_toolsets = _kb.effective_task_toolsets(requested_toolsets)
+    else:
+        worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
@@ -2887,6 +2809,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env.pop(KANBAN_TASK_TOOLSETS_BOUNDED_ENV, None)
+    if getattr(task, "enabled_toolsets", None) is not None:
+        env[KANBAN_TASK_TOOLSETS_BOUNDED_ENV] = "1"
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"
@@ -2944,10 +2869,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
+    scoped_cmd = _restart_safe_worker_argv(task, cmd)
+    worker_scoped = scoped_cmd is not cmd
+    cmd = scoped_cmd
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
+    isolation_mode = "systemd_scope" if worker_scoped else "process_session"
+    scope_unit = _kanban_worker_scope_unit(task.id, task.current_run_id) if worker_scoped else None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -2957,7 +2886,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if _kb._IS_WINDOWS else 0,
         )
     except FileNotFoundError:
         log_f.close()
@@ -2969,7 +2898,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # the OS-level FD stays open in the child until it exits.
     if _kb._IS_WINDOWS:
         _live_worker_procs[proc.pid] = proc
-    return proc.pid
+    return _SpawnedWorkerPid(proc.pid, isolation_mode=isolation_mode, scope_unit=scope_unit, started_at=_process_fingerprint(proc.pid) or UNVERIFIED_WORKER_FINGERPRINT)
 
 
 # ---------------------------------------------------------------------------
@@ -3031,8 +2960,60 @@ def run_daemon(
         stop_event.wait(timeout=interval)
 
 
+class _SpawnedWorkerPid(int):
+    """Int-compatible worker PID carrying sanitized spawn audit metadata."""
+
+    isolation_mode: str
+    scope_unit: Optional[str]
+
+    def __new__(
+        cls,
+        pid: int,
+        *,
+        isolation_mode: str,
+        scope_unit: Optional[str],
+        started_at: Optional[str] = None,
+    ):
+        value = int.__new__(cls, int(pid))
+        value.isolation_mode = isolation_mode
+        value.scope_unit = scope_unit
+        value.started_at = started_at
+        return value
+
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_workspace as _kbw
+
+from hermes_cli.kanban_db_worker_ownership import (
+    _process_fingerprint,
+    _worker_alive,
+    _pid_recycled,
+    _terminate_reclaimed_worker,
+    _finish_worker_scope_cleanup,
+    _set_worker_pid,
+    adopt_worker_pid,
+    _validate_task_toolsets_for_spawn,
+    _audit_and_block_invalid_task_toolsets,
+    _signal_owned_worker,
+    _worker_cleanup_verified,
+    _handoff_worker_teardown_pending,
+    _worker_identity_guard,
+    _worker_identity_from_row,
+    _record_spawn_cleanup_failure,
+    _stop_spawn_after_pid_persistence_loss,
+    _systemd_worker_scope_required,
+    _kanban_worker_scope_unit,
+    _stop_kanban_worker_scope,
+    _systemd_worker_scope_state,
+    _systemd_worker_scope_inactive,
+    _systemd_worker_scope_unloaded,
+    _worker_scope_expected,
+    _worker_scope_unit,
+)
+
+from hermes_cli.kanban_db_worker_logs import (
+    worker_log_rotation_config,
+)
