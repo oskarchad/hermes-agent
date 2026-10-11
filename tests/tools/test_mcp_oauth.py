@@ -810,7 +810,7 @@ class TestNonInteractiveFailFastAtCallbackBoundary:
 
         # Binding the callback listener or entering the poll loop is the bug.
         fake_server = MagicMock(side_effect=AssertionError("must not bind callback listener"))
-        monkeypatch.setattr(mod, "HTTPServer", fake_server)
+        monkeypatch.setattr(mod, "ThreadingHTTPServer", fake_server)
 
         async def no_sleep(_seconds):
             raise AssertionError("must not wait for the callback timeout")
@@ -1010,6 +1010,7 @@ class TestWaitForCallbackSkipIntegration:
         mod._oauth_port = _find_free_port()
         monkeypatch.setattr(mod, "_is_interactive", lambda: True)
         monkeypatch.setattr("sys.stdin", MagicMock(readline=lambda: "skip\n"))
+        monkeypatch.setattr(mod, "_read_paste_line", lambda _stop: "skip\n")
 
         async def instant_sleep(_):
             pass
