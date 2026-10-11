@@ -3689,4 +3689,8 @@ for _m in (
     _methods_connectors_account, _methods_display, _methods_display_watch, _methods_onboarding,
     _methods_i18n, _methods_shared_metrics, _methods_start_chat):
     _m.register(sys.modules[__name__])
+from . import captain_turn as _captain_turn
+_captain_turn.register(sys.modules[__name__])
+from . import captain_inbox as _captain_inbox
+_captain_inbox.register(sys.modules[__name__])
 del _m

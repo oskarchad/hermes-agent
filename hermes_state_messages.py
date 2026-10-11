@@ -117,8 +117,13 @@ def _stale_holder(row, now: float) -> bool:
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
 
 
-class SessionMessagesMixin:
+from hermes_state_captain import CaptainMessagesMixin
+
+
+class SessionMessagesMixin(CaptainMessagesMixin):
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
+
+
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
         """Advance the peer's conversation generation past a boundary, in the txn that writes it. Only
@@ -518,6 +523,7 @@ class SessionMessagesMixin:
         except BaseException:
             _restore()
             raise
+
 
     def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str,
                                                  display_kind: str,

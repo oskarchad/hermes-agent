@@ -502,6 +502,11 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    captain_terminal: Any = None
+    captain_attempted: bool = False
+    completion_id: str | None = None
+    require_persisted: bool = False
+    turn_purpose: str = "ordinary"
 
 
 def _adopt_out_of_band_turns(session: dict) -> None:
@@ -995,6 +1000,8 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
             payload["partial"] = True
         if _error_surface:
             payload["error_surface"] = _error_surface
+    _stamp_captain_turn_receipt(session, st, raw, status, payload)
+    _settle_captain_prompt_turn(session, st, status == "complete")
     if st.terminal_callback is not None:
         st.receipt_attempted = True
         st.terminal_callback({
@@ -1020,6 +1027,10 @@ def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseExcept
     print(f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
     # A finalizer exception can leave in-memory history at the turn-start snapshot.
     _restore_agent_history_after_turn_error(session, st.agent)
+    try:
+        _settle_captain_prompt_turn(session, st, False)
+    except Exception:
+        logger.exception("Captain terminal receipt settlement failed")
     if st.terminal_callback is not None and not st.receipt_attempted:
         st.receipt_attempted = True
         try:
@@ -1123,7 +1134,8 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None, on_terminal=None, completion_id: str | None = None,
+    require_persisted: bool = False, turn_purpose: str = "ordinary") -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1168,13 +1180,16 @@ def _run_prompt_submit(
         runtime_session_token = _current_runtime_session_record.set(session)
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
-            receipt_committed=terminal_callback is None)
-        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
+            receipt_committed=terminal_callback is None and on_terminal is None,
+            captain_terminal=on_terminal, completion_id=completion_id,
+            require_persisted=require_persisted, turn_purpose=turn_purpose)
+        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None and on_terminal is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
         try:
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
+                _settle_captain_prompt_turn(session, st, False)
                 if st.terminal_callback is not None and not st.receipt_attempted:
                     st.receipt_attempted = True
                     st.terminal_callback({
@@ -1193,9 +1208,10 @@ def _run_prompt_submit(
                 from tui_gateway.free_tier_task_done import note_task_done
                 note_task_done(session, st.result, st.agent, display_kind)
             _emit("message.complete", sid, payload)
-            goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
-            if status == "complete":
-                _after_complete_turn(sid, session, st, raw)
+            if st.turn_purpose != "captain_report":
+                goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+                if status == "complete":
+                    _after_complete_turn(sid, session, st, raw)
             # Goal judge + loop tick evaluation mutate persisted state AFTER message.complete: publish the
             # structured control snapshot now so the Desktop card never paints the pre-judge turn count.
             _publish_session_control_snapshot(sid, session, only_if_present=True)
