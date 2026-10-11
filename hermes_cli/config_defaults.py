@@ -4,7 +4,6 @@ Pure-data leaf module — must not import from hermes_cli.config. Comments are t
 docs of config.yaml.
 """
 
-
 #: Image every container terminal backend (docker/modal/daytona/singularity) uses unless the
 #: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
 #: (the 3.14 pin shipped between the two without a migration); a saved config still holding one
@@ -15,7 +14,6 @@ LEGACY_SANDBOX_IMAGE = LEGACY_SANDBOX_IMAGES[0]
 # Vercel Sandbox managed image (Vercel deprecated its `runtime` presets in Aug 2026).
 DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
 LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
-
 
 def _aux(timeout, *, reasoning_effort=True, **extra):
     """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
@@ -28,7 +26,6 @@ def _aux(timeout, *, reasoning_effort=True, **extra):
         d["reasoning_effort"] = ""
     d.update(extra)
     return d
-
 
 DEFAULT_CONFIG = {
     "model": "",
@@ -1691,6 +1688,8 @@ DEFAULT_CONFIG = {
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
         "deny": [],
+        # Executable selectors: gh pr merge / git push main.
+        "deny_commands": [],
         # /reload-mcp confirms before rebuilding the MCP tool set (it invalidates the prompt cache,
         # so the next message re-sends full input). "Always Approve" → false.
         "mcp_reload_confirm": True,
@@ -1798,6 +1797,7 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        "delivery_routes": [],
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
         # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
