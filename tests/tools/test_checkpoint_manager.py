@@ -244,8 +244,13 @@ class TestRealPruning:
         assert reasons[0] == "step-5"
         assert reasons[-1] == "step-3"
 
+    @pytest.mark.parametrize("large_name", [
+        " large [1] payload.bin",
+        pytest.param("carriage\rreturn.bin", marks=pytest.mark.linux_only),
+        pytest.param(os.fsdecode(b"invalid-\xff.bin"), marks=pytest.mark.linux_only),
+    ])
     def test_excluded_payloads_never_enter_store_and_survive_restore(
-        self, work_dir, checkpoint_base, monkeypatch,
+        self, work_dir, checkpoint_base, monkeypatch, large_name,
     ):
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
         m = CheckpointManager(enabled=True, max_file_size_mb=1, max_total_size_mb=0)
@@ -265,7 +270,7 @@ class TestRealPruning:
             for suffix in (".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3")
         }
         # Non-compressible, unusual literal path; post-add index removal is not enough.
-        payloads[work_dir / " large [1] payload.bin"] = os.urandom(1024 * 1024 + 1)
+        payloads[work_dir / large_name] = os.urandom(1024 * 1024 + 1)
         for path, data in payloads.items():
             path.write_bytes(data)
         assert m.ensure_checkpoint(str(work_dir), "excluded payloads")

@@ -203,9 +203,10 @@ def _git_env(store: Path, working_dir: str, index_file: Optional[Path] = None) -
     return env
 
 
-def _git_subprocess(cmd: List[str], env: dict, timeout: int, cwd: Optional[str] = None):
+def _git_subprocess(cmd: List[str], env: dict, timeout: int, cwd: Optional[str] = None, text: bool = True):
     # creationflags suppresses the per-call conhost flash on Windows (no-op on POSIX).
-    return subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
+    return subprocess.run(cmd, capture_output=True, text=text, encoding='utf-8' if text else None,
+                          errors='replace' if text else None, timeout=timeout,
                           env=env, cwd=cwd, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
 
 
@@ -236,7 +237,8 @@ def _run_git(args: List[str], store: Path, working_dir: str, timeout: int = _GIT
         return False, "", msg
 
     try:
-        result = _git_subprocess(cmd, _git_env(store, str(wd), index_file=index_file), timeout, cwd=str(wd))
+        result = _git_subprocess(cmd, _git_env(store, str(wd), index_file=index_file), timeout,
+                                 cwd=str(wd), text="-z" not in args)
     except subprocess.TimeoutExpired:
         msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
         logger.error(msg, exc_info=True)
@@ -253,9 +255,9 @@ def _run_git(args: List[str], store: Path, working_dir: str, timeout: int = _GIT
         return False, "", str(exc)
 
     ok = result.returncode == 0
-    # Whitespace is part of filenames in NUL-delimited Git output.
-    stdout = result.stdout if "-z" in args else result.stdout.strip()
-    stderr = result.stderr.strip()
+    # Preserve raw filename bytes, CRs and whitespace in NUL-delimited output.
+    stdout = os.fsdecode(result.stdout) if "-z" in args else result.stdout.strip()
+    stderr = os.fsdecode(result.stderr).strip()
     if not ok and result.returncode not in (allowed_returncodes or set()):
         logger.error("Git command failed: %s (rc=%d) stderr=%s",
                      " ".join(cmd), result.returncode, stderr)
