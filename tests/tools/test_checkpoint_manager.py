@@ -236,6 +236,54 @@ class TestRealPruning:
         assert reasons[0] == "step-5"
         assert reasons[-1] == "step-3"
 
+    @pytest.mark.parametrize("large_name", [
+        " large [1] payload.bin",
+        pytest.param("carriage\rreturn.bin", marks=pytest.mark.platforms("linux")),
+        pytest.param(b"invalid-\xff.bin", marks=pytest.mark.platforms("linux")),
+    ])
+    def test_excluded_payloads_never_enter_store_and_survive_restore(
+        self, work_dir, checkpoint_base, monkeypatch, large_name,
+    ):
+        large_name = os.fsdecode(large_name)
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        m = CheckpointManager(enabled=True, max_file_size_mb=1, max_total_size_mb=0)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+
+        def object_usage():
+            ok, out, err = _run_git(["count-objects", "-v"], store, str(work_dir))
+            assert ok, err
+            print(out)
+            fields = dict(line.split(": ", 1) for line in out.splitlines())
+            return int(fields["size"]) + int(fields["size-pack"])
+
+        before = object_usage()
+        payloads = {
+            work_dir / ("state" + suffix): os.urandom(128 * 1024)
+            for suffix in (".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3")
+        }
+        # Non-compressible, unusual literal path; post-add index removal is not enough.
+        payloads[work_dir / large_name] = os.urandom(1024 * 1024 + 1)
+        for path, data in payloads.items():
+            path.write_bytes(data)
+        assert m.ensure_checkpoint(str(work_dir), "excluded payloads")
+        base = m.list_checkpoints(str(work_dir))[0]["hash"]
+        assert object_usage() - before < 128, "excluded blobs were written before filtering"
+
+        for path, data in payloads.items():
+            path.write_bytes(data + b"agent append")
+            m.record_agent_write(str(path))
+        (work_dir / "main.py").write_text("agent change\n")
+        m.record_agent_write(str(work_dir / "main.py"))
+        assert m.diff(str(work_dir), base)["success"]
+        result = m.restore(str(work_dir), base, safe=True)
+        assert result["success"], result
+        assert (work_dir / "main.py").read_text() == "print('hello')\n"
+        for path, data in payloads.items():
+            assert path.read_bytes() == data + b"agent append"
+            assert path.name not in result["restored_files"]
+        assert object_usage() - before < 128, "diff/restore wrote excluded blobs"
+
     def test_max_file_size_mb_skips_large_files(
         self, tmp_path, checkpoint_base, monkeypatch,
     ):
@@ -265,6 +313,41 @@ class TestRealPruning:
 # =========================================================================
 
 class TestRestore:
+    @pytest.mark.parametrize("nested_repo", [False, True])
+    @pytest.mark.parametrize("spec, restore_neighbor", [
+        (":(glob)a*/note.txt", True),
+        (":(literal)a[1]/note.txt", False),
+    ])
+    def test_restore_resolves_explicit_pathspecs_with_or_without_gitlinks(
+        self, mgr, work_dir, nested_repo, spec, restore_neighbor,
+    ):
+        selected = work_dir / "a[1]" / "note.txt"
+        neighbor = work_dir / "a1" / "note.txt"
+        for path in (selected, neighbor):
+            path.parent.mkdir()
+            path.write_text("original\n")
+        nested = work_dir / "tool"
+        if nested_repo:
+            subprocess.run(["git", "init", "-q", str(nested)], check=True)
+            subprocess.run(
+                ["git", "-C", str(nested), "-c", "user.name=test", "-c",
+                 "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "seed"],
+                check=True,
+            )
+            (nested / "uncaptured.txt").write_text("precious nested edit\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline")
+        commit = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+        for path in (selected, neighbor):
+            path.write_text("user edit\n")
+
+        result = mgr.restore(str(work_dir), commit, file_path=spec)
+
+        assert result["success"], result
+        assert selected.read_text() == "original\n"
+        assert neighbor.read_text() == ("original\n" if restore_neighbor else "user edit\n")
+        if nested_repo:
+            assert (nested / "uncaptured.txt").read_text() == "precious nested edit\n"
+
     def test_restore_refuses_uncaptured_nested_repository(self, mgr, tmp_path):
         project = tmp_path / "project"
         nested = project / "nested"
@@ -382,6 +465,51 @@ class TestSafeRestore:
         assert (work_dir / "README.md").read_text() == "user hand edit\n"
         assert "README.md" in result["skipped_user_edits"]
         assert "main.py" in result["restored_files"]
+
+    @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("names", [
+        ("growth\n[1].txt", "growth\n1.txt"),
+        ("growth\r[1].txt", "growth\r1.txt"),
+        (":(glob)growth*.txt", "growth-neighbor.txt"),
+    ])
+    @pytest.mark.parametrize("grow_past_cap", [False, True])
+    @pytest.mark.parametrize("single_file", [False, True, "with_nested_repo"])
+    def test_restore_treats_selected_names_as_literal_paths(
+        self, work_dir, checkpoint_base, monkeypatch, names, grow_past_cap, single_file,
+    ):
+        m = self._capped_mgr(checkpoint_base, monkeypatch)
+        selected, neighbor = (work_dir / name for name in names)
+        selected.write_bytes(b"original selected\n")
+        neighbor.write_bytes(b"original neighbor\n")
+        if single_file == "with_nested_repo":
+            nested = work_dir / "nested"
+            nested.mkdir()
+            subprocess.run(["git", "init", "-q", str(nested)], check=True)
+            subprocess.run(
+                ["git", "-C", str(nested), "-c", "user.name=test", "-c",
+                 "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "seed"],
+                check=True,
+            )
+        base = self._checkpoint(m, work_dir)
+
+        selected.write_bytes(b"x" * (1024 * 1024 + 1) if grow_past_cap else b"agent edit\n")
+        m.record_agent_write(str(selected))
+        neighbor.write_bytes(b"precious user edit\n")
+        plan = m._safe_restore_plan(str(work_dir), base)
+        assert plan["restore"] == [selected.name]
+        assert plan["skipped"] == [neighbor.name]
+
+        if single_file:
+            result = m.restore(str(work_dir), base, file_path=selected.name)
+        else:
+            result = m.restore(str(work_dir), base, safe=True)
+        assert result["success"], result
+        assert neighbor.read_bytes() == b"precious user edit\n", "restore overwrote a skipped user edit"
+        assert selected.read_bytes() == b"original selected\n"
+        if not single_file:
+            assert result["restored_files"] == [selected.name]
+            assert result["skipped_user_edits"] == [neighbor.name]
+            assert result["skipped_oversize"] == []
 
     def test_safe_restore_finds_ledger_under_walked_key(self, mgr, work_dir, tmp_path):
         base = self._checkpoint(mgr, work_dir)
