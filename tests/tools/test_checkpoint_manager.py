@@ -244,6 +244,48 @@ class TestRealPruning:
         assert reasons[0] == "step-5"
         assert reasons[-1] == "step-3"
 
+    def test_excluded_payloads_never_enter_store_and_survive_restore(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        m = CheckpointManager(enabled=True, max_file_size_mb=1, max_total_size_mb=0)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+
+        def object_usage():
+            ok, out, err = _run_git(["count-objects", "-v"], store, str(work_dir))
+            assert ok, err
+            print(out)
+            fields = dict(line.split(": ", 1) for line in out.splitlines())
+            return int(fields["size"]) + int(fields["size-pack"])
+
+        before = object_usage()
+        payloads = {
+            work_dir / ("state" + suffix): os.urandom(128 * 1024)
+            for suffix in (".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3")
+        }
+        # Non-compressible, unusual literal path; post-add index removal is not enough.
+        payloads[work_dir / " large [1] payload.bin"] = os.urandom(1024 * 1024 + 1)
+        for path, data in payloads.items():
+            path.write_bytes(data)
+        assert m.ensure_checkpoint(str(work_dir), "excluded payloads")
+        base = m.list_checkpoints(str(work_dir))[0]["hash"]
+        assert object_usage() - before < 128, "excluded blobs were written before filtering"
+
+        for path, data in payloads.items():
+            path.write_bytes(data + b"agent append")
+            m.record_agent_write(str(path))
+        (work_dir / "main.py").write_text("agent change\n")
+        m.record_agent_write(str(work_dir / "main.py"))
+        assert m.diff(str(work_dir), base)["success"]
+        result = m.restore(str(work_dir), base, safe=True)
+        assert result["success"], result
+        assert (work_dir / "main.py").read_text() == "print('hello')\n"
+        for path, data in payloads.items():
+            assert path.read_bytes() == data + b"agent append"
+            assert path.name not in result["restored_files"]
+        assert object_usage() - before < 128, "diff/restore wrote excluded blobs"
+
     def test_max_file_size_mb_skips_large_files(
         self, tmp_path, checkpoint_base, monkeypatch,
     ):

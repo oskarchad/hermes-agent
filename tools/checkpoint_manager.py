@@ -19,6 +19,7 @@ import re
 import shutil
 import stat as stat_mod
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,7 @@ DEFAULT_EXCLUDES = [
     "*.so", "*.dylib", "*.dll", "*.o", "*.a", "*.jar", "*.class", "*.exe", "*.obj",  # compiled binaries
     "*.mp4", "*.mov", "*.mkv", "*.webm", "*.zip", "*.tar", "*.tar.gz", "*.tgz",  # media / large binaries
     "*.7z", "*.rar", "*.iso",
+    "*.db", "*.db-wal", "*.db-shm", "*.db-journal", "*.sqlite", "*.sqlite3",  # databases
     ".env", ".env.*", ".env.local", ".env.*.local",  # secrets
     ".DS_Store", "Thumbs.db", "*.log",  # OS junk / logs
 ]
@@ -251,7 +253,9 @@ def _run_git(args: List[str], store: Path, working_dir: str, timeout: int = _GIT
         return False, "", str(exc)
 
     ok = result.returncode == 0
-    stdout, stderr = result.stdout.strip(), result.stderr.strip()
+    # Whitespace is part of filenames in NUL-delimited Git output.
+    stdout = result.stdout if "-z" in args else result.stdout.strip()
+    stderr = result.stderr.strip()
     if not ok and result.returncode not in (allowed_returncodes or set()):
         logger.error("Git command failed: %s (rc=%d) stderr=%s",
                      " ".join(cmd), result.returncode, stderr)
@@ -513,7 +517,7 @@ def _project_refs(working_dir: str) -> _ProjectRefs:
 
 
 def _locate(working_dir: str, commit_hash: str,
-            file_path: Optional[str] = None) -> Tuple[Optional[_ProjectRefs], Optional[Dict]]:
+            file_path: Optional[str] = None) -> Tuple[_ProjectRefs, Optional[Dict]]:
     """Validate inputs and resolve store coordinates; ``(refs, error_result_or_None)``."""
     p = _project_refs(working_dir)
     err = _validate_commit_hash(commit_hash) or (file_path and _validate_file_path(file_path, p.abs_dir))
@@ -522,15 +526,29 @@ def _locate(working_dir: str, commit_hash: str,
     return p, None if _store_has_head(p.store) else _no_store_result()
 
 
-def _stage_all(p: _ProjectRefs) -> Tuple[bool, str, str]:
-    """``git add -A`` into the per-project index."""
-    return _run_git(["add", "-A"], p.store, p.abs_dir, timeout=_GIT_TIMEOUT * 2, index_file=p.index_file)
+def _stage_all(p: _ProjectRefs, oversize: List[str]) -> Tuple[bool, str, str]:
+    """Exclude large paths before Git can write even unreachable blobs."""
+    for i in range(0, len(oversize), 200):
+        result = _run_git(["--literal-pathspecs", "rm", "--cached", "-f", "--quiet",
+                           "--ignore-unmatch", "--", *oversize[i:i + 200]],
+                          p.store, p.abs_dir, index_file=p.index_file)
+        if not result[0]:
+            return result
+    # A NUL-delimited file avoids argv limits and pathspec magic in filenames.
+    with tempfile.TemporaryDirectory(prefix="hermes-checkpoint-") as tmp:
+        pathspec = Path(tmp) / "paths"
+        pathspec.write_bytes(b".\0" + b"".join(
+            os.fsencode(f":(top,literal,exclude){rel}") + b"\0" for rel in oversize))
+        return _run_git(["add", "-A", f"--pathspec-from-file={pathspec}", "--pathspec-file-nul"],
+                        p.store, p.abs_dir, timeout=_GIT_TIMEOUT * 2, index_file=p.index_file)
 
 
-def _diff_staged_tree(p: _ProjectRefs, *diff_args: List[str]) -> List[Tuple[bool, str, str]]:
+def _diff_staged_tree(p: _ProjectRefs, *diff_args: List[str], oversize: List[str]) -> List[Tuple[bool, str, str]]:
     """Stage the working tree (so new files show), run each ``git diff`` variant,
     then point the index back at the ref so it doesn't drift."""
-    _stage_all(p)
+    staged = _stage_all(p, oversize)
+    if not staged[0]:
+        return [staged for _ in diff_args]
     results = [_run_git(args, p.store, p.abs_dir, index_file=p.index_file) for args in diff_args]
     _run_git(["read-tree", p.ref], p.store, p.abs_dir, index_file=p.index_file, allowed_returncodes={128})
     return results
@@ -596,7 +614,11 @@ class CheckpointManager:
         if err:
             return err
 
-        (ok, names_out, err), = _diff_staged_tree(p, ["diff", "--name-only", commit_hash, "--cached"])
+        ok, oversize, err = self._oversize_paths(p)
+        if not ok:
+            return {"success": False, "error": f"Could not enumerate files: {err}"}
+        (ok, names_out, err), = _diff_staged_tree(
+            p, ["diff", "--name-only", "-z", commit_hash, "--cached"], oversize=oversize)
         if not ok:
             return {"success": False, "error": f"Could not compute changed files: {err}"}
 
@@ -604,7 +626,9 @@ class CheckpointManager:
         if not ledger:
             return {"success": True, "restore": [], "skipped": [], "ledger_empty": True}
         out: Dict[str, List[str]] = {"restore": [], "skipped": []}
-        for rel in filter(None, (line.strip() for line in names_out.splitlines())):
+        # Keep capped paths in the plan without staging their content: the ledger
+        # still decides authorship, and a previously-small file can be restored.
+        for rel in sorted(set(filter(None, names_out.split("\0"))) | set(oversize)):
             abs_path = Path(p.abs_dir) / rel
             entry = ledger.get(str(abs_path))
             recorded = entry.get("sha256") if isinstance(entry, dict) else None
@@ -683,8 +707,12 @@ class CheckpointManager:
         if not ok:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' not found"}
 
+        ok, oversize, err = self._oversize_paths(p)
+        if not ok:
+            return {"success": False, "error": f"Could not enumerate files: {err}"}
         (ok_stat, stat_out, _), (ok_diff, diff_out, _) = _diff_staged_tree(
-            p, ["diff", "--stat", commit_hash, "--cached"], ["diff", commit_hash, "--cached", "--no-color"])
+            p, ["diff", "--stat", commit_hash, "--cached"],
+            ["diff", commit_hash, "--cached", "--no-color"], oversize=oversize)
         if not ok_stat and not ok_diff:
             return {"success": False, "error": "Could not generate diff"}
         return {"success": True, "stat": stat_out if ok_stat else "", "diff": diff_out if ok_diff else ""}
@@ -808,12 +836,12 @@ class CheckpointManager:
         ref_commit = _ref_tip(p.store, working_dir, p.ref)
         _seed_project_index(p, ref_commit)
 
-        # Broad patterns come from the exclude file; oversize paths are dropped post-stage.
-        ok, _, err = _stage_all(p)
+        ok, oversize, err = self._oversize_paths(p)
+        if not ok:
+            return _step_failed("ls-files", err)
+        ok, _, err = _stage_all(p, oversize)
         if not ok:
             return _step_failed("git-add", err)
-        if self.max_file_size_mb > 0:
-            self._drop_oversize_from_index(p.store, working_dir, p.index_file)
 
         skip = _index_unchanged_reason(p, ref_commit)
         if skip:
@@ -849,21 +877,15 @@ class CheckpointManager:
         except OSError:
             return False
 
-    def _drop_oversize_from_index(self, store: Path, working_dir: str, index_file: Path) -> None:
-        """Unstage files larger than ``max_file_size_mb`` (datasets, weights, videos)."""
+    def _oversize_paths(self, p: _ProjectRefs) -> Tuple[bool, List[str], str]:
+        """Stat Git's tracked/unignored candidates without reading file contents."""
         if self.max_file_size_mb <= 0:
-            return
-        ok, stdout, _ = _run_git(["ls-files", "--cached", "-z"], store, working_dir, index_file=index_file)
-        abs_workdir = _normalize_path(working_dir)
-        # NUL-separated; _run_git's strip() leaves NULs alone.
-        oversize = [rel for rel in (stdout if ok else "").split("\x00") if rel and self._exceeds_size_cap(abs_workdir / rel)]
-        if not oversize:
-            return
-        logger.debug("Checkpoint: dropping %d oversize file(s) (>%d MB) from index",
-                     len(oversize), self.max_file_size_mb)
-        for i in range(0, len(oversize), 200):  # chunk: never overflow argv
-            _run_git(["rm", "--cached", "--quiet", "--"] + oversize[i:i + 200],
-                     store, working_dir, index_file=index_file, allowed_returncodes={128})
+            return True, [], ""
+        ok, stdout, err = _run_git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+                                  p.store, p.abs_dir, index_file=p.index_file)
+        oversize = [rel for rel in stdout.split("\0")
+                    if rel and self._exceeds_size_cap(Path(p.abs_dir) / rel)] if ok else []
+        return ok, oversize, err
 
     def _prune(self, store: Path, working_dir: str, ref: str) -> None:
         """Rewrite the ref to its last ``max_snapshots`` commits and gc (only limiting the
