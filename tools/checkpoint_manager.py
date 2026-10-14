@@ -145,6 +145,8 @@ DEFAULT_EXCLUDES = [
     "*.7z",
     "*.rar",
     "*.iso",
+    # Databases
+    "*.db", "*.db-wal", "*.db-shm", "*.db-journal", "*.sqlite", "*.sqlite3",
     # Secrets
     ".env",
     ".env.*",
@@ -782,7 +784,7 @@ class CheckpointManager:
         are dropped when the store exceeds this after a commit.
     max_file_size_mb : int
         Skip adding any single file larger than this to a checkpoint.
-        (Implemented via ``.gitignore`` excludes + a post-stage size check.)
+        (Implemented via Git excludes + a pre-stage size check.)
     """
 
     def __init__(
@@ -874,8 +876,9 @@ class CheckpointManager:
         index_file = _index_path(store, dir_hash)
 
         # Stage the current tree so the name-only diff sees new files too.
-        _run_git(["add", "-A"], store, abs_dir,
-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
+        ok, oversize, err = self._stage_filtered(store, abs_dir, index_file)
+        if not ok:
+            return {"success": False, "error": f"Could not stage files: {err}"}
         ok, names_out, err = _run_git(
             ["diff", "--name-only", "-z", commit_hash, "--cached"],
             store, abs_dir, index_file=index_file,
@@ -897,7 +900,9 @@ class CheckpointManager:
                     "ledger_empty": True}
         restore: list[str] = []
         skipped: list[str] = []
-        for rel in filter(None, names_out.split("\x00")):
+        # Capped paths still need ledger classification: an earlier small version
+        # can be restored, while a never-captured large file must be kept.
+        for rel in sorted(set(filter(None, names_out.split("\x00"))) | set(oversize)):
             abs_path = Path(abs_dir) / rel
             entry = ledger.get(str(abs_path))
             recorded = entry.get("sha256") if isinstance(entry, dict) else None
@@ -1055,8 +1060,9 @@ class CheckpointManager:
         index_file = _index_path(store, dir_hash)
 
         # Stage current state into the per-project index to compare.
-        _run_git(["add", "-A"], store, abs_dir,
-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
+        ok, _, err = self._stage_filtered(store, abs_dir, index_file)
+        if not ok:
+            return {"success": False, "error": f"Could not stage files: {err}"}
 
         ok_stat, stat_out, _ = _run_git(
             ["diff", "--stat", commit_hash, "--cached"],
@@ -1185,6 +1191,10 @@ class CheckpointManager:
                 except ValueError:
                     requested_rel = Path(file_path)
                 requested_parts = tuple(requested_rel.parts)
+                literal_selection = any(
+                    record.split("\t", 1)[-1] == requested_rel.as_posix()
+                    for record in tree_out.split("\x00") if "\t" in record
+                )
 
                 def _scope_intersects_nested_repo(repo_path: str) -> bool:
                     repo_parts = tuple(PurePosixPath(repo_path).parts)
@@ -1200,8 +1210,10 @@ class CheckpointManager:
 
                 # Literal paths below a gitlink have no tree entry to match.
                 # Keep the explicit refusal above, but let Git resolve all
-                # other selections exactly as checkout does (glob, icase,
-                # top, exclude, literal, etc.). ls-tree lacks that pathspec
+                # other selections as patterns unless they name an exact tree
+                # entry (literal filenames must not expand to a neighbor).
+                # Pattern selections retain glob, icase,
+                # top, exclude, literal, etc. ls-tree lacks that pathspec
                 # support. A disposable index avoids touching the project's
                 # index, refs or files before we know rollback is possible.
                 if not blocked_repos:
@@ -1215,6 +1227,7 @@ class CheckpointManager:
                             ok, selected, err = _run_git(
                                 ["ls-files", "--stage", "--error-unmatch", "-z", "--", file_path],
                                 store, abs_dir, index_file=inspect_index,
+                                extra_env={"GIT_LITERAL_PATHSPECS": "1"} if literal_selection else None,
                             )
                         if not ok:
                             return {"success": False, "error": f"Could not inspect restore selection: {err}"}
@@ -1294,7 +1307,7 @@ class CheckpointManager:
                     checkout_targets.append(rel)
                 elif self._exceeds_size_cap(Path(abs_dir) / rel):
                     # Absent from the checkpoint because ``max_file_size_mb``
-                    # kept it out (_drop_oversize_from_index), not because
+                    # kept it out (_stage_filtered), not because
                     # Hermes created it. Deleting it would not restore a prior
                     # state — no checkpoint holds one — it would destroy the
                     # only copy. The ledger records a content hash, not whether
@@ -1318,7 +1331,7 @@ class CheckpointManager:
                 ok, _stdout, err = True, "", ""
             else:
                 ok, _stdout, err = _run_git(
-                    ["checkout", commit_hash, "--", *checkout_targets],
+                    ["--literal-pathspecs", "checkout", commit_hash, "--", *checkout_targets],
                     store, abs_dir, timeout=_GIT_TIMEOUT * 2,
                     index_file=index_file,
                 )
@@ -1340,7 +1353,7 @@ class CheckpointManager:
                 )
         else:
             ok, _stdout, err = _run_git(
-                ["checkout", commit_hash, "--", file_path if file_path else "."],
+                ["--literal-pathspecs", "checkout", commit_hash, "--", file_path if file_path else "."],
                 store, abs_dir, timeout=_GIT_TIMEOUT * 2,
                 index_file=index_file,
             )
@@ -1461,20 +1474,10 @@ class CheckpointManager:
             # First snapshot for this project.
             index_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # Stage with per-project index.  Include a per-stage file-size filter
-        # via ``core.bigFileThreshold`` is not what we want — instead, we
-        # rely on the exclude file for broad patterns and post-stage prune
-        # any path whose size exceeds max_file_size_mb.
-        ok, _, err = _run_git(
-            ["add", "-A"], store, working_dir,
-            timeout=_GIT_TIMEOUT * 2, index_file=index_file,
-        )
+        ok, _, err = self._stage_filtered(store, working_dir, index_file)
         if not ok:
             logger.debug("Checkpoint git-add failed: %s", err)
             return False
-
-        if self.max_file_size_mb > 0:
-            self._drop_oversize_from_index(store, working_dir, index_file)
 
         # Compare against the current ref tip (not HEAD — HEAD points to a
         # branch that doesn't exist on a bare store, so ``diff --cached``
@@ -1564,7 +1567,7 @@ class CheckpointManager:
     def _exceeds_size_cap(self, path: Path) -> bool:
         """Whether *path* is larger than ``max_file_size_mb``.
 
-        The same test :meth:`_drop_oversize_from_index` applies when building a
+        The same test :meth:`_stage_filtered` applies when building a
         checkpoint, so "excluded from the checkpoint" and "refused deletion at
         restore" agree on one definition. A cap of 0 disables it, and an
         unstattable path is not claimed to be oversize.
@@ -1577,48 +1580,41 @@ class CheckpointManager:
         except OSError:
             return False
 
-    def _drop_oversize_from_index(
+    def _stage_filtered(
         self, store: Path, working_dir: str, index_file: Path,
-    ) -> None:
-        """Remove any staged file larger than ``max_file_size_mb`` from the index.
+    ) -> tuple[bool, list[str], str]:
+        """Filter before staging so excluded content never becomes a Git blob.
 
-        Lets the agent keep snapshotting source code while refusing to
-        swallow generated assets (datasets, model weights, logs, videos).
+        Return capped paths as well: safe restore still needs to classify them.
         """
-        if self.max_file_size_mb <= 0:
-            return
-        ok, stdout, _ = _run_git(
-            ["ls-files", "--cached", "-z"],
-            store, working_dir, index_file=index_file,
-        )
-        if not ok or not stdout:
-            return
-        # NUL separators preserve whitespace within each literal filename.
-        paths = [p for p in stdout.split("\x00") if p]
-        abs_workdir = _normalize_path(working_dir)
-        # Same predicate safe restore consults, called rather than restated:
-        # a threshold that drifted between the two would make a file both
-        # absent from the checkpoint and not recognised as capped at restore,
-        # which is precisely the deletion this change exists to prevent.
-        oversize = [
-            rel for rel in paths if self._exceeds_size_cap(abs_workdir / rel)
-        ]
-        if not oversize:
-            return
-        logger.debug(
-            "Checkpoint: dropping %d oversize file(s) (>%d MB) from index",
-            len(oversize), self.max_file_size_mb,
-        )
-        # Use --pathspec-from-file for safety with many paths.
-        # Chunk into manageable batches.
-        BATCH = 200
-        for i in range(0, len(oversize), BATCH):
-            chunk = oversize[i:i + BATCH]
-            _run_git(
-                ["rm", "--cached", "--quiet", "--"] + chunk,
+        oversize: list[str] = []
+        if self.max_file_size_mb > 0:
+            ok, stdout, err = _run_git(
+                ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
                 store, working_dir, index_file=index_file,
-                allowed_returncodes={128},
             )
+            if not ok:
+                return False, [], err
+            oversize = [rel for rel in stdout.split("\0")
+                        if rel and self._exceeds_size_cap(Path(working_dir) / rel)]
+        for i in range(0, len(oversize), 200):
+            ok, _, err = _run_git(
+                ["--literal-pathspecs", "rm", "--cached", "-f", "--quiet",
+                 "--ignore-unmatch", "--", *oversize[i:i + 200]],
+                store, working_dir, index_file=index_file,
+            )
+            if not ok:
+                return False, oversize, err
+        # A NUL-delimited file avoids argv limits and pathspec magic in filenames.
+        with tempfile.TemporaryDirectory(prefix="hermes-checkpoint-") as tmp:
+            pathspec = Path(tmp) / "paths"
+            pathspec.write_bytes(b".\0" + b"".join(
+                os.fsencode(f":(top,literal,exclude){rel}") + b"\0" for rel in oversize))
+            ok, _, err = _run_git(
+                ["add", "-A", f"--pathspec-from-file={pathspec}", "--pathspec-file-nul"],
+                store, working_dir, timeout=_GIT_TIMEOUT * 2, index_file=index_file,
+            )
+        return ok, oversize, err
 
     def _prune(self, store: Path, working_dir: str, ref: str) -> None:
         """Checkpoint-take path: snapshot-count budget plus one size round, gc deferred to the
