@@ -385,6 +385,42 @@ class TestSafeRestore:
         assert "README.md" in result["skipped_user_edits"]
         assert "main.py" in result["restored_files"]
 
+    @pytest.mark.linux_only
+    @pytest.mark.parametrize("names", [
+        ("growth\n[1].txt", "growth\n1.txt"),
+        ("growth\r[1].txt", "growth\r1.txt"),
+        (":(glob)growth*.txt", "growth-neighbor.txt"),
+    ])
+    @pytest.mark.parametrize("grow_past_cap", [False, True])
+    @pytest.mark.parametrize("single_file", [False, True])
+    def test_restore_treats_selected_names_as_literal_paths(
+        self, work_dir, checkpoint_base, monkeypatch, names, grow_past_cap, single_file,
+    ):
+        m = self._capped_mgr(checkpoint_base, monkeypatch)
+        selected, neighbor = (work_dir / name for name in names)
+        selected.write_bytes(b"original selected\n")
+        neighbor.write_bytes(b"original neighbor\n")
+        base = self._checkpoint(m, work_dir)
+
+        selected.write_bytes(b"x" * (1024 * 1024 + 1) if grow_past_cap else b"agent edit\n")
+        m.record_agent_write(str(selected))
+        neighbor.write_bytes(b"precious user edit\n")
+        plan = m.safe_restore_plan(str(work_dir), base)
+        assert plan["restore"] == [selected.name]
+        assert plan["skipped"] == [neighbor.name]
+
+        if single_file:
+            result = m.restore(str(work_dir), base, file_path=selected.name)
+        else:
+            result = m.restore(str(work_dir), base, safe=True)
+        assert result["success"], result
+        assert neighbor.read_bytes() == b"precious user edit\n", "restore overwrote a skipped user edit"
+        assert selected.read_bytes() == b"original selected\n"
+        if not single_file:
+            assert result["restored_files"] == [selected.name]
+            assert result["skipped_user_edits"] == [neighbor.name]
+            assert result["skipped_oversize"] == []
+
     def test_safe_restore_skips_file_user_edited_after_agent(self, mgr, work_dir):
         base = self._checkpoint(mgr, work_dir)
 

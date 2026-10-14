@@ -769,8 +769,8 @@ class CheckpointManager:
         if restore_paths is not None:
             targets = self._apply_safe_restore_deletes(p, commit_hash, restore_paths)
         if targets.checkout:
-            ok, _, err = _run_git(["checkout", commit_hash, "--", *targets.checkout], p.store, abs_dir,
-                                  timeout=_GIT_TIMEOUT * 2, index_file=p.index_file)
+            ok, _, err = _run_git(["--literal-pathspecs", "checkout", commit_hash, "--", *targets.checkout],
+                                  p.store, abs_dir, timeout=_GIT_TIMEOUT * 2, index_file=p.index_file)
             if not ok:
                 return {"success": False, "error": f"Restore failed: {err}", "debug": err or None}
 
