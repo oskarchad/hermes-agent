@@ -1177,7 +1177,9 @@ class CheckpointManager:
             return {"success": False, "error": f"Could not inspect checkpoint: {err}"}
         nested_repos = _gitlink_paths(tree_out)
         selected_paths: Optional[list[str]] = None
-        if nested_repos:
+        # Resolve explicit selections consistently even without gitlinks; the
+        # final checkout uses the inspected literal names, not the user's spec.
+        if nested_repos or file_path:
             blocked_repos = nested_repos
             if file_path:
                 # Select by the path as recorded in the checkpoint, not by

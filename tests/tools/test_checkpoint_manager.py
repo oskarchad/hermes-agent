@@ -313,6 +313,41 @@ class TestRealPruning:
 # =========================================================================
 
 class TestRestore:
+    @pytest.mark.parametrize("nested_repo", [False, True])
+    @pytest.mark.parametrize("spec, restore_neighbor", [
+        (":(glob)a*/note.txt", True),
+        (":(literal)a[1]/note.txt", False),
+    ])
+    def test_restore_resolves_explicit_pathspecs_with_or_without_gitlinks(
+        self, mgr, work_dir, nested_repo, spec, restore_neighbor,
+    ):
+        selected = work_dir / "a[1]" / "note.txt"
+        neighbor = work_dir / "a1" / "note.txt"
+        for path in (selected, neighbor):
+            path.parent.mkdir()
+            path.write_text("original\n")
+        nested = work_dir / "tool"
+        if nested_repo:
+            subprocess.run(["git", "init", "-q", str(nested)], check=True)
+            subprocess.run(
+                ["git", "-C", str(nested), "-c", "user.name=test", "-c",
+                 "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "seed"],
+                check=True,
+            )
+            (nested / "uncaptured.txt").write_text("precious nested edit\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline")
+        commit = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+        for path in (selected, neighbor):
+            path.write_text("user edit\n")
+
+        result = mgr.restore(str(work_dir), commit, file_path=spec)
+
+        assert result["success"], result
+        assert selected.read_text() == "original\n"
+        assert neighbor.read_text() == ("original\n" if restore_neighbor else "user edit\n")
+        if nested_repo:
+            assert (nested / "uncaptured.txt").read_text() == "precious nested edit\n"
+
     def test_restore_refuses_uncaptured_nested_repository(self, mgr, tmp_path):
         project = tmp_path / "project"
         nested = project / "nested"
