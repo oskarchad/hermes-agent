@@ -107,5 +107,69 @@ def test_async_vision_uses_main_fallback_only_for_wrapped_limit(monkeypatch, rat
             ac._reset_aux_unhealthy_cache()
 
     asyncio.run(exercise())
-    assert [r["model"] for r in requests] == ([CLAUDE, CLAUDE, GPT] if rate_limited else [CLAUDE, CLAUDE])
+    # Wrapped 5xx gets a transport retry, then the existing credential-rung retry
+    # once the named provider identity is retained; plain 503 never enters that rung.
+    assert [r["model"] for r in requests] == ([CLAUDE, CLAUDE, CLAUDE, GPT] if rate_limited else [CLAUDE, CLAUDE])
     assert all(r["messages"] == messages for r in requests)
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_auto_vision_rotates_named_custom_pool_before_fallback(monkeypatch, async_mode):
+    home = get_hermes_home()
+    config = {
+        "model": {"provider": "custom:review-proxy", "default": CLAUDE},
+        "providers": {"review-proxy": {"base_url": "https://proxy.test/v1"}},
+        "auxiliary": {"vision": {"provider": "auto"}},
+        "fallback_providers": [{"provider": "custom:review-proxy", "model": GPT}],
+    }
+    (home / "config.yaml").write_text(json.dumps(config))
+    (home / "auth.json").write_text(json.dumps({
+        "version": 1, "providers": {}, "credential_pool": {"review-proxy": [
+            {"id": "one", "label": "one", "auth_type": "api_key", "priority": 0,
+             "source": "manual", "access_token": "test-first"},
+            {"id": "two", "label": "two", "auth_type": "api_key", "priority": 1,
+             "source": "manual", "access_token": "test-second"},
+        ]},
+    }))
+    requests = []
+    clients = []
+
+    def respond(request):
+        assert request.url.host == "proxy.test"
+        payload = json.loads(request.content)
+        key = request.headers["authorization"]
+        requests.append((key, payload["model"]))
+        if key == "Bearer test-first":
+            return httpx.Response(401, json={"error": {"message": "Invalid API key"}})
+        assert key == "Bearer test-second"
+        return httpx.Response(200, json={
+            "id": "test", "object": "chat.completion", "created": 0, "model": payload["model"],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "healthy pool key"},
+                         "finish_reason": "stop"}],
+        })
+
+    def http_client_kwargs(base_url, *, async_mode=False):
+        client = (httpx.AsyncClient if async_mode else httpx.Client)(transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return {"http_client": client}
+
+    monkeypatch.setattr(ac, "_openai_http_client_kwargs", http_client_kwargs)
+    ac._client_cache.clear()
+    ac._reset_aux_unhealthy_cache()
+
+    async def exercise():
+        try:
+            kwargs = {"task": "vision", "messages": [{"role": "user", "content": "Describe screenshot"}]}
+            result = await ac.async_call_llm(**kwargs) if async_mode else ac.call_llm(**kwargs)
+            assert result.choices[0].message.content == "healthy pool key"
+        finally:
+            for client in clients:
+                if isinstance(client, httpx.AsyncClient):
+                    await client.aclose()
+                else:
+                    client.close()
+            ac._client_cache.clear()
+            ac._reset_aux_unhealthy_cache()
+
+    asyncio.run(exercise())
+    assert requests == [("Bearer test-first", CLAUDE), ("Bearer test-second", CLAUDE)]

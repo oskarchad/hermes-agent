@@ -7956,6 +7956,7 @@ def _aux_recovery_ladder(
     resolved_base_url: Optional[str], resolved_api_key: Optional[str],
     resolved_api_mode: Optional[str], final_model: Optional[str], max_tokens: Optional[int],
     main_runtime: Optional[dict[str, Any]], route_info: Optional[dict[str, str]],
+    request_provider: Optional[str] = None,
 ):
     """Ordered recovery rungs after the primary request failed (generator): parameter
     strips → Nous heal/refresh → credential refresh/pool rotation → provider fallback.
@@ -7974,19 +7975,17 @@ def _aux_recovery_ladder(
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
         return resp
-    resp, first_err = yield from _ladder_credential_rungs(first_err, route, kwargs, client_is_nous)
+    # Recovery needs the concrete backend; provider fallback still needs the auto policy.
+    credential_route = route._replace(resolved_provider=request_provider or resolved_provider)
+    resp, first_err = yield from _ladder_credential_rungs(first_err, credential_route, kwargs, client_is_nous)
     if first_err is None:
         return resp
     resp = yield from _ladder_provider_fallback(first_err, route)
     if resp is not None:
         return resp
-    # Connection/timeout errors poison the cached client (closed transport, half-read
-    # stream); evict so the next aux call rebuilds a fresh one.
     # Reached only when no fallback answered, so the next auxiliary call rebuilds a fresh
     # client instead of reusing the dead one. ``first_err`` is the narrowed error from the
     # rungs above, not necessarily the original one. See issue #23432.
-    # Mirror the sync path: drop poisoned clients on connection/timeout so the next aux call rebuilds. See
-    # issue #23432.
     if _is_connection_error(first_err):
         try:
             _evict_cached_client_instance(client)
@@ -8172,7 +8171,7 @@ def _start_recovery_ladder(
         resolved_model=req.resolved_model, resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         final_model=req.final_model, max_tokens=retry_kwargs["max_tokens"],
-        main_runtime=retry_kwargs["main_runtime"], route_info=route_info)
+        main_runtime=retry_kwargs["main_runtime"], route_info=route_info, request_provider=req.request_provider)
 
 
 def _call_llm_impl(
