@@ -7975,8 +7975,8 @@ def _aux_recovery_ladder(
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
         return resp
-    # Recovery needs the concrete backend; provider fallback still needs the auto policy.
-    credential_route = route._replace(resolved_provider=request_provider or resolved_provider)
+    # Vision needs the concrete backend; text refresh must retain its auto cache key.
+    credential_route = route._replace(resolved_provider=request_provider) if task == "vision" and request_provider else route
     resp, first_err = yield from _ladder_credential_rungs(first_err, credential_route, kwargs, client_is_nous)
     if first_err is None:
         return resp

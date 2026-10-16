@@ -173,3 +173,26 @@ def test_auto_vision_rotates_named_custom_pool_before_fallback(monkeypatch, asyn
 
     asyncio.run(exercise())
     assert requests == [("Bearer test-first", CLAUDE), ("Bearer test-second", CLAUDE)]
+
+
+def test_text_auto_refresh_keeps_auto_cache_eviction(monkeypatch):
+    from types import SimpleNamespace
+
+    client = SimpleNamespace(base_url="https://api.x.ai/v1", api_key="stale",
+                             _hermes_aux_effective_provider="xai-oauth")
+    response = httpx.Response(401, request=httpx.Request("POST", client.base_url))
+    error = openai.AuthenticationError("Invalid credentials", response=response, body=None)
+    evicted = []
+    monkeypatch.setattr(ac, "_refresh_provider_credentials", lambda provider: provider == "xai-oauth")
+    monkeypatch.setattr(ac, "_evict_cached_clients", evicted.append)
+    ladder = ac._aux_recovery_ladder(
+        error, client=client, kwargs={"model": "grok"}, task="title", async_mode=False,
+        base_info=client.base_url, resolved_provider="auto", request_provider="xai-oauth",
+        resolved_model="grok", resolved_base_url=None, resolved_api_key=None,
+        resolved_api_mode=None, final_model="grok", max_tokens=None, main_runtime=None, route_info={},
+    )
+    try:
+        assert next(ladder).kind == "retry_same_provider"
+        assert evicted == ["auto"]
+    finally:
+        ladder.close()
