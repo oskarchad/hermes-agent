@@ -345,6 +345,8 @@ _SPECS = [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
         _arg("--reviewer", help="Optional reviewer profile; reassigns the task before review dispatch."),
+        _arg("--review-skill", dest="review_skills", action="append",
+             help="Reviewer-only required skill (repeatable); author skills remain on the task."),
         _arg("--metadata", help="JSON object with structured reviewer handoff facts."),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "

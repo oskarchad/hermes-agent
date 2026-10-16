@@ -222,6 +222,11 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "Optional reviewer profile. When provided, the task is "
                 "reassigned to that profile before review dispatch."
         )),
+        "review_skills": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Explicit reviewer-only required skills. Author skills stay on the task; sdlc-review is always added. Required for cross-profile handoffs with author skills; omitted on re-review reuses the prior review list.",
+        },
         "metadata": {
             "type": "object",
             "description": (
