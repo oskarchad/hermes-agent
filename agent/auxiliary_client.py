@@ -3231,12 +3231,7 @@ def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(kw in text for kw in needles)
 
 
-# Billing-body markers (credit exhaustion wrapped in 402/403/404/429 bodies). The main classifier's
-# ``_BILLING_PATTERNS`` is the single source (#107166: the two lists had drifted, so OpenRouter's org
-# "Budget limit exceeded" / "Key limit exceeded" 403s were billing for the main loop but not for the aux
-# ladder, and aux fallback never fired); the aux list only adds broader phrasings and daily/weekly quota
-# exhaustion (functionally credit exhaustion; "resource exhausted" is the Vertex/gRPC quota phrasing —
-# also serialized by SDK wrappers and NIM as RESOURCE_EXHAUSTED / ResourceExhausted / resource-exhausted).
+# Share the main billing table (#107166); add auxiliary daily/weekly and Vertex/gRPC quota phrasings.
 _PAYMENT_KEYWORDS = _BILLING_PATTERNS + (
     "credits", "insufficient funds", "can only afford", "billing",
     "isn't available on the free tier", "key limit exceeded", "budget limit",
@@ -3248,11 +3243,18 @@ _PAYMENT_KEYWORDS = _BILLING_PATTERNS + (
 )
 
 
+def _is_proxy_wrapped_limit(exc: Exception) -> bool:
+    """9router and similar proxies can mask an explicit upstream limit as a 5xx."""
+    status = getattr(exc, "status_code", None)
+    return (isinstance(status, int) and 500 <= status < 600
+            and re.search(r"\[429\]|\brate_limit_error\b", str(exc).lower()) is not None)
+
+
 def _is_payment_error(exc: Exception) -> bool:
-    """Payment/credit/quota exhaustion: HTTP 402, or a billing/quota body on 403/404/429/no-status."""
+    """Payment/credit/quota exhaustion, including proxy-wrapped upstream limits."""
     status = getattr(exc, "status_code", None)
     return status == 402 or (
-        status in {403, 404, 429, None} and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
+        (status in {403, 404, 429, None} or _is_proxy_wrapped_limit(exc)) and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
     )
 
 
@@ -3283,12 +3285,10 @@ def _is_overloaded_error(exc: Exception) -> bool:
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
-    """429 rate limit (not billing/quota, which _is_payment_error owns).
-
-    OpenAI's RateLimitError may omit .status_code — matched by class name. A generic 429 without
-    billing keywords counts as a rate limit.
-    """
-    # (PR #8023 pattern)
+    """429 (or proxy-wrapped limit); wrapped billing/quota belongs to _is_payment_error.
+    OpenAI's RateLimitError may omit status_code (PR #8023)."""
+    if _is_proxy_wrapped_limit(exc):
+        return not _is_payment_error(exc)
     if type(exc).__name__ == "RateLimitError":
         return True
     if getattr(exc, "status_code", None) != 429:
@@ -7433,7 +7433,7 @@ def _resolve_call_client(
             effective_provider, client, final_model = resolve_vision_provider_client(
                 provider="auto", model=resolved_model, async_mode=async_mode,
                 main_runtime=main_runtime)
-        if client is not None:
+        if client is not None and resolved_provider != "auto":
             resolved_provider = effective_provider or resolved_provider
     else:
         client, final_model = _get_cached_client(
