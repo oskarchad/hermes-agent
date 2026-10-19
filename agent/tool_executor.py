@@ -749,6 +749,11 @@ def _dispatch_authorized_once(
     from agent.terminal_approval_batch import prepare_current_terminal
     prepare_current_terminal(ref)
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
+    # Checkpoint preflight can outlive the executor's deadline. Do not launch
+    # the backend after that worker was interrupted/abandoned while snapshotting.
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return _ToolCancelledResult("[Tool execution cancelled before backend dispatch]")
     return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
 
 

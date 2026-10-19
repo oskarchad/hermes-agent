@@ -17,12 +17,20 @@ from pm.worker_operations import OPERATIONS
 
 
 def _missing_or_refuse(name):
-    from pm.install import _refuse_lazy, is_installed, lazy_installs_allowed
-    from pm.registry import walk
+    from pm.install import _lockfile, _refuse_lazy, is_installed, lazy_installs_allowed
+    from pm.registry import get_package, walk
+    from pm.store import current_target
 
     missing = [package.name for package in walk([name]) if not is_installed(package.name)]
     if missing and not lazy_installs_allowed():
         raise _refuse_lazy(name, ", ".join(missing))
+    # The first install would fail before any publication. Avoid bootstrapping
+    # a worker just to reject a declared platform gap (e.g. Git on POSIX).
+    if missing and _lockfile().version(missing[0]) is not None:
+        target = current_target()
+        reason = get_package(missing[0]).missing_reason(target)
+        if reason is not None:
+            raise InstallError(missing[0], f"unavailable on {target}: {reason}", "none")
     return missing
 
 
