@@ -478,6 +478,10 @@ class _ToolTimeoutResult(str):
     """Marker for a synthesized sequential-tool timeout result."""
 
 
+class _ToolDispatchCancelledResult(str):
+    """Preflight stopped before backend dispatch; the result publisher still owns its hook."""
+
+
 class _ToolCancelledResult(str):
     """Marker for a synthesized sequential-tool user-interrupt result; its terminal
     post_tool_call was already emitted, so a late-finishing abandoned worker must not report."""
@@ -693,6 +697,7 @@ def _dispatch_authorized_once(
     display_index: int | None,
     begin_execution,
     authorization_gate: _ConcurrentToolAuthorizationGate | None,
+    abandoned: threading.Event | None,
 ) -> Any:
     """Hermes policy (scope → plugin pre-hooks → pruned-arg check → guardrails) then the one real dispatch.
 
@@ -749,11 +754,15 @@ def _dispatch_authorized_once(
     from agent.terminal_approval_batch import prepare_current_terminal
     prepare_current_terminal(ref)
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    # Checkpoint preflight can outlive the executor's deadline. Do not launch
-    # the backend after that worker was interrupted/abandoned while snapshotting.
+    # Call-owned abandonment survives normal turn-finalizer interrupt clearing.
+    # Its publisher owns the terminal event; a late worker must emit nothing.
+    if abandoned is not None and abandoned.is_set():
+        raise _BatchAbandoned(ref.name)
     from tools.interrupt import is_interrupted
     if is_interrupted():
-        return _ToolCancelledResult("[Tool execution cancelled before backend dispatch]")
+        return _ToolDispatchCancelledResult(json.dumps({
+            "error": "Tool execution cancelled before backend dispatch", "status": "cancelled",
+        }))
     return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
 
 
@@ -770,6 +779,7 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    abandoned: threading.Event | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -798,6 +808,7 @@ def _run_agent_tool_execution_middleware(
             display_index=display_index,
             begin_execution=begin_execution,
             authorization_gate=authorization_gate,
+            abandoned=abandoned,
         )
 
     from agent.terminal_approval_batch import bind_prepared_dispatch
@@ -934,11 +945,14 @@ def _run_sequential_tool_execution_middleware(
     if prepared is None:
         authorization_gate = _ConcurrentToolAuthorizationGate()
         worker_tid: list[int] = []
+    dispatch_abandoned = prepared.batch.cancelled if prepared is not None else threading.Event()
 
     def _run() -> _ManagedToolResult:
         with _registered_tool_worker(agent) as tid:
             worker_tid.append(tid)
-            return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
+            return _run_agent_tool_execution_middleware(
+                agent, authorization_gate=authorization_gate, abandoned=dispatch_abandoned, **kwargs,
+            )
 
     if ref.trace is None:
         ref.trace = []
@@ -977,6 +991,7 @@ def _run_sequential_tool_execution_middleware(
                 duration_ms=int(timeout_s * 1000), status="timeout", error_type="tool_timeout", error_message=message,
             )
         abandoned = True
+        dispatch_abandoned.set()
         if prepared is not None:
             # A timed-out shell may still be unwinding. Never release a later
             # prepared command into overlapping execution.
@@ -1351,6 +1366,7 @@ class _ConcurrentBatch:
                 display_index=index + 1,
                 begin_execution=start_gate.advance,
                 authorization_gate=self.authorization_gate,
+                abandoned=self.gate.abandoned,
             )
             result, ref.args, ref.trace = managed.result, managed.args, managed.middleware_trace
             blocked, dispatched = managed.blocked, managed.dispatched
@@ -1368,7 +1384,7 @@ class _ConcurrentBatch:
             result = f"Error executing tool '{ref.name}': {tool_error}"
             logger.error("_invoke_tool raised for %s: %s", ref.name, tool_error, exc_info=True)
         duration = time.time() - start
-        if not blocked and not dispatched:
+        if not blocked and (not dispatched or isinstance(result, _ToolDispatchCancelledResult)):
             ref.emit_post(agent, result, duration_ms=int(duration * 1000))
         is_error, _ = _detect_tool_failure(ref.name, result)
         if is_error:

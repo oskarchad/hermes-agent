@@ -82,6 +82,7 @@ class _TerminalSlot:
                     batch.agent, **ref.middleware_kwargs(), execute=dispatch.execute,
                     scope_block=pc.scope_block, display_index=self.index + 1,
                     authorization_gate=batch.authorization_gate,
+                    abandoned=batch.cancelled,
                 )
         finally:
             self.ready.set()
