@@ -140,6 +140,69 @@ def test_concurrent_checkpoint_cancellation_has_one_terminal_owner(tmp_path, mon
     assert len(posts) == 1
 
 
+@pytest.mark.parametrize("winner", ["worker", "deadline"])
+def test_concurrent_terminal_selection_precedes_stalled_hook(tmp_path, monkeypatch, winner):
+    checkpoint_entered, hook_entered, release, finished = [threading.Event() for _ in range(4)]
+    posts, dispatched, committed = [], [], []
+    agent = SimpleNamespace(
+        quiet_mode=True, tool_progress_mode="off", tool_progress_callback=None,
+        tool_start_callback=None, _touch_activity=lambda *_: None,
+        _tool_guardrails=ToolCallGuardrailController(), session_id="terminal-race",
+        _interrupt_requested=False, _execution_thread_id=None,
+        _tool_worker_threads=set(), _tool_worker_threads_lock=threading.Lock(),
+        _invoke_tool=lambda *a, **kw: dispatched.append(a) or "{}",
+    )
+
+    def checkpoint(*args):
+        checkpoint_entered.set()
+        if winner == "deadline":
+            assert release.wait(10)
+        interrupt.set_interrupt(True)
+        return True
+
+    def post(*args, **kwargs):
+        posts.append(kwargs)
+        hook_entered.set()
+        if winner == "worker":
+            assert release.wait(10)
+
+    agent._checkpoint_mgr = SimpleNamespace(enabled=True, ensure_checkpoint=checkpoint)
+    parsed = te._ParsedCall(SimpleNamespace(id="terminal-race-call"), "terminal",
+                            {"command": "printf fixture > output.txt", "workdir": str(tmp_path)}, [], None, None)
+    batch = te._ConcurrentBatch(agent, [], "terminal-race", [parsed], 2)
+    original = batch.run_worker
+
+    def worker(*args):
+        try:
+            return original(*args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(te, "_ra", lambda: SimpleNamespace(_set_interrupt=interrupt.set_interrupt))
+    monkeypatch.setattr(te, "_emit_terminal_post_tool_call", post)
+    monkeypatch.setattr(te, "_commit_tool_result", lambda *a, **kw: committed.append(a[3]))
+    monkeypatch.setattr(batch, "run_worker", worker)
+    try:
+        batch.run()
+        assert checkpoint_entered.is_set()
+        if winner == "worker":
+            assert hook_entered.is_set()
+        te._append_batch_results(agent, [], "terminal-race", batch, None)
+        selected = batch.results[0]
+        assert selected is not None
+        assert committed == [selected.result]
+        if winner == "worker":
+            assert json.loads(selected.result)["status"] == "cancelled"
+        else:
+            assert "timed out" in selected.result
+    finally:
+        release.set()
+        assert finished.wait(5)
+    assert dispatched == []
+    assert len(posts) == 1
+    assert batch.results[0] is selected, "late worker overwrote the selected terminal result"
+
+
 def test_prepared_terminal_retains_batch_abandonment_after_checkpoint(tmp_path, monkeypatch):
     from agent import terminal_approval_batch as tab
     dispatched = []
