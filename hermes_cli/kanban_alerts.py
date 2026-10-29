@@ -1,6 +1,7 @@
 """Bounded, redacted presentation helpers for Kanban terminal alerts."""
 
 from __future__ import annotations
+import logging
 
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -20,6 +21,8 @@ class KanbanEventLineage:
     block_is_current: bool
 
 
+logger = logging.getLogger(__name__)
+
 def _redact_text(value: Any) -> str:
     from agent.redact import redact_sensitive_text
 
@@ -32,6 +35,7 @@ def _bounded_atom(value: Any, *, fallback: str) -> str:
     try:
         text = _redact_text(value)
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         return "[redacted]"
     text = " ".join(text.split())
     if not text:
@@ -86,6 +90,7 @@ def render_kanban_alert(
         redacted = _redact_text(text)
         suffix = f"\n{_redact_text(lineage.text)}" if lineage is not None else ""
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         return _REDACTION_FAILURE_TEXT
 
     prefix_limit = KANBAN_ALERT_MAX_CHARS - len(suffix)

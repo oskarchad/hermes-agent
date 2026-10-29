@@ -20,9 +20,22 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
             continue
         with _profile_runtime_scope(profile_home or get_hermes_home()):
             from cron.delivery_routes import adapters_for_profile
+
+            def _allowed_profiles():
+                # Gate on the runner's LIVE allowlist, not just the watch scopes. Watch scopes come
+                # from `_multiplex_profile_homes`, which enumerates profiles on disk and ignores
+                # `multiplex_profile_allowlist` — so a profile whose authorization was revoked after
+                # dispatch would still drain here. Cron output must never be delivered through an
+                # adapter the operator has since de-authorized.
+                names = {name for name, _ in _handoff_watch_scopes(runner) if name is not None}
+                cfg = getattr(runner, "config", None)
+                allowlist = getattr(cfg, "multiplex_profile_allowlist", None)
+                if allowlist is not None:
+                    names &= set(allowlist)
+                return names
+
             view = adapters_for_profile(
                 profile_name, primary=adapters,
                 profiles=getattr(runner, "_profile_adapters", {}),
-                allowed_profiles=lambda: {
-                    name for name, _ in _handoff_watch_scopes(runner) if name is not None})
+                allowed_profiles=_allowed_profiles)
             cron_scheduler.drain_delivery_queue(view, loop)

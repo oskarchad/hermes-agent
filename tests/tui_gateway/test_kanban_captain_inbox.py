@@ -20,7 +20,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
-import tui_gateway.server as server
+from tui_gateway import server
 from tui_gateway.server import _collect_kanban_notifications
 
 ORIGIN_KEY = "captain-origin-session"
@@ -156,7 +156,8 @@ def test_live_origin_owns_report_sibling_gets_none():
 
     # Sibling must not claim while the exact origin is live.
     sib_claims = []
-    assert _collect_kanban_notifications(sibling, claim_records=sib_claims) == []
+    from tui_gateway import captain_inbox
+    assert captain_inbox._collect_kanban_notifications(sibling, claim_records=sib_claims) == []
     assert sib_claims == []
 
     orig_claims = []
@@ -1075,6 +1076,9 @@ class _EmptyCompletionQueue:
 
     def empty(self):
         return True
+
+    def qsize(self):
+        return 0
 
 
 def test_poller_loop_reject_releases_then_accept_acks_no_replay(monkeypatch):

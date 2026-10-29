@@ -264,7 +264,7 @@ def test_default_spawn_uses_exact_task_toolsets_in_worker_and_reviewer_phases(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    kb._default_spawn(_spawn_task(kb, status=status), str(workspace))
+    kbd._default_spawn(_spawn_task(kb, status=status), str(workspace))
 
     command = captured["cmd"]
     assert isinstance(command, list)
