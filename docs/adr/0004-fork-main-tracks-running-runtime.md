@@ -26,9 +26,15 @@ runtime fixes could only land as PRs against `backup/live-*` branches.
   entries are covered by this directory's `README.md`, and its remaining
   entry describes upstream plugin-manager code. It stays readable in
   history through the old `main` parent.
-- Fork CI keeps the upstream workflows unchanged. The only addition is
-  `github.repository == 'oskarchad/hermes-agent'` runner fallbacks, because
-  the fork has no larger hosted runners.
+- Fork CI keeps the upstream workflows unchanged except for
+  `github.repository == 'oskarchad/hermes-agent'` guards: standard-runner
+  fallbacks (the fork has no larger hosted runners) and, in `tests.yml`,
+  `timeout-minutes: 60` and `HERMES_TEST_WORKERS=4` sized for those runners.
+- Main-only Honcho HER-155 noise filter (`plugins/memory/honcho`, source
+  `b7a722c6`) is NOT_CARRIED and remains an OPEN GAP: the contract is still
+  required, but the active consumer is the out-of-repo catalog plugin
+  `profiles/otto/plugins/honcho`, which lacks the filter in the running
+  runtime as well. Porting it is a separate card owned by Otto.
 
 ## Consequences
 

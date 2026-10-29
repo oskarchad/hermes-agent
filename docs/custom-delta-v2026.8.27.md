@@ -8,7 +8,7 @@ is recorded in the Kanban completion handoff and bound OCR receipt.
 The prior custom runtime `e2e0642166c02a682d071b89be9ef73109f88ec5` was used
 only as behavioral evidence. Shared upstream behavior was not replayed.
 
-Governing direction is indexed by `docs/ADR.md` and recorded in
+Governing direction is indexed by `docs/adr/README.md` and recorded in
 `docs/0001-retained-custom-runtime-delta.md`. The backend/renderer seam routes
 through `apps/desktop/DESIGN.md`, `docs/kanban/multi-gateway.md`, and
 `docs/session-lifecycle.md` so future contributors reach the same contracts.
