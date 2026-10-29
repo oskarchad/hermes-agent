@@ -147,6 +147,8 @@ Every former god file is a **facade** (public entry points + the names other pac
 
 ## Routing Table — working in X → read X/AGENTS.md
 
+Fork ADRs: [index](docs/adr/README.md).
+
 | Area | Read | Covers |
 |---|---|---|
 | `run_agent.py`, `agent/` | `agent/AGENTS.md` | turn phases, caching and message-flow invariants, compression, model/aux resolution |
