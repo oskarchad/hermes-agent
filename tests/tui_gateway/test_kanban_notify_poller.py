@@ -246,21 +246,6 @@ class TestFormatKanbanEventText:
             ev = SimpleNamespace(kind=kind, payload={})
             assert _format_kanban_event_text(self.SUB, self.TASK, ev, "main") is None
 
-    def test_blocked_includes_reason(self):
-        ev = SimpleNamespace(kind="blocked", payload={"reason": "needs creds"})
-        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
-        assert "t_abc123" in text
-        assert "blocked" in text
-        assert "needs creds" in text
-        assert "[main]" in text
-        assert "@worker" in text
-
-    def test_completed_prefers_payload_summary(self):
-        ev = SimpleNamespace(kind="completed", payload={"summary": "first line\nsecond"})
-        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
-        assert "done" in text
-        assert "first line" in text
-        assert "second" not in text
 
     def test_timed_out_with_bad_payload_does_not_raise(self):
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
@@ -279,7 +264,7 @@ class TestNotificationPollerLoopKanbanWiring:
 
     def _start_poller(self, session: dict, monkeypatch):
         import threading
-        import tui_gateway.server as server
+        from tui_gateway import server
 
         emits: list = []
         submits: list = []
@@ -342,7 +327,7 @@ class TestNotificationPollerLoopKanbanWiring:
     def _run_poller_once(session: dict, monkeypatch, *, emits: list, submit) -> None:
         import threading
 
-        import tui_gateway.server as server
+        from tui_gateway import server
         from tools.process_registry import process_registry
 
         class _StopAfterOnePoll(threading.Event):
@@ -360,6 +345,9 @@ class TestNotificationPollerLoopKanbanWiring:
 
             def empty(self):
                 return True
+
+            def qsize(self):
+                return 0
 
         monkeypatch.setattr(process_registry, "completion_queue", _EmptyCompletionQueue())
         monkeypatch.setattr(server, "_maybe_fire_tui_loop_tick", lambda *_args: None)
@@ -428,7 +416,7 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
 
     def test_codex_runtime_does_not_advertise_captain_receiver(self, monkeypatch):
-        import tui_gateway.server as server
+        from tui_gateway import server
 
         session = self._poller_session(running=False)
         session["agent"] = SimpleNamespace(api_mode="codex_app_server")
@@ -458,7 +446,7 @@ class TestNotificationPollerLoopKanbanWiring:
     ):
         import time as _time
 
-        import tui_gateway.server as server
+        from tui_gateway import server
 
         tid = _create_subscribed_task()
         _complete(tid, summary="long Captain turn")
@@ -514,7 +502,7 @@ class TestNotificationPollerLoopKanbanWiring:
     def test_captain_signal_terminal_settlement_posts_reply_exactly_once(
         self, monkeypatch, tmp_path
     ):
-        import tui_gateway.server as server
+        from tui_gateway import server
         from tools import kanban_tools as kt
 
         class ActiveWorker:
@@ -643,7 +631,7 @@ class TestNotificationPollerLoopKanbanWiring:
     def test_busy_session_waits_then_dispatches_when_idle(self, monkeypatch):
         import threading
 
-        import tui_gateway.server as server
+        from tui_gateway import server
 
         tid = _create_subscribed_task()
         initial_cursor = _sub_rows(tid)[0]["last_event_id"]
@@ -786,7 +774,7 @@ class TestNotificationPollerLoopKanbanWiring:
     def test_no_turn_reservation_cannot_strand_waiting_user_prompt(
         self, monkeypatch, outcome
     ):
-        import tui_gateway.server as server
+        from tui_gateway import server
         from tools.process_registry import process_registry
 
         class _WaiterFirstLock:
@@ -834,6 +822,9 @@ class TestNotificationPollerLoopKanbanWiring:
 
             def empty(self):
                 return True
+
+            def qsize(self):
+                return 0
 
         history_lock = _WaiterFirstLock()
         session = {

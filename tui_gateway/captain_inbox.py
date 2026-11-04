@@ -83,7 +83,7 @@ def _session_captain_profile(session: dict) -> str:
         if isinstance(session, dict) and session.get("profile_home"):
             return normalize_profile_name(Path(session["profile_home"]).name)
     except Exception:
-        pass
+        logger.debug("runtime boundary failed", exc_info=True)
     return normalize_profile_name(_current_profile_name())
 
 
@@ -175,6 +175,7 @@ def _collect_captain_reports(
             receiver_max_age_seconds=_CAPTAIN_RECEIVER_TTL_SECONDS,
         )
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         return 0
     eligible = [
         int(c["event_id"])
@@ -309,6 +310,7 @@ def _touch_captain_receivers(session: dict) -> None:
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         boards = [{"slug": _kb.DEFAULT_BOARD}]
     seen_db_paths: set[str] = set()
     for board_meta in boards:
@@ -320,6 +322,7 @@ def _touch_captain_receivers(session: dict) -> None:
                 if db_path else str(_kb.kanban_db_path(slug).resolve())
             )
         except Exception:
+            logger.debug("runtime boundary failed", exc_info=True)
             resolved = f"slug:{slug}"
         if resolved in seen_db_paths:
             continue
@@ -334,6 +337,7 @@ def _touch_captain_receivers(session: dict) -> None:
                 tenant=None,
             )
         except Exception:
+            logger.debug("runtime boundary failed", exc_info=True)
             continue
         finally:
             if conn is not None:
@@ -351,6 +355,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     try:
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         return
 
     sid_key = session.get("session_key") or ""
@@ -413,7 +418,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                     _run_prompt_submit(rid, sid, session, payload["message"])
                     return
             except Exception:
-                pass
+                logger.debug("runtime boundary failed", exc_info=True)
             decision = mgr.complete_tick("")
             if decision.get("message"):
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
@@ -421,6 +426,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         _emit("message.start", sid)
         _run_prompt_submit(rid, sid, session, wakeup)
     except Exception as exc:
+        logger.debug("runtime boundary failed", exc_info=True)
         print(
             f"[tui_gateway] loop wakeup dispatch failed: "
             f"{type(exc).__name__}: {exc}",
@@ -431,10 +437,10 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         try:
             mgr.abandon_tick()
         except Exception:
-            pass
+            logger.debug("runtime boundary failed", exc_info=True)
 
 
-def _format_kanban_event_text(
+def _captain_format_kanban_event_text(
     sub: dict,
     task,
     ev,
@@ -522,7 +528,52 @@ def _format_kanban_event_text(
     return None
 
 
-def _collect_kanban_notifications(
+def _captain_event_owned_here(conn, ev, captain_profile, session_key, include_captain, claim_records):
+    """The Captain lease owns this event when both durable routes target this session."""
+    captain_backed = conn.execute('SELECT 1 FROM kanban_captain_inbox WHERE event_id = ?', (ev.id,)).fetchone() is not None
+    captain_owner = conn.execute('SELECT profile, origin_session_key FROM kanban_captain_registry WHERE task_id = ?', (ev.task_id,)).fetchone()
+    captain_owned_here = bool(captain_owner and captain_owner['profile'] == captain_profile and (not captain_owner['origin_session_key'] or captain_owner['origin_session_key'] == session_key))
+    if include_captain and captain_backed and captain_owned_here and (claim_records is not None):
+        return
+    return True
+
+def _collect_captain_origin_subscriptions(conn, subs, slug, session_key, captain_profile, claim_records, texts, include_captain):
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_notify as kbn
+    claimed_event_ids = set()
+    for sub in subs:
+        if (sub.get('platform') or '').lower() != 'tui':
+            continue
+        if sub.get('chat_id') != session_key:
+            continue
+        old_cursor, claimed_cursor, events = kbn.claim_unseen_events_for_sub(conn, task_id=sub['task_id'], platform=sub['platform'], chat_id=sub['chat_id'], thread_id=sub.get('thread_id') or '', kinds=_KANBAN_NOTIFY_KINDS)
+        if not events:
+            continue
+        claim_record = None
+        if claim_records is not None:
+            claim_record = {'board': slug, 'sub': sub, 'old_cursor': old_cursor, 'claimed_cursor': claimed_cursor, 'unsubscribe': False, 'deliveries': []}
+            claim_records.append(claim_record)
+        task = _kb.get_task(conn, sub['task_id'])
+        latest_run = _kb.latest_run(conn, sub['task_id'])
+        if claim_record is not None:
+            claim_record['unsubscribe'] = bool(task and getattr(task, 'status', '') == 'archived')
+        for ev in events:
+            if not _captain_event_owned_here(conn, ev, captain_profile, session_key, include_captain, claim_records):
+                continue
+            claimed_event_ids.add(ev.id)
+            text = _format_kanban_event_text(sub, task, ev, slug, latest_run)
+            if text:
+                texts.append(text)
+                if claim_record is not None:
+                    claim_record['deliveries'].append({'id': f'kanban:{slug}:{ev.id}', 'event_id': ev.id, 'text': text})
+        if claim_records is None and task and (getattr(task, 'status', '') == 'archived'):
+            try:
+                kbn.remove_notify_sub(conn, task_id=sub['task_id'], platform=sub['platform'], chat_id=sub['chat_id'], thread_id=sub.get('thread_id') or '')
+            except Exception:
+                logger.debug('runtime boundary failed', exc_info=True)
+    return claimed_event_ids
+
+def _captain_collect_kanban_notifications(
     session: dict,
     *,
     claim_records: Optional[list[dict]] = None,
@@ -552,15 +603,18 @@ def _collect_kanban_notifications(
         from hermes_cli import kanban_db_connect as kbc
         from hermes_cli import kanban_db_notify as kbn
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         return []
     captain_profile = _session_captain_profile(session)
     texts: list = []
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         try:
             boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
         except Exception:
+            logger.debug("runtime boundary failed", exc_info=True)
             return []
     # Poll each resolved DB path once — multiple slugs can point at the same
     # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
@@ -576,6 +630,7 @@ def _collect_kanban_notifications(
                 if db_path else str(_kb.kanban_db_path(slug).resolve())
             )
         except Exception:
+            logger.debug("runtime boundary failed", exc_info=True)
             resolved = f"slug:{slug}"
         if resolved in seen_db_paths:
             continue
@@ -594,6 +649,7 @@ def _collect_kanban_notifications(
         except Exception:
             # Preserve delivery if the read-only probe cannot inspect a
             # locked, corrupt, or otherwise unusual database.
+            logger.debug("runtime boundary failed", exc_info=True)
             open_writable = True
         if not open_writable and claim_records is not None and include_captain:
             try:
@@ -601,116 +657,28 @@ def _collect_kanban_notifications(
                     board=slug, profile=captain_profile
                 ) > 0
             except Exception:
+                logger.debug("runtime boundary failed", exc_info=True)
                 open_writable = True
         if not open_writable:
             continue
         try:
             conn = kbc.connect(board=slug)
         except Exception:
+            logger.debug("runtime boundary failed", exc_info=True)
             continue
         try:
             claimed_event_ids: set = set()
             try:
                 subs = kbn.list_notify_subs(conn)
             except Exception:
+                logger.debug("runtime boundary failed", exc_info=True)
                 subs = []
             # Once this poll has leased its one Captain event, leave ordinary
             # subscription cursors untouched for the next turn. Conversely, an
             # earlier ordinary delivery prevents leasing a Captain row below.
-            for sub in (() if captain_rows_leased else subs):
-                if (sub.get("platform") or "").lower() != "tui":
-                    continue
-                if sub.get("chat_id") != session_key:
-                    continue
-                old_cursor, claimed_cursor, events = kbn.claim_unseen_events_for_sub(
-                    conn,
-                    task_id=sub["task_id"],
-                    platform=sub["platform"],
-                    chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
-                )
-                if not events:
-                    continue
-                claim_record = None
-                if claim_records is not None:
-                    claim_record = {
-                        "board": slug,
-                        "sub": sub,
-                        "old_cursor": old_cursor,
-                        "claimed_cursor": claimed_cursor,
-                        "unsubscribe": False,
-                        "deliveries": [],
-                    }
-                    claim_records.append(claim_record)
-                task = _kb.get_task(conn, sub["task_id"])
-                latest_run = _kb.latest_run(conn, sub["task_id"])
-                if claim_record is not None:
-                    claim_record["unsubscribe"] = bool(
-                        task and getattr(task, "status", "") == "archived"
-                    )
-                for ev in events:
-                    captain_backed = conn.execute(
-                        "SELECT 1 FROM kanban_captain_inbox WHERE event_id = ?",
-                        (ev.id,),
-                    ).fetchone() is not None
-                    captain_owner = conn.execute(
-                        "SELECT profile, origin_session_key "
-                        "FROM kanban_captain_registry WHERE task_id = ?",
-                        (ev.task_id,),
-                    ).fetchone()
-                    captain_owned_here = bool(
-                        captain_owner
-                        and captain_owner["profile"] == captain_profile
-                        and (
-                            not captain_owner["origin_session_key"]
-                            or captain_owner["origin_session_key"] == session_key
-                        )
-                    )
-                    if (
-                        include_captain
-                        and captain_backed
-                        and captain_owned_here
-                        and claim_records is not None
-                    ):
-                        # When this session owns both routes, the Captain lease
-                        # is the single delivery receipt. Other creator sessions
-                        # retain their independent exact-origin notification.
-                        continue
-                    # Record every event id the exact-origin route claimed so
-                    # the Captain route can settle-but-not-duplicate the same
-                    # task_event.id (both routes may see it for the origin).
-                    claimed_event_ids.add(ev.id)
-                    text = _format_kanban_event_text(
-                        sub, task, ev, slug, latest_run,
-                    )
-                    if text:
-                        texts.append(text)
-                        if claim_record is not None:
-                            claim_record["deliveries"].append({
-                                "id": f"kanban:{slug}:{ev.id}",
-                                "event_id": ev.id,
-                                "text": text,
-                            })
-                # Unsubscribe only on archive. ``done`` is reversible in
-                # review/controller flows, so retaining the subscription lets
-                # a later reopen notify the same originating TUI/Desktop
-                # session. The claimed cursor prevents historical replay.
-                if (
-                    claim_records is None
-                    and task
-                    and getattr(task, "status", "") == "archived"
-                ):
-                    try:
-                        kbn.remove_notify_sub(
-                            conn,
-                            task_id=sub["task_id"],
-                            platform=sub["platform"],
-                            chat_id=sub["chat_id"],
-                            thread_id=sub.get("thread_id") or "",
-                        )
-                    except Exception:
-                        pass
+            claimed_event_ids = _collect_captain_origin_subscriptions(
+                conn, () if captain_rows_leased else subs, slug, session_key,
+                captain_profile, claim_records, texts, include_captain)
             # Durable, profile-scoped Captain route (fallback + generalization
             # of the exact-origin route above). Claims reportable terminal
             # events for this session's profile, deduplicating any already
@@ -727,6 +695,7 @@ def _collect_kanban_notifications(
                         ),
                     )
                 except Exception as exc:
+                    logger.debug("runtime boundary failed", exc_info=True)
                     print(
                         f"[tui_gateway] captain report collection failed: "
                         f"{type(exc).__name__}: {exc}",
@@ -768,6 +737,31 @@ def _renew_kanban_notification_claims(
             conn.close()
 
 
+def _settle_one_captain_claim(conn, record, accepted, reply_author, reply_body):
+    from hermes_cli import kanban_db as _kb
+    expected = max(1, int(record.get('expected_count') or 1))
+    owner = record.get('owner')
+    if not owner:
+        raise RuntimeError('Captain settlement claim has no fenced owner')
+    if accepted:
+        signal_task_ids = set(record.get('signal_task_ids') or ())
+        if signal_task_ids:
+            if not reply_author or not reply_body or (not reply_body.strip()):
+                raise RuntimeError('Captain signal settlement requires a persisted reply')
+            settled = _kb.ack_captain_reports_with_reply(conn, token=record['token'], owner=owner, reply_author=reply_author, reply_body=reply_body, reply_task_ids=signal_task_ids)
+        else:
+            settled = _kb.ack_captain_reports(conn, token=record['token'], owner=owner)
+        if settled != expected:
+            raise RuntimeError(f'Captain ack expected {expected} row(s), got {settled}')
+        for tid in record.get('task_ids') or ():
+            try:
+                _kb.captain_gc_task_if_settled(conn, tid)
+            except Exception:
+                logger.debug('runtime boundary failed', exc_info=True)
+                logger.warning('Captain settled-task GC failed for %s', tid, exc_info=True)
+    else:
+        _kb.release_captain_reports(conn, token=record['token'], owner=owner)
+
 def _settle_kanban_notification_claims(
     claim_records: list[dict],
     *,
@@ -792,53 +786,9 @@ def _settle_kanban_notification_claims(
             conn = None
             try:
                 conn = kbc.connect(board=record["board"])
-                expected = max(1, int(record.get("expected_count") or 1))
-                owner = record.get("owner")
-                if not owner:
-                    raise RuntimeError("Captain settlement claim has no fenced owner")
-                if accepted:
-                    signal_task_ids = set(record.get("signal_task_ids") or ())
-                    if signal_task_ids:
-                        if not reply_author or not reply_body or not reply_body.strip():
-                            raise RuntimeError(
-                                "Captain signal settlement requires a persisted reply"
-                            )
-                        settled = _kb.ack_captain_reports_with_reply(
-                            conn,
-                            token=record["token"],
-                            owner=owner,
-                            reply_author=reply_author,
-                            reply_body=reply_body,
-                            reply_task_ids=signal_task_ids,
-                        )
-                    else:
-                        settled = _kb.ack_captain_reports(
-                            conn,
-                            token=record["token"],
-                            owner=owner,
-                        )
-                    if settled != expected:
-                        raise RuntimeError(
-                            f"Captain ack expected {expected} row(s), got {settled}"
-                        )
-                    # GC is retention-only after the authoritative ack. A GC
-                    # failure must not turn a committed delivery into a retry.
-                    for tid in record.get("task_ids") or ():
-                        try:
-                            _kb.captain_gc_task_if_settled(conn, tid)
-                        except Exception:
-                            logger.warning(
-                                "Captain settled-task GC failed for %s",
-                                tid,
-                                exc_info=True,
-                            )
-                else:
-                    _kb.release_captain_reports(
-                        conn,
-                        token=record["token"],
-                        owner=owner,
-                    )
+                _settle_one_captain_claim(conn, record, accepted, reply_author, reply_body)
             except Exception as exc:
+                logger.debug("runtime boundary failed", exc_info=True)
                 errors.append(exc)
                 if accepted:
                     failed_captain_records.append(record)
@@ -871,6 +821,7 @@ def _settle_kanban_notification_claims(
                     old_cursor=record["old_cursor"],
                 )
         except Exception as exc:
+            logger.debug("runtime boundary failed", exc_info=True)
             errors.append(exc)
         finally:
             if conn is not None:
@@ -890,6 +841,7 @@ def _settle_kanban_notification_claims(
                     owner=record.get("owner"),
                 )
             except Exception as exc:
+                logger.debug("runtime boundary failed", exc_info=True)
                 errors.append(exc)
             finally:
                 if conn is not None:
@@ -930,6 +882,7 @@ def _settle_captain_turn_claims(
         if not reply_body:
             raise RuntimeError("Captain signal reply is empty")
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         _settle_kanban_notification_claims(claim_records, accepted=False)
         raise
 
@@ -973,6 +926,7 @@ def _persisted_captain_report(session: dict, completion_id: str):
         try:
             return rehome(completion_id, session_id)
         except Exception:
+            logger.debug("runtime boundary failed", exc_info=True)
             logger.warning(
                 "Captain profile-wide transcript reconciliation failed for %s",
                 session_id,
@@ -1077,6 +1031,7 @@ def _start_captain_lease_renewer(claim_records: list[dict]):
             try:
                 _renew_kanban_notification_claims(claim_records)
             except Exception as exc:
+                logger.debug("runtime boundary failed", exc_info=True)
                 failures.append(exc)
                 return
 
@@ -1094,420 +1049,172 @@ def _stop_captain_lease_renewer(handle) -> None:
     if failures:
         raise RuntimeError("Captain lease renewal failed") from failures[0]
 
-def _notification_poller_loop(
-    stop_event: threading.Event, sid: str, session: dict
-) -> None:
-    """Poll completion_queue and dispatch notifications autonomously.
+def _notification_poller_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
+    """Compatibility entry point using the current scoped notification spine."""
+    with _session_profile_runtime_scope(session):
+        _notification_poller_scoped_loop(stop_event, sid, session)
 
-    Runs in a daemon thread started by _init_session(). Chains an agent turn via
-    _run_prompt_submit when idle, then commits the claims after the transcript
-    is durable and before the stable-id assistant completion is emitted.
+def _dispatch_native_kanban_pending(sid, session):
+    """Preserve native diagnostic partition/admission and settle origin cursors after the whole batch."""
+    if not session.get('_kanban_pending') or not _notif_claim_turn(session):
+        return
+    from gateway.warning_notifications import DiagnosticText, warning_notifications_enabled
+    with session['history_lock']:
+        pending = session['_kanban_pending']
+        split = not warning_notifications_enabled('tui')
+        diagnostic = split and isinstance(pending[0], DiagnosticText)
+        batch = [text for text in pending if not split or isinstance(text, DiagnosticText) == diagnostic]
+        remaining = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
+        session['_kanban_pending'] = remaining
+        claims = tuple(session.get('_kanban_pending_claims') or ())
+    settled = threading.Event()
 
-    The completion_queue is process-global. In multi-session Desktop each
-    poller requeues events owned by another live session and drops addressed
-    events whose owner is gone; ownerless legacy notifications remain global.
+    def terminal(success):
+        if settled.is_set():
+            return
+        settled.set()
+        if success and remaining:
+            return  # the cursor covers both partitions; acknowledge only after both settled
+        _settle_kanban_notification_claims(claims, accepted=bool(success))
+        with session['history_lock']:
+            session['_kanban_pending_claims'] = []
+            if not success:
+                session['_kanban_pending'] = []  # the rejected cursor was rewound for durable replay
+    kwargs = {'display_metadata': {'notification_category': 'diagnostic'}} if diagnostic else {}
+    if claims:
+        kwargs['on_terminal'] = terminal
+    rid = f'__notif__{int(time.time() * 1000)}'
+    try:
+        accepted = _notif_submit(rid, sid, session, '\n'.join(batch),
+            'kanban notification dispatch failed', **kwargs)
+        if accepted is False:
+            raise RuntimeError('synthetic turn was not accepted')
+    except Exception:
+        terminal(False)
+        _notif_release_turn(session)
+        logger.debug('ordinary kanban notification dispatch failed', exc_info=True)
+        _drain_queued_prompt(rid, sid, session)
 
-    Also polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` for this
-    session's TUI kanban subscriptions and delivers terminal task events the
-    same way (agent turn + terminal receipt) — the delivery path
-    tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
-    The poller reserves an idle turn before claiming the durable cursor; a
-    rejected dispatch rewinds that claim, so RAM is never the sole copy.
-    """
-    from tools.process_registry import process_registry, format_process_notification
 
-    _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
-    _last_kanban_poll = 0.0
-    _last_loop_poll = 0.0
-    while not stop_event.is_set() and not session.get("_finalized"):
-        _now = time.monotonic()
-        # ── /loop wakeup driver ──────────────────────────────────────
-        # Fire a due /loop tick for THIS session while it's idle. Same
-        # claim-under-lock pattern as the kanban dispatch below. Active
-        # non-parked /goal owns the idle boundary and defers the tick.
-        if _now - _last_loop_poll >= _LOOP_POLL_SECONDS:
-            _last_loop_poll = _now
+def _queue_native_kanban_batch(sid, session, texts, claims):
+    from gateway.warning_notifications import DiagnosticText, render_notification
+    for text in texts:
+        render_notification(lambda: _emit('status.update', sid, {'kind': 'process', 'text': text}),
+                            platform='tui', diagnostic=isinstance(text, DiagnosticText))
+    with session['history_lock']:
+        session.setdefault('_kanban_pending', []).extend(texts)
+        session.setdefault('_kanban_pending_claims', []).extend(claims)
+        session['running'] = False
+    _dispatch_native_kanban_pending(sid, session)
+
+
+def _poll_captain_notifications(sid: str, session: dict) -> None:
+    _captain_runtime_deferred = getattr(session.get('agent'), 'api_mode', '') == 'codex_app_server'
+    if not _captain_runtime_deferred:
+        try:
+            _touch_captain_receivers(session)
+        except Exception as _heartbeat_exc:
+            logger.debug("runtime boundary failed", exc_info=True)
+            print(f'[tui_gateway] Captain receiver heartbeat failed: {type(_heartbeat_exc).__name__}: {_heartbeat_exc}', file=sys.stderr)
+    _reserved = False
+    _kanban_claims: list[dict] = []
+    _kanban_texts: list[str] = []
+    _kb_exc = None
+    if not _notif_claim_turn(session):
+        return
+    with session['history_lock']:
+        if session.get('running'):
+            _reserved = True
             try:
-                _maybe_fire_tui_loop_tick(sid, session)
-            except Exception as _loop_exc:
-                print(
-                    f"[tui_gateway] loop wakeup poll failed: "
-                    f"{type(_loop_exc).__name__}: {_loop_exc}",
-                    file=sys.stderr,
-                )
-        if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
-            _last_kanban_poll = _now
-            _captain_runtime_deferred = (
-                getattr(session.get("agent"), "api_mode", "")
-                == "codex_app_server"
-            )
-            if not _captain_runtime_deferred:
+                _kanban_texts = _collect_kanban_notifications(session, claim_records=_kanban_claims, include_captain=not _captain_runtime_deferred)
+            except Exception as exc:
+                logger.debug("runtime boundary failed", exc_info=True)
+                _kb_exc = exc
+            if _kb_exc is not None:
                 try:
-                    _touch_captain_receivers(session)
-                except Exception as _heartbeat_exc:
-                    print(
-                        f"[tui_gateway] Captain receiver heartbeat failed: "
-                        f"{type(_heartbeat_exc).__name__}: {_heartbeat_exc}",
-                        file=sys.stderr,
-                    )
-            _reserved = False
-            _kanban_claims: list[dict] = []
-            _kanban_texts: list[str] = []
-            _kb_exc = None
-            with session["history_lock"]:
-                if not session.get("running"):
-                    # Hold the lock through the DB claim. A concurrent user
-                    # submit waits here instead of observing a transient busy
-                    # state on empty polls; when events exist, running=True is
-                    # already reserved before their cursor advances.
-                    session["running"] = True
-                    _reserved = True
+                    _settle_kanban_notification_claims(_kanban_claims, accepted=False)
+                except Exception as settle_exc:
+                    logger.debug("runtime boundary failed", exc_info=True)
+                    _kb_exc = settle_exc
+                session['running'] = False
+            elif not _kanban_texts:
+                try:
+                    _settle_kanban_notification_claims(_kanban_claims, accepted=True)
+                except Exception as settle_exc:
+                    logger.debug("runtime boundary failed", exc_info=True)
+                    _kb_exc = settle_exc
+                session['running'] = False
+    if _reserved:
+        if _kb_exc is not None:
+            print(f'[tui_gateway] kanban notification poll failed: {type(_kb_exc).__name__}: {_kb_exc}', file=sys.stderr)
+        elif _kanban_texts:
+            rid = f'__notif__{int(time.time() * 1000)}'
+            _settled = threading.Event()
+            _settled_lock = threading.Lock()
+            _lease_renewer = None
+            completion_id = _captain_completion_id(_kanban_claims, _kanban_texts)
+            _has_captain_claim = any(record.get('route') == 'captain' for record in _kanban_claims)
+            if not _has_captain_claim:
+                _queue_native_kanban_batch(sid, session, _kanban_texts, _kanban_claims)
+                return
+            try:
+                _reconciled = _reconcile_persisted_captain_report(sid, session, _kanban_claims, completion_id) if _has_captain_claim else False
+            except Exception as _reconcile_exc:
+                logger.debug("runtime boundary failed", exc_info=True)
+                _release_exc = None
+                try:
+                    _settle_kanban_notification_claims(_kanban_claims, accepted=False)
+                except Exception as exc:
+                    logger.debug("runtime boundary failed", exc_info=True)
+                    _release_exc = exc
+                print(f'[tui_gateway] Captain receipt reconciliation failed: {type(_reconcile_exc).__name__}: {_reconcile_exc}', file=sys.stderr)
+                if _release_exc is not None:
+                    print(f'[tui_gateway] Captain reconciliation release failed: {type(_release_exc).__name__}: {_release_exc}', file=sys.stderr)
+                with session['history_lock']:
+                    session['running'] = False
+                return
+            if _reconciled:
+                with session['history_lock']:
+                    session['running'] = False
+                return
+            _lease_renewer = _start_captain_lease_renewer(_kanban_claims)
+
+            def _settle_after_terminal(succeeded: Optional[bool], *, _claim_records=tuple(_kanban_claims), _completion_id=completion_id, _lease_handle=_lease_renewer, _settled_event=_settled, _settlement_lock=_settled_lock) -> None:
+                with _settlement_lock:
+                    if _settled_event.is_set():
+                        return
                     try:
-                        _kanban_texts = _collect_kanban_notifications(
-                            session,
-                            claim_records=_kanban_claims,
-                            include_captain=not _captain_runtime_deferred,
-                        )
-                    except Exception as exc:
-                        _kb_exc = exc
-                    if _kb_exc is not None:
+                        _stop_captain_lease_renewer(_lease_handle)
+                    except Exception:
+                        logger.debug("runtime boundary failed", exc_info=True)
+                        if succeeded is None:
+                            _settled_event.set()
+                            raise
                         try:
-                            _settle_kanban_notification_claims(
-                                _kanban_claims, accepted=False
-                            )
-                        except Exception as settle_exc:
-                            _kb_exc = settle_exc
-                        session["running"] = False
-                    elif not _kanban_texts:
-                        try:
-                            _settle_kanban_notification_claims(
-                                _kanban_claims, accepted=True
-                            )
-                        except Exception as settle_exc:
-                            _kb_exc = settle_exc
-                        session["running"] = False
-            if _reserved:
-                if _kb_exc is not None:
-                    print(
-                        f"[tui_gateway] kanban notification poll failed: "
-                        f"{type(_kb_exc).__name__}: {_kb_exc}",
-                        file=sys.stderr,
-                    )
-                else:
-                    if _kanban_texts:
-                        rid = f"__notif__{int(time.time() * 1000)}"
-                        _settled = threading.Event()
-                        _settled_lock = threading.Lock()
-                        _lease_renewer = None
-                        completion_id = _captain_completion_id(
-                            _kanban_claims,
-                            _kanban_texts,
-                        )
-                        _has_captain_claim = any(
-                            record.get("route") == "captain"
-                            for record in _kanban_claims
-                        )
-                        try:
-                            _reconciled = (
-                                _reconcile_persisted_captain_report(
-                                    sid,
-                                    session,
-                                    _kanban_claims,
-                                    completion_id,
-                                )
-                                if _has_captain_claim
-                                else False
-                            )
-                        except Exception as _reconcile_exc:
-                            _release_exc = None
-                            try:
-                                _settle_kanban_notification_claims(
-                                    _kanban_claims,
-                                    accepted=False,
-                                )
-                            except Exception as exc:
-                                _release_exc = exc
-                            print(
-                                f"[tui_gateway] Captain receipt reconciliation failed: "
-                                f"{type(_reconcile_exc).__name__}: {_reconcile_exc}",
-                                file=sys.stderr,
-                            )
-                            if _release_exc is not None:
-                                print(
-                                    f"[tui_gateway] Captain reconciliation release failed: "
-                                    f"{type(_release_exc).__name__}: {_release_exc}",
-                                    file=sys.stderr,
-                                )
-                            with session["history_lock"]:
-                                session["running"] = False
-                            continue
-                        if _reconciled:
-                            with session["history_lock"]:
-                                session["running"] = False
-                            continue
-                        _lease_renewer = _start_captain_lease_renewer(
-                            _kanban_claims
-                        )
+                            _settle_kanban_notification_claims(_claim_records, accepted=False)
+                        finally:
+                            _settled_event.set()
+                        raise
+                    if succeeded is None:
+                        _settled_event.set()
+                        return
+                    try:
+                        _settle_captain_turn_claims(session, _claim_records, completion_id=_completion_id, captain_profile=_session_captain_profile(session), succeeded=bool(succeeded))
+                    finally:
+                        _settled_event.set()
+            try:
+                _emit('message.start', sid)
+                accepted = _run_prompt_submit(rid, sid, session, '\n'.join(_kanban_texts), on_terminal=_settle_after_terminal, completion_id=completion_id, require_persisted=_has_captain_claim, turn_purpose=_CAPTAIN_TURN_PURPOSE if _has_captain_claim else 'ordinary')
+                if accepted is False:
+                    raise RuntimeError('synthetic turn was not accepted')
+            except Exception as exc:
+                logger.debug("runtime boundary failed", exc_info=True)
+                _settle_after_terminal(False)
+                print(f'[tui_gateway] kanban notification dispatch failed: {type(exc).__name__}: {exc}', file=sys.stderr)
+                with session['history_lock']:
+                    session['running'] = False
+                _drain_queued_prompt(rid, sid, session)
 
-                        def _settle_after_terminal(
-                            succeeded: Optional[bool],
-                            *,
-                            _claim_records=list(_kanban_claims),
-                            _completion_id=completion_id,
-                            _lease_handle=_lease_renewer,
-                            _settled_event=_settled,
-                            _settlement_lock=_settled_lock,
-                        ) -> None:
-                            # The prompt turn is asynchronous. Bind every
-                            # per-dispatch value now so later poll intervals
-                            # cannot rebind this closure to another claim set.
-                            with _settlement_lock:
-                                if _settled_event.is_set():
-                                    return
-                                try:
-                                    _stop_captain_lease_renewer(_lease_handle)
-                                except Exception:
-                                    if succeeded is None:
-                                        _settled_event.set()
-                                        raise
-                                    try:
-                                        _settle_kanban_notification_claims(
-                                            _claim_records, accepted=False
-                                        )
-                                    finally:
-                                        _settled_event.set()
-                                    raise
-                                if succeeded is None:
-                                    # Rollback of the crash-staged input failed.
-                                    # Leave the claim leased rather than making a
-                                    # dirty retry immediately eligible; normal
-                                    # lease expiry provides the bounded retry.
-                                    _settled_event.set()
-                                    return
-                                try:
-                                    _settle_captain_turn_claims(
-                                        session,
-                                        _claim_records,
-                                        completion_id=_completion_id,
-                                        captain_profile=_session_captain_profile(session),
-                                        succeeded=bool(succeeded),
-                                    )
-                                finally:
-                                    # Mark after the authoritative attempt, not
-                                    # before it. Callback failures must propagate
-                                    # through _run_prompt_submit and suppress the
-                                    # visible success frame.
-                                    _settled_event.set()
-
-                        try:
-                            _emit("message.start", sid)
-                            accepted = _run_prompt_submit(
-                                rid,
-                                sid,
-                                session,
-                                "\n".join(_kanban_texts),
-                                on_terminal=_settle_after_terminal,
-                                completion_id=completion_id,
-                                require_persisted=_has_captain_claim,
-                                turn_purpose=(
-                                    _CAPTAIN_TURN_PURPOSE
-                                    if _has_captain_claim
-                                    else "ordinary"
-                                ),
-                            )
-                            if accepted is False:
-                                raise RuntimeError("synthetic turn was not accepted")
-                        except Exception as exc:
-                            _settle_after_terminal(False)
-                            print(
-                                f"[tui_gateway] kanban notification dispatch failed: "
-                                f"{type(exc).__name__}: {exc}",
-                                file=sys.stderr,
-                            )
-                            with session["history_lock"]:
-                                session["running"] = False
-                            _drain_queued_prompt(rid, sid, session)
-
-        try:
-            evt = process_registry.completion_queue.get(timeout=0.5)
-        except Exception:
-            continue
-
-        # Multiple desktop sessions share this one process-wide queue. Only
-        # consume events that belong to *this* session — otherwise a background
-        # process started in session A would surface its completion in whichever
-        # session's poller happened to wake first (Ben's "reported in a
-        # different session" bug). Leave foreign events for their owner.
-        if _notification_event_belongs_elsewhere(sid, session, evt):
-            process_registry.completion_queue.put(evt)
-            time.sleep(0.1)
-            continue
-
-        # What reaches here is not owned by another LIVE session. Addressed
-        # events still require positive proof before injection: exact UI origin,
-        # direct durable key, or compression lineage. If none proves ownership,
-        # the event is orphaned and must not be adopted by this chat. Truly
-        # ownerless ordinary notifications retain legacy global delivery.
-        requires_owner = _notification_event_requires_owner(evt)
-        if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            log = (
-                logger.warning
-                if evt.get("type") == "async_delegation"
-                else logger.debug
-            )
-            log(
-                "Dropping unowned %s notification (origin=%r key=%r) instead "
-                "of delivering to session %s",
-                evt.get("type", "completion"),
-                str(evt.get("origin_ui_session_id") or ""),
-                str(evt.get("session_key") or ""),
-                sid,
-            )
-            continue
-
-        _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
-            continue
-
-        text = format_process_notification(evt)
-        if not text:
-            continue
-
-        # Only emit the same notification identity to TUI once — re-queued
-        # completions get re-emitted every 0.5s otherwise when session is busy,
-        # while distinct watch_match events from the same process must remain
-        # visible independently.
-        _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
-
-        _requeued = False
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                _requeued = True
-            else:
-                session["running"] = True
-        if _requeued:
-            # Back off before re-polling: the re-queued event keeps the queue
-            # non-empty, so without a sleep this loop spins at full speed
-            # (100% CPU, GIL churn) for as long as the session stays busy.
-            time.sleep(0.25)
-            continue
-
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
-
-    # Drain any remaining events after stop signal (process all pending
-    # before exiting so nothing is lost on shutdown). Events owned by other
-    # live sessions are set aside and re-queued so their poller still sees them.
-    # Orphaned events (owner gone) are dropped — same guard as the main loop.
-    deferred: list = []
-    while not process_registry.completion_queue.empty():
-        try:
-            evt = process_registry.completion_queue.get_nowait()
-        except Exception:
-            break
-        if _notification_event_belongs_elsewhere(sid, session, evt):
-            deferred.append(evt)
-            continue
-        # Same positive-proof rule as the live loop. Preserve the existing
-        # shutdown behavior for orphaned delegation payloads by deferring them
-        # for a later resume; ordinary addressed orphans are dropped.
-        requires_owner = _notification_event_requires_owner(evt)
-        if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            if evt.get("type") == "async_delegation":
-                deferred.append(evt)
-            else:
-                logger.debug(
-                    "Dropping unowned %s notification during shutdown drain "
-                    "(origin=%r key=%r)",
-                    evt.get("type", "completion"),
-                    str(evt.get("origin_ui_session_id") or ""),
-                    str(evt.get("session_key") or ""),
-                )
-            continue
-        _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
-            continue
-        text = format_process_notification(evt)
-        if not text:
-            continue
-
-        _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
-
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                break
-            session["running"] = True
-
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
-
-    # Hand any other sessions' events back to the shared queue.
-    for evt in deferred:
-        process_registry.completion_queue.put(evt)
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -1598,6 +1305,7 @@ def _wire_desktop_ui() -> None:
     try:
         from tools import desktop_ui
     except Exception:
+        logger.debug("runtime boundary failed", exc_info=True)
         return
 
     desktop_ui.set_emitter(lambda sid, event, payload: _emit(event, sid, payload))
@@ -1610,6 +1318,19 @@ def _wire_desktop_ui() -> None:
 _notification_pollers: list = []
 
 
+def _collect_kanban_notifications(session, claim_records=None, *, include_captain=True):
+    """Retained module entry point; the native scoped notification owner composes Captain delivery."""
+    from . import server
+    return server._collect_kanban_notifications(session, claim_records=claim_records, include_captain=include_captain)
+
+
+def _format_kanban_event_text(sub, task, ev, board_slug, latest_run=None, *, include_error_detail=True):
+    """Retained module entry point with native diagnostic presentation preserved."""
+    from . import server
+    return server._format_kanban_event_text(sub, task, ev, board_slug, latest_run, include_error_detail=include_error_detail)
+
+
 def register(server) -> None:
     """Publish this module's helpers onto ``server``, rebound to its globals."""
-    bind_module(globals(), server, skip=())
+    bind_module(globals(), server, skip=("_collect_kanban_notifications", "_format_kanban_event_text", "_maybe_fire_tui_loop_tick", "_notification_poller_loop",
+        "_async_delegation_display_metadata", "_desktop_ui_wired", "_notification_pollers"))

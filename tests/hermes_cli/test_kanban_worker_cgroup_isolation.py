@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_worker_ownership as kbwo
 from hermes_cli import kanban_db_workspace as kbw
 
 
@@ -40,10 +41,11 @@ def _prepare_spawn(monkeypatch, tmp_path):
 
     root = tmp_path / ".hermes"
     (root / "profiles" / "patch").mkdir(parents=True)
+    (root / "profiles" / "patch" / "config.yaml").write_text("{}\n", encoding="utf-8")
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
-    monkeypatch.setattr(kb, "_retag_legacy_worker_sessions", lambda _root: None)
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_retag_legacy_worker_sessions", lambda _root: None)
     monkeypatch.setattr(kb, "worker_logs_dir", lambda board=None: tmp_path / "logs")
 
     workspace = tmp_path / "workspace"
@@ -51,7 +53,7 @@ def _prepare_spawn(monkeypatch, tmp_path):
     return kb, workspace
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_systemd_owned_dispatcher_spawns_worker_in_sibling_scope(monkeypatch, tmp_path):
     kb, workspace = _prepare_spawn(monkeypatch, tmp_path)
     from tools import process_registry
@@ -73,7 +75,7 @@ def test_systemd_owned_dispatcher_spawns_worker_in_sibling_scope(monkeypatch, tm
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
 
-    pid = kb._default_spawn(_make_task(kb), str(workspace))
+    pid = kbd._default_spawn(_make_task(kb), str(workspace))
 
     assert pid == 4242
     assert captured["cmd"][:4] == [
@@ -91,7 +93,7 @@ def test_systemd_owned_dispatcher_spawns_worker_in_sibling_scope(monkeypatch, tm
     assert captured["start_new_session"] is True
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_systemd_owned_dispatcher_fails_closed_when_scope_is_unavailable(
     monkeypatch, tmp_path
 ):
@@ -108,11 +110,11 @@ def test_systemd_owned_dispatcher_fails_closed_when_scope_is_unavailable(
     monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
 
     with pytest.raises(RuntimeError, match="systemd scope.*unavailable"):
-        kb._default_spawn(_make_task(kb), str(workspace))
+        kbd._default_spawn(_make_task(kb), str(workspace))
 
 
-@pytest.mark.linux_only
-def test_reclaim_stops_exact_worker_scope_before_pid_fallback(monkeypatch):
+@pytest.mark.platforms("linux")
+def test_reclaim_gives_parent_shutdown_grace_before_exact_scope_cleanup(monkeypatch):
     from hermes_cli import kanban_db as kb
 
     host = kb._claimer_id().split(":", 1)[0]
@@ -139,12 +141,12 @@ def test_reclaim_stops_exact_worker_scope_before_pid_fallback(monkeypatch):
     )
 
     assert stopped == [unit]
-    assert signalled == []
+    assert signalled[0] == (12345, signal.SIGTERM)
     assert result["terminated"] is True
     assert result["termination_target"] == "systemd_scope"
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_scope_stop_requires_inactive_verification(monkeypatch):
     from hermes_cli import kanban_db as kb
     from tools import process_registry
@@ -167,7 +169,7 @@ def test_scope_stop_requires_inactive_verification(monkeypatch):
     assert stopped == [unit]
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_dead_wrapper_does_not_hide_failed_scope_cleanup(monkeypatch):
     from hermes_cli import kanban_db as kb
 
@@ -188,7 +190,7 @@ def test_dead_wrapper_does_not_hide_failed_scope_cleanup(monkeypatch):
     assert kb._worker_survived_termination(result) is True
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_reclaim_never_stops_scope_for_foreign_host(monkeypatch):
     from hermes_cli import kanban_db as kb
 
@@ -221,7 +223,7 @@ def _alive_non_zombie(pid: int) -> bool:
     return len(right) == 2 and not right[1].lstrip().startswith("Z")
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 @pytest.mark.live_system_guard_bypass
 def test_reclaim_fallback_kills_worker_process_group_without_orphan(tmp_path):
     from hermes_cli import kanban_db as kb
@@ -290,7 +292,7 @@ def test_timeout_uses_scope_aware_cleanup_and_records_sanitized_target(
         )
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
-        kb._set_worker_pid(conn, task_id, 45678)
+        kbd._set_worker_pid(conn, task_id, 45678)
         old = int(time.time()) - 30
         conn.execute(
             "UPDATE task_runs SET started_at = ? WHERE id = ?",
@@ -343,7 +345,7 @@ def test_dispatcher_restart_keeps_live_run_identity_and_does_not_duplicate_claim
         claimed = kb.claim_task(conn, task_id, ttl_seconds=3600)
         assert claimed is not None
         worker_pid = 56789
-        kb._set_worker_pid(conn, task_id, worker_pid)
+        kbd._set_worker_pid(conn, task_id, worker_pid)
         assert kbd.heartbeat_worker(
             conn, task_id, note="still working", expected_run_id=claimed.current_run_id
         )
@@ -391,7 +393,7 @@ def test_spawn_event_identifies_scope_without_exposing_claim(monkeypatch, tmp_pa
             scope_unit=scope_unit,
         )
 
-        kb._set_worker_pid(conn, task_id, pid)
+        kbd._set_worker_pid(conn, task_id, pid)
 
         event = conn.execute(
             "SELECT payload FROM task_events "
@@ -399,6 +401,10 @@ def test_spawn_event_identifies_scope_without_exposing_claim(monkeypatch, tmp_pa
             (task_id,),
         ).fetchone()
         payload = json.loads(event["payload"])
+        # Upstream carries a spawn-time fingerprint alongside the pid so a recycled
+        # PID cannot be mistaken for the original worker. It is not part of this
+        # test's contract (scope identity without claim exposure), so drop it.
+        payload.pop("started_at", None)
         assert payload == {
             "pid": 67890,
             "isolation_mode": "systemd_scope",
@@ -425,7 +431,7 @@ def test_timeout_defers_release_when_exact_worker_scope_survives(
         )
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
-        kb._set_worker_pid(conn, task_id, 78901)
+        kbd._set_worker_pid(conn, task_id, 78901)
         conn.execute(
             "UPDATE task_runs SET started_at = ? WHERE id = ?",
             (int(time.time()) - 30, claimed.current_run_id),
@@ -464,7 +470,7 @@ def test_timeout_defers_release_when_exact_worker_scope_survives(
         conn.close()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_scope_unavailable_is_spawn_failure_not_worker_crash(monkeypatch, tmp_path):
     kb, workspace = _prepare_spawn(monkeypatch, tmp_path)
     from tools import process_registry
@@ -531,7 +537,7 @@ def test_crash_reclaim_stops_surviving_worker_scope_descendants(
         lock = kb._dispatcher_claim_lock(conn, task_id)
         claimed = kb.claim_task(conn, task_id, claimer=lock)
         assert claimed is not None
-        kb._set_worker_pid(conn, task_id, 81234)
+        kbd._set_worker_pid(conn, task_id, 81234)
         conn.execute(
             "UPDATE tasks SET started_at = ? WHERE id = ?",
             (int(time.time()) - 30, task_id),
@@ -541,7 +547,7 @@ def test_crash_reclaim_stops_surviving_worker_scope_descendants(
         stopped = []
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
-        monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("unknown", None))
+        monkeypatch.setattr(kbd, "_classify_worker_exit", lambda _pid: ("unknown", None))
         monkeypatch.setattr(kb, "_systemd_worker_scope_required", lambda: True)
         monkeypatch.setattr(
             kb,
@@ -572,7 +578,7 @@ def test_crash_cleanup_failure_preserves_run_and_suppresses_retry_until_verified
         lock = kb._dispatcher_claim_lock(conn, task_id)
         claimed = kb.claim_task(conn, task_id, claimer=lock)
         assert claimed is not None
-        kb._set_worker_pid(
+        kbd._set_worker_pid(
             conn,
             task_id,
             kb._SpawnedWorkerPid(
@@ -590,7 +596,7 @@ def test_crash_cleanup_failure_preserves_run_and_suppresses_retry_until_verified
         state = {"scope_stopped": False}
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
-        monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("unknown", None))
+        monkeypatch.setattr(kbd, "_classify_worker_exit", lambda _pid: ("unknown", None))
         monkeypatch.setattr(
             kb,
             "_stop_kanban_worker_scope",
@@ -642,7 +648,7 @@ def test_manual_reclaim_scope_failure_preserves_ownership(monkeypatch, tmp_path)
         lock = kb._dispatcher_claim_lock(conn, task_id)
         claimed = kb.claim_task(conn, task_id, claimer=lock)
         assert claimed is not None
-        kb._set_worker_pid(
+        kbd._set_worker_pid(
             conn,
             task_id,
             kb._SpawnedWorkerPid(
@@ -679,17 +685,14 @@ def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_pa
         task_id = kb.create_task(conn, title="archive running", assignee="patch")
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
-        kb._set_worker_pid(conn, task_id, 84567)
+        kbd._set_worker_pid(conn, task_id, 84567)
 
-        assert kb.archive_task(conn, task_id) is False
-        running = kb.get_task(conn, task_id)
-        assert running is not None
-        assert running.status == "running"
-        assert running.claim_lock == claimed.claim_lock
-        assert running.worker_pid == 84567
-        assert running.current_run_id == claimed.current_run_id
-        assert not any(event.kind == "archived" for event in kb.list_events(conn, task_id))
-
+        # Upstream #76196 changed this contract deliberately: archiving a *running*
+        # task now SUCCEEDS and terminates the host-local worker, because clearing
+        # worker_pid alone left the OS process executing against a task nothing
+        # tracked anymore. We follow upstream (ADR 0002) instead of re-asserting the
+        # old refusal; what we still verify is that the transition is terminal and
+        # the claim is released rather than silently left behind.
         monkeypatch.setattr(
             kb,
             "_terminate_reclaimed_worker",
@@ -705,7 +708,6 @@ def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_pa
                 "cleanup_verified": True,
             },
         )
-        assert kb.reclaim_task(conn, task_id, reason="archive requested") is True
         assert kb.archive_task(conn, task_id) is True
 
         archived = kb.get_task(conn, task_id)
@@ -714,6 +716,9 @@ def test_archive_rejects_running_task_until_verified_reclaim(monkeypatch, tmp_pa
         assert archived.claim_lock is None
         assert archived.worker_pid is None
         assert archived.current_run_id is None
+        # The status flip stays atomic; the kill outcome lands as its own event.
+        kinds = [event.kind for event in kb.list_events(conn, task_id)]
+        assert "archived" in kinds
     finally:
         conn.close()
 
@@ -728,7 +733,7 @@ def test_delete_rejects_unverified_running_scope_cleanup(monkeypatch, tmp_path):
         claim_lock = kb._dispatcher_claim_lock(conn, task_id)
         claimed = kb.claim_task(conn, task_id, claimer=claim_lock)
         assert claimed is not None
-        kb._set_worker_pid(
+        kbd._set_worker_pid(
             conn,
             task_id,
             kb._SpawnedWorkerPid(
@@ -780,7 +785,7 @@ def test_crash_cleanup_identity_swap_defers_replacement_run(monkeypatch, tmp_pat
         old_lock = kb._dispatcher_claim_lock(conn, task_id)
         old_run = kb.claim_task(conn, task_id, claimer=old_lock)
         assert old_run is not None
-        kb._set_worker_pid(
+        kbd._set_worker_pid(
             conn,
             task_id,
             kb._SpawnedWorkerPid(
@@ -816,7 +821,7 @@ def test_crash_cleanup_identity_swap_defers_replacement_run(monkeypatch, tmp_pat
                 new_lock = kb._dispatcher_claim_lock(side, task_id)
                 new_run = kb.claim_task(side, task_id, claimer=new_lock)
                 assert new_run is not None
-                kb._set_worker_pid(
+                kbd._set_worker_pid(
                     side,
                     task_id,
                     kb._SpawnedWorkerPid(
@@ -844,7 +849,7 @@ def test_crash_cleanup_identity_swap_defers_replacement_run(monkeypatch, tmp_pat
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
         monkeypatch.setattr(kb, "_terminate_reclaimed_worker", cleanup_then_replace)
-        monkeypatch.setattr(kb, "_classify_worker_exit", lambda _pid: ("unknown", None))
+        monkeypatch.setattr(kbd, "_classify_worker_exit", lambda _pid: ("unknown", None))
 
         assert kbd.detect_crashed_workers(conn) == []
 
@@ -871,7 +876,7 @@ def test_dispatch_stops_exact_spawn_when_pid_persistence_cas_loses(
     monkeypatch, tmp_path,
 ):
     from hermes_cli import kanban_db as kb
-    import hermes_cli.profiles as profiles
+    from hermes_cli import profiles
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -947,7 +952,7 @@ def test_dispatch_pre_pid_manual_recovery_preserves_original_owner(
     monkeypatch, tmp_path, operation,
 ):
     from hermes_cli import kanban_db as kb
-    import hermes_cli.profiles as profiles
+    from hermes_cli import profiles
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -1026,7 +1031,7 @@ def test_dispatch_pre_pid_stale_ttl_reclaim_preserves_original_owner(
     monkeypatch, tmp_path,
 ):
     from hermes_cli import kanban_db as kb
-    import hermes_cli.profiles as profiles
+    from hermes_cli import profiles
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -1083,20 +1088,28 @@ def test_dispatch_pre_pid_stale_ttl_reclaim_preserves_original_owner(
 
         held = kb.get_task(conn, task_id)
         assert held is not None
-        assert attempted == {
-            "reclaimed": 0,
-            "run_id": held.current_run_id,
-            "claim_lock": held.claim_lock,
-        }
-        assert held.status == "running"
-        assert held.worker_pid == 89202
-        assert [item[0] for item in result.spawned] == [task_id]
+        # Upstream #111306 books every claim-releasing reclaim as a failed attempt,
+        # including a claim that expired before its worker ever spawned — otherwise
+        # claim -> reclaim -> claim loops forever with consecutive_failures stuck at
+        # 0 and the breaker never trips. The reclaim therefore now succeeds mid-spawn
+        # and returns the task to `ready`, where the old flow kept it `running`.
+        #
+        # What this test guards is unchanged and is what we assert: the PID CAS must
+        # refuse to attach the now-orphaned worker (89202) to a task whose claim was
+        # reclaimed underneath it. A stale PID landing on a released claim would let
+        # an untracked process keep working against a task nobody owns.
+        assert attempted["reclaimed"] == 1
+        assert held.status == "ready"
+        assert held.worker_pid is None
+        assert held.current_run_id is None
+        assert held.claim_lock is None
+        assert [item[0] for item in result.spawned] == []
         active_runs = conn.execute(
             "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
             "AND status = 'running' AND ended_at IS NULL",
             (task_id,),
         ).fetchone()[0]
-        assert active_runs == 1
+        assert active_runs == 0
     finally:
         conn.close()
 
@@ -1106,8 +1119,8 @@ def test_pid_cas_loss_cleanup_failure_does_not_mutate_successor(
     monkeypatch, tmp_path, lane,
 ):
     from hermes_cli import kanban_db as kb
-    import hermes_cli.config as config
-    import hermes_cli.profiles as profiles
+    from hermes_cli import config
+    from hermes_cli import profiles
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -1182,7 +1195,7 @@ def test_pid_cas_loss_cleanup_failure_does_not_mutate_successor(
                         side, claimed.id, claimer=successor_lock,
                     )
                 assert successor is not None
-                kb._set_worker_pid(side, claimed.id, 89300)
+                kbd._set_worker_pid(side, claimed.id, 89300)
                 replacement.update(
                     run_id=successor.current_run_id,
                     claim_lock=successor_lock,
@@ -1234,7 +1247,7 @@ def test_pid_cas_loss_cleanup_failure_does_not_mutate_successor(
         conn.close()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize(
     ("load_state", "active_state", "expected"),
     [
@@ -1267,8 +1280,8 @@ def test_implementation_to_review_waits_for_loaded_source_scope_then_claims(
     monkeypatch, tmp_path,
 ):
     from hermes_cli import kanban_db as kb
-    import hermes_cli.config as config
-    import hermes_cli.profiles as profiles
+    from hermes_cli import config
+    from hermes_cli import profiles
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -1306,7 +1319,7 @@ def test_implementation_to_review_waits_for_loaded_source_scope_then_claims(
         assert implementation is not None
         assert implementation.claim_lock is not None
         scope_unit = kb._kanban_worker_scope_unit(implementation.id, implementation.current_run_id)
-        assert kb._set_worker_pid(
+        assert kbd._set_worker_pid(
             conn,
             task_id,
             kb._SpawnedWorkerPid(
@@ -1363,8 +1376,8 @@ def test_review_to_repair_waits_for_live_source_process_then_claims(
     monkeypatch, tmp_path,
 ):
     from hermes_cli import kanban_db as kb
-    import hermes_cli.config as config
-    import hermes_cli.profiles as profiles
+    from hermes_cli import config
+    from hermes_cli import profiles
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -1396,7 +1409,7 @@ def test_review_to_repair_waits_for_live_source_process_then_claims(
         )
         review = kb.claim_review_task(conn, task_id, claimer="gauge:review")
         assert review is not None
-        assert kb._set_worker_pid(
+        assert kbd._set_worker_pid(
             conn,
             task_id,
             kb._SpawnedWorkerPid(
@@ -1449,7 +1462,7 @@ def test_review_to_repair_waits_for_live_source_process_then_claims(
 
 def test_genuine_spawn_failure_still_trips_failure_budget(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
-    import hermes_cli.profiles as profiles
+    from hermes_cli import profiles
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -1486,7 +1499,7 @@ def test_genuine_spawn_failure_still_trips_failure_budget(monkeypatch, tmp_path)
         conn.close()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_shared_scope_stop_failure_blocks_cleanup_even_when_wrapper_pid_is_dead(monkeypatch):
     """Review gap: a dead wrapper PID must not certify a scope that still holds descendants."""
     from hermes_cli import kanban_db as kb
@@ -1509,12 +1522,12 @@ def test_shared_scope_stop_failure_blocks_cleanup_even_when_wrapper_pid_is_dead(
     assert kb._worker_cleanup_verified(result) is False
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_handoff_guard_derives_shared_scope_when_spawn_payload_lacks_unit(monkeypatch, tmp_path):
     """Review gap: the same-card handoff guard must wait for the shared scope, not the wrapper PID."""
     from hermes_cli import kanban_db as kb
-    import hermes_cli.config as config
-    import hermes_cli.profiles as profiles
+    from hermes_cli import config
+    from hermes_cli import profiles
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -1546,7 +1559,7 @@ def test_handoff_guard_derives_shared_scope_when_spawn_payload_lacks_unit(monkey
         )
         assert implementation is not None
         # Legacy payload shape: bare pid, no persisted unit, wrapper already gone.
-        assert kb._set_worker_pid(conn, task_id, 55555)
+        assert kbd._set_worker_pid(conn, task_id, 55555)
         assert kb.request_review(
             conn,
             task_id,
@@ -1554,7 +1567,7 @@ def test_handoff_guard_derives_shared_scope_when_spawn_payload_lacks_unit(monkey
             reviewer="gauge",
             expected_run_id=implementation.current_run_id,
         )
-        assert kb._handoff_worker_teardown_pending(conn, task_id) is True
+        assert kbwo._handoff_worker_teardown_pending(conn, task_id) is True
         assert probed == [
             kb._kanban_worker_scope_unit(task_id, implementation.current_run_id)
         ]
@@ -1574,7 +1587,7 @@ def test_worker_scope_unit_is_always_the_exact_run_identity(monkeypatch, tmp_pat
             task_id = kb.create_task(conn, title=title, assignee="patch")
             claimed = kb.claim_task(conn, task_id)
             assert claimed is not None
-            assert kb._set_worker_pid(conn, task_id, pid)
+            assert kbd._set_worker_pid(conn, task_id, pid)
             return task_id, claimed
 
         for title, persisted in (
@@ -1617,7 +1630,7 @@ def _install_successor_between_snapshot_and_scope_lookup(kb, monkeypatch, conn, 
             conn_.commit()
             successor = kb.claim_task(conn_, tid, claimer=lock)
             assert successor is not None
-            assert kb._set_worker_pid(conn_, tid, new_pid)
+            assert kbd._set_worker_pid(conn_, tid, new_pid)
             state["successor"] = successor
             state["before_task"] = tuple(
                 conn_.execute(
@@ -1647,7 +1660,7 @@ def _install_successor_between_snapshot_and_scope_lookup(kb, monkeypatch, conn, 
     return state
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_manual_reclaim_race_stops_snapshotted_run_and_never_consumes_successor(
     monkeypatch, tmp_path
 ):
@@ -1664,7 +1677,7 @@ def test_manual_reclaim_race_stops_snapshotted_run_and_never_consumes_successor(
         lock = kb._dispatcher_claim_lock(conn, task_id)
         old_run = kb.claim_task(conn, task_id, claimer=lock)
         assert old_run is not None
-        assert kb._set_worker_pid(conn, task_id, 4001)
+        assert kbd._set_worker_pid(conn, task_id, 4001)
         state = _install_successor_between_snapshot_and_scope_lookup(
             kb, monkeypatch, conn, task_id, lock, 4002
         )
@@ -1683,7 +1696,7 @@ def test_manual_reclaim_race_stops_snapshotted_run_and_never_consumes_successor(
         conn.close()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_stale_claim_race_stops_snapshotted_run_and_never_consumes_successor(
     monkeypatch, tmp_path
 ):
@@ -1700,7 +1713,7 @@ def test_stale_claim_race_stops_snapshotted_run_and_never_consumes_successor(
         lock = kb._dispatcher_claim_lock(conn, task_id)
         old_run = kb.claim_task(conn, task_id, claimer=lock)
         assert old_run is not None
-        assert kb._set_worker_pid(conn, task_id, 4101)
+        assert kbd._set_worker_pid(conn, task_id, 4101)
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 600, task_id),
@@ -1722,7 +1735,7 @@ def test_stale_claim_race_stops_snapshotted_run_and_never_consumes_successor(
         conn.close()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize(
     "cleanup_path",
     ["manual_reclaim", "expired_claim", "max_runtime", "stale_heartbeat"],
@@ -1754,7 +1767,7 @@ def test_failed_cleanup_race_never_defers_or_mutates_successor(
         lock = kb._dispatcher_claim_lock(conn, task_id)
         old_run = kb.claim_task(conn, task_id, claimer=lock)
         assert old_run is not None
-        assert kb._set_worker_pid(conn, task_id, 4201)
+        assert kbd._set_worker_pid(conn, task_id, 4201)
         now = int(time.time())
         if cleanup_path == "expired_claim":
             conn.execute(
@@ -1823,7 +1836,7 @@ def test_failed_cleanup_race_never_defers_or_mutates_successor(
         conn.close()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_handoff_guard_ignores_foreign_persisted_scope(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
@@ -1837,7 +1850,7 @@ def test_handoff_guard_ignores_foreign_persisted_scope(monkeypatch, tmp_path):
         assert implementation is not None
         expected = kb._kanban_worker_scope_unit(task_id, implementation.current_run_id)
         foreign = "hermes-worker-kanban-other-run-999.scope"
-        assert kb._set_worker_pid(
+        assert kbd._set_worker_pid(
             conn,
             task_id,
             kb._SpawnedWorkerPid(
@@ -1859,13 +1872,13 @@ def test_handoff_guard_ignores_foreign_persisted_scope(monkeypatch, tmp_path):
             lambda unit: probed.append(unit) or unit == foreign,
         )
 
-        assert kb._handoff_worker_teardown_pending(conn, task_id) is True
+        assert kbwo._handoff_worker_teardown_pending(conn, task_id) is True
         assert probed == [expected]
     finally:
         conn.close()
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_handoff_guard_fails_closed_without_exact_scope(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
@@ -1878,7 +1891,7 @@ def test_handoff_guard_fails_closed_without_exact_scope(monkeypatch, tmp_path):
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         exact = kb._kanban_worker_scope_unit(task_id, implementation.current_run_id)
-        assert kb._set_worker_pid(
+        assert kbd._set_worker_pid(
             conn,
             task_id,
             kb._SpawnedWorkerPid(
@@ -1901,7 +1914,7 @@ def test_handoff_guard_fails_closed_without_exact_scope(monkeypatch, tmp_path):
             lambda unit: probed.append(unit) or True,
         )
 
-        assert kb._handoff_worker_teardown_pending(conn, task_id) is True
+        assert kbwo._handoff_worker_teardown_pending(conn, task_id) is True
         assert probed == []
     finally:
         conn.close()

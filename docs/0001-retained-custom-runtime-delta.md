@@ -21,8 +21,9 @@ record.
 - Retain only behavior absent from upstream: durable Captain inbox and fenced
   receipts/recovery; Kanban review provenance and lifecycle safeguards;
   task-bounded toolsets and worker ownership/cleanup; headless MCP OAuth
-  single-flight ownership; and the minimum session/renderer seams those
-  contracts require.
+  single-flight ownership; delegated terminal marker hygiene; lifecycle guard
+  Python data operand handling (PR17); and the minimum session/renderer seams
+  those contracts require.
 - Extend upstream seams instead of replacing watcher wake behavior, delegation
   schema/registry, base TUI/session lifecycle, updater gates, terminal/plugin
   registry, MCP transport/reconnect, or other native upstream behavior.

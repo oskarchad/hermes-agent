@@ -4,6 +4,7 @@ The gateway supplies its existing allowed profile set and live registry. Worker 
 are preflight evidence only: final delivery always resolves the live view again.
 """
 from __future__ import annotations
+import logging
 
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -11,11 +12,12 @@ from contextvars import ContextVar
 _PREFLIGHT: ContextVar = ContextVar("cron_delivery_route_preflight", default=())
 
 
-def configured_routes():
-    from hermes_cli.config import read_user_config_raw
-    from hermes_constants import get_hermes_home
+logger = logging.getLogger(__name__)
 
-    raw = read_user_config_raw(get_hermes_home() / "config.yaml")
+def configured_routes():
+    from hermes_cli.config import load_config_readonly
+
+    raw = load_config_readonly()
     cron = raw.get("cron", {})
     routes = cron.get("delivery_routes", []) if isinstance(cron, dict) else []
     if not isinstance(routes, list):
@@ -149,4 +151,5 @@ def check_explicit_delivery(job):
         return None, covered - uncovered
     except Exception:
         # Configuration/read/target errors cannot authorize a different bot.
+        logger.debug("runtime boundary failed", exc_info=True)
         return "explicit cron delivery route configuration unavailable or invalid", set()

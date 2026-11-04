@@ -274,7 +274,11 @@ def test_captain_signal_delivery_reads_bounded_redacted_authoritative_comment(
     conn = kbc.connect(tmp_path / "delivery.db")
     try:
         task_id = kb.create_task(conn, title="decision target", assignee="worker")
-        secret = "«redacted:sk-…»"
+        # Use a credential-shaped value, not a pre-masked placeholder: upstream's repr pass
+        # now deliberately leaves already-masked values alone (5280dec0ee), so a fake
+        # "«redacted:…»" string would pass through untouched and prove nothing. A real
+        # sk-shaped token is what the redactor must actually catch.
+        secret = "sk-proj-AbCdEf1234567890XyZaBcDeFgHiJkLmNoPq"
         comment_id = kb.add_comment(
             conn,
             task_id,

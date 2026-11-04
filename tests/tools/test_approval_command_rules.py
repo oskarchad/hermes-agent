@@ -10,9 +10,9 @@ import subprocess
 import sys
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
-import hermes_cli.config as config
+from hermes_cli import config
 from tools import approval
 from tools.approval_context import _get_approval_config
 
@@ -173,7 +173,7 @@ def test_fresh_loader_reload_and_fail_closed_config(tmp_path, selectors, invalid
     probe = r'''
 import json, os
 from pathlib import Path
-import yaml
+import hermes_yaml as yaml
 from hermes_cli.config import get_config_path, load_config_readonly
 from tools.approval import check_dangerous_command, check_all_command_guards
 path = Path(os.environ['HERMES_HOME']) / 'config.yaml'
@@ -342,3 +342,37 @@ def test_git_tag_shorthand_matches_normalized_destination(tmp_path, monkeypatch,
         assert result["approved"] is not denied, result
         if denied:
             assert result.get("user_deny"), result
+
+
+@pytest.mark.parametrize("command,selector,denied", [
+    ("timeout 30 gh pr merge 6", "gh pr merge", True),
+    ("timeout -k 2 -- 30 gh pr merge 6", "gh pr merge", True),
+    ("nice -n 5 gh pr merge 6", "gh pr merge", True),
+    ("env -S 'gh pr merge 6'", "gh pr merge", True),
+    ("env --split-string='gh pr merge' 6", "gh pr merge", True),
+    ("env -S '${EXECUTABLE} pr merge 6'", "gh pr merge", True),
+    ("timeout 30 git push origin HEAD:main", "git push main", True),
+    ("timeout 30 gh pr create --body 'gh pr merge 6'", "gh pr merge", False),
+    ("nice -n 5 printf '%s' 'gh pr merge 6'", "gh pr merge", False),
+    ("env -S 'printf %s gh\\_pr\\_merge\\_6'", "gh pr merge", False),
+    ("env -u -S gh pr create --body 'gh pr merge 6'", "gh pr merge", False),
+    ("command -pv gh pr merge 6", "gh pr merge", False),
+    ("chrt -p 0 gh pr merge 6", "gh pr merge", False),
+])
+@pytest.mark.parametrize("bypass", ["off", "yolo", "allowlist"])
+def test_wrapper_ownership_preserves_public_selector_floor(
+    tmp_path, monkeypatch, command, selector, denied, bypass,
+):
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "approvals": {"mode": "off" if bypass == "off" else "manual",
+                      "deny_commands": [selector]},
+        "security": {"tirith_enabled": False},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", bypass == "yolo")
+    monkeypatch.setattr(approval, "_permanent_approved", {command} if bypass == "allowlist" else set())
+    from tools.approval_floors import _user_command_deny_block
+    assert bool(_user_command_deny_block(command)) is denied
+    if denied or bypass != "allowlist":
+        for guard_entry in (approval.check_dangerous_command, approval.check_all_command_guards):
+            assert guard_entry(command, "local")["approved"] is not denied

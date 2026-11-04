@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from gateway.config import Platform, PlatformConfig, GatewayConfig
 from cron.scheduler_delivery import _resolve_target_transport
@@ -41,7 +41,7 @@ def route_env(tmp_path, monkeypatch):
 
 
 def multiplex_view(home, otto, adapter, monkeypatch, *, gate=None):
-    import cron.scheduler as scheduler
+    from cron import scheduler
     views = []
     monkeypatch.setattr(InProcessCronScheduler, 'recover_interrupted', lambda self: 0)
     monkeypatch.setattr(scheduler, 'tick', lambda **kw: views.append(kw['adapters']))
@@ -155,9 +155,12 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
     previous_multiplex = is_multiplex_active()
     set_multiplex_active(True)
     # Replace only the OS supervisor wrapper, not launch/payload/adoption/preflight/delivery.
-    # Tuple keeps the actual argv, while exercising the managed-worker branch's distinct value.
+    # Upstream now returns a GatewayChildDispatch(mode, argv) instead of a bare tuple, and the
+    # caller branches on `.mode`. Keep the actual argv and report "degraded" so this still
+    # exercises external worker adoption without pretending a user systemd scope exists;
+    # "in_process" would silently take the caller's in-process path instead.
     monkeypatch.setattr(process_registry, 'restart_safe_gateway_child_argv',
-                        lambda argv, **kw: tuple(argv))
+                        lambda argv, **kw: process_registry.GatewayChildDispatch('degraded', list(argv)))
     sent = []
 
     async def send(chat_id, text, metadata=None):
@@ -246,3 +249,37 @@ def test_mandatory_route_block_alerts_once_then_rearms_after_recovery(route_env,
             assert scheduler.run_job(get_job(job['id']))[0] is True
         assert not get_job(job['id']).get('preflight_alerted')
         assert scheduler.run_job(get_job(job['id']))[3].startswith(BLOCKED_CONFIG_MARKER)
+
+
+@pytest.mark.parametrize('snapshot, live_profile, accepted', [
+    ([], 'secondary', False),
+    ([], None, True),
+    ('secondary', None, False),
+    ('secondary', 'other', False),
+    ('secondary', 'secondary', True),
+    (None, 'secondary', True),
+    (None, None, True),
+])
+def test_attempt_route_snapshot_binds_presence_and_absence(snapshot, live_profile, accepted):
+    from cron.delivery_routes import ExplicitRouteAdapters
+
+    target = {'platform': 'discord', 'chat_id': 'channel'}
+    route = {**target, 'adapter_profile': 'secondary'}
+    original = SimpleNamespace(config=PlatformConfig(enabled=True), is_connected=True)
+    secondary = SimpleNamespace(config=PlatformConfig(enabled=True), is_connected=True)
+    other = SimpleNamespace(config=PlatformConfig(enabled=True), is_connected=True)
+    view = ExplicitRouteAdapters({Platform.DISCORD: original},
+        {'secondary': {Platform.DISCORD: secondary}, 'other': {Platform.DISCORD: other}},
+        lambda: {'secondary', 'other'})
+    config = GatewayConfig(platforms={Platform.DISCORD: original.config})
+    job = {}
+    if snapshot is not None:
+        job['_cron_delivery_route_bindings'] = [{**route, 'available': True}] if snapshot else []
+    routes = [{**target, 'adapter_profile': live_profile}] if live_profile else []
+    result, error = _resolve_target_transport(job, Platform.DISCORD, 'discord', target,
+        view, config, routes=routes)
+    if not accepted:
+        assert result is None and 'changed since dispatch' in error
+    else:
+        assert error is None
+        assert result[2] is (secondary if live_profile else original)
