@@ -853,7 +853,7 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, operation: str = "complete"):
     """Goal judge for every terminal worker handoff (including review).
 
     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
@@ -887,7 +887,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
         try:
             verdict, reason, _, _, transport_failed = judge_goal(
                 goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                last_response=evidence.strip())
+                last_response=evidence.strip(), kanban_operation=operation)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
@@ -911,7 +911,8 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
     None to allow."""
-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
+    operation = {"completion": "complete", "review handoff": "request-review"}[handoff]
+    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence, operation)
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
                 f"the goal unachievable — {rejection}. {blocked_hint}")
