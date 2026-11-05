@@ -16,6 +16,7 @@ from agent.prompt_builder import build_skills_system_prompt
 @pytest.fixture
 def oneshot(monkeypatch):
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)  # plain -q, not a dispatched Kanban worker
 
 
 def _tools(*names):
@@ -33,6 +34,20 @@ def test_oneshot_hides_skill_manage_and_skill_authoring_coaching(oneshot, intera
     assert "demo-skill" in prompt and "skill_view" in prompt
     assert "skill_manage" not in prompt and "offer to save as a skill" not in prompt
     assert "skill_manage" in interactive_prompt and "offer to save as a skill" in interactive_prompt
+
+
+def test_kanban_worker_oneshot_keeps_skill_manage_and_full_skills_prompt(oneshot, monkeypatch, tmp_path):
+    """The dispatcher launches every Kanban worker via ``chat -q``; skill-maintenance cards must still be able
+    to edit skills, so the owned board task opts the session out of the skill footprint (only that part)."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_demo")
+    kept = {t["function"]["name"] for t in oneshot_footprint.prune_oneshot_tools(_tools("skill_manage", "skill_view"))}
+    assert "skill_manage" in kept
+
+    prompt = build_skills_system_prompt(available_tools={"skill_view", "skills_list", "skill_manage"},
+                                        skills_dir_override=_skills_dir(tmp_path))
+    assert "do not create or edit skills" not in prompt and "skill_manage" in prompt
+    # The finite-session marker itself (approval gate, delegation cap, metrics) is untouched.
+    assert oneshot_footprint.is_single_query_session()
 
 
 def _skills_dir(tmp_path):

@@ -5,7 +5,9 @@ exits. The interactive self-improvement loop is pure overhead there, and a measu
 one-shot benchmark trajectories the agent authored 7 new skills and patched a bundled one mid-task, 37 of
 ~215 tool calls were ``skill_view``/``skill_manage``, and skill text was 34% of every tool-result byte fed
 back into context. Three rules follow, all keyed on the same session marker the approval gate and the
-delegation dispatcher already read (``HERMES_SINGLE_QUERY_SESSION``), so interactive sessions are untouched:
+delegation dispatcher already read (``HERMES_SINGLE_QUERY_SESSION``), so interactive sessions are untouched.
+A dispatcher-owned Kanban worker is also launched via ``-q`` but keeps the skill surface (first two rules;
+see :func:`skill_footprint_applies`): its card may be skill maintenance.
 
 * ``skill_manage`` is not offered (``skills_list``/``skill_view`` stay: reading a domain skill can still win);
 * the ## Skills prompt drops the "record it / patch it / offer to save" coaching and the "load process skills
@@ -31,10 +33,19 @@ def is_single_query_session() -> bool:
     return str(get_session_env("HERMES_SINGLE_QUERY_SESSION", "") or "") == "1"
 
 
+def skill_footprint_applies() -> bool:
+    """One-shot, minus the dispatcher-owned Kanban worker: it also runs via ``chat -q``, but its card may be
+    skill maintenance (fleet rules and lessons live in skills), so it keeps ``skill_manage`` and the full
+    ## Skills guidance. Only this footprint is lifted; approval, delegation cap and metrics still key on
+    :func:`is_single_query_session`."""
+    from agent.delegation_context import owned_kanban_task
+    return is_single_query_session() and not owned_kanban_task()
+
+
 def prune_oneshot_tools(tools: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """*tools* minus ``ONESHOT_HIDDEN_TOOLS``; identity when the session is not one-shot."""
+    """*tools* minus ``ONESHOT_HIDDEN_TOOLS``; identity when the skill footprint does not apply."""
     tools = list(tools)
-    if not is_single_query_session():
+    if not skill_footprint_applies():
         return tools
     return [t for t in tools if (t.get("function") or {}).get("name") not in ONESHOT_HIDDEN_TOOLS]
 
