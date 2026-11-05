@@ -2940,7 +2940,7 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     try:
         import importlib.util
         if importlib.util.find_spec("hermes_cli") is not None:
-            return [sys.executable, "-m", "hermes_cli.main"]
+            return [sys.executable, "-P", "-m", "hermes_cli.main"]  # -P: no cwd shadowing
     except Exception:
         pass
     import shutil
