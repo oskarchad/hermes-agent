@@ -1483,7 +1483,7 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kbd._resolve_hermes_argv() == [sys.executable, "-P", "-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
@@ -1557,7 +1557,7 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
         claim_expires=None, tenant=None, branch_name=None,
     )
 
-    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", kbd._module_hermes_argv)
     kbd._default_spawn(task, str(tmp_path / "ws"))
     assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
 

@@ -882,7 +882,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
     except Exception:
         found = False
     if found:
-        argv = [sys.executable, "-m", "hermes_cli.main"]
+        argv = [sys.executable, "-P", "-m", "hermes_cli.main"]  # -P: no cwd shadowing
     else:
         hermes_bin = shutil.which("hermes")
         if not hermes_bin:
@@ -911,7 +911,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                      f"profile's environment ({type(exc).__name__}: {exc}); do not resend")
     if home.parent.name != "profiles":
         argv += ["-p", "default"]
-    if argv[1:3] == ["-m", "hermes_cli.main"]:
+    if argv[1:4] == ["-P", "-m", "hermes_cli.main"]:
         # served_profile_child_env strips Hermes-owned PYTHONPATH entries; under a store-python
         # shim the bare interpreter then cannot import the package find_spec just proved (#122487).
         from pathlib import Path
