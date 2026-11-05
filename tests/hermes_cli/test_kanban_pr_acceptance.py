@@ -20,10 +20,16 @@ def github(tmp_path, monkeypatch):
             state["requests"].append(self.path)
             sha = state["head"]
             if self.path == "/graphql":
+                checks = [] if state.get("no_protection") else [{"context": "required", "app": {"databaseId": 1}}]
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": checks}}}}}}
+            elif "/rules/branches/" in self.path and state.get("rules_fault"):
+                code, message = state["rules_fault"]
+                self.send_response(code)
+                self.end_headers()
+                self.wfile.write(json.dumps({"message": message, "status": str(code)}).encode())
+                return
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
@@ -60,9 +66,16 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    # Like real gh on an HTTP error: JSON body on stdout, "gh: <message> (HTTP <code>)" on
+    # stderr, exit 1. Status 499 stands in for an unauthenticated gh (exit 4, no exchange).
+    gh.write_text(f"#!{sys.executable}\nimport json,sys,urllib.error,urllib.request\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n"
+                  "    if e.code == 499:\n        sys.exit(4)\n"
+                  "    body = e.read().decode()\n    print(body)\n"
+                  "    sys.stderr.write(f'gh: {json.loads(body)[\"message\"]} (HTTP {e.code})\\n')\n"
+                  "    sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -107,6 +120,46 @@ def test_pr_completion_requires_current_required_evidence(github):
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
+
+
+PLAN_403 = (403, "Upgrade to GitHub Pro or make this repository public to enable this feature.")
+
+
+@pytest.mark.platforms("linux")
+def test_plan_unavailable_rules_api_falls_back_to_exact_head_checks(github):
+    """A private free-plan repo answers the Rules API with a plan 403: only that source is
+    skipped; any other refusal stays fail-closed and gh's stderr is never persisted."""
+    def attempt(**state):
+        github.update({"conclusion": "success", "head": "a" * 40, **state})
+        with connect() as conn:
+            tid = kb.create_task(conn, title="plan", completion_contract="acme/repo")
+            ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            receipt = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' "
+                                              "ORDER BY id DESC", (tid,)).fetchone()[0])
+            assert ok is (kb.get_task(conn, tid).status == "done")
+        for key in ("rules_fault", "no_protection", "missing", "stale"):
+            github.pop(key, None)
+        assert "Upgrade" not in json.dumps(receipt)
+        return ok, receipt
+
+    ok, receipt = attempt(rules_fault=PLAN_403)
+    assert ok and receipt["rules_api"] == "skipped: HTTP 403 plan-unavailable"
+    # No declared checks: the exact head's non-skipped check-runs/statuses become required.
+    ok, receipt = attempt(rules_fault=PLAN_403, no_protection=True)
+    assert ok and receipt["required"] == [{"context": "required", "app_id": 1}]
+    ok, receipt = attempt(rules_fault=PLAN_403, no_protection=True, conclusion="failure")
+    assert not ok and receipt["classification"] == "failure"
+    ok, receipt = attempt(rules_fault=PLAN_403, no_protection=True, stale=True)
+    assert not ok and receipt["classification"] == "stale"
+    ok, receipt = attempt(rules_fault=PLAN_403, no_protection=True, missing=True)  # only skipped runs
+    assert not ok and receipt["classification"] == "missing" and not receipt["required"]
+    ok, receipt = attempt(no_protection=True)  # Rules API readable and empty: unchanged refusal
+    assert not ok and receipt["classification"] == "missing"
+    for fault, classification in (((403, "Resource not accessible by integration"), "auth"),
+                                  ((404, "Not Found"), "auth"), ((499, "no login"), "auth"),
+                                  ((500, "Server Error"), "infra")):
+        ok, receipt = attempt(rules_fault=fault, no_protection=True)
+        assert not ok and receipt["classification"] == classification, fault
 
 
 @pytest.mark.platforms("linux")
