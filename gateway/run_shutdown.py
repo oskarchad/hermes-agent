@@ -1372,7 +1372,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
 
     # Restart orchestration
     @staticmethod
-    def _restart_watcher_env() -> dict:
+    def _restart_watcher_env(hermes_cmd: list | tuple = ()) -> dict:
         """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down).
 
         The host multiplexer is respawned with ``host_gateway_child_env`` (default-root
@@ -1421,6 +1421,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             )
         watcher_env = drop_bridged_env(watcher_env)
         watcher_env.pop("_HERMES_GATEWAY", None)
+        if list(hermes_cmd[1:4]) == ["-P", "-m", "hermes_cli.main"]:  # env strips the tree, -P the cwd
+            from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+            pin_hermes_tree_on_pythonpath(watcher_env, Path(__file__).resolve().parents[1])
         return watcher_env
 
     @staticmethod
@@ -1430,7 +1433,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         from hermes_cli._subprocess_compat import (
             windows_detach_flags_without_breakaway, windows_detach_popen_kwargs
         )
-        watcher_env = GatewayShutdownMixin._restart_watcher_env()
+        watcher_env = GatewayShutdownMixin._restart_watcher_env(hermes_cmd)
         # host_gateway_child_env does not copy the parent dotenv. The watcher
         # still has to run inside the venv this process is using, or the
         # respawn cannot import hermes.
@@ -1441,9 +1444,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         project_root = Path(__file__).resolve().parent.parent
         # Console python under CREATE_NO_WINDOW: nothing flashes. NOT pythonw.exe — a console-less
         # watcher makes every console-subsystem descendant allocate a visible conhost (#54220/#56747).
-        # The watcher runs sys.executable (console python) under the CREATE_NO_WINDOW detach kwargs below:
-        # it owns one hidden console, inherited by the `hermes gateway restart` child, so nothing flashes.
-        # See #54220, #56747.
         from hermes_cli._launchers import runtime_command
         watcher_argv = runtime_command(project_root,
             [str(current_pid), str(restart_after_s), *hermes_cmd, "gateway", "restart"],
@@ -1497,7 +1497,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         argv = [setsid_bin, "bash", "-lc", shell_cmd] if setsid_bin else ["bash", "-lc", shell_cmd]
         subprocess.Popen(  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
             argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=GatewayShutdownMixin._restart_watcher_env(), start_new_session=True,
+            env=GatewayShutdownMixin._restart_watcher_env(hermes_cmd), start_new_session=True,
         )
 
     def _wedged_agent_count(self) -> int:
