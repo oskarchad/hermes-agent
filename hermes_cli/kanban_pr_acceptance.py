@@ -44,6 +44,8 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # or missing grant), not a transient API failure. Persist only the status
         # code + endpoint, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
+        if denied and denied[1] == "403" and _PLAN_UNAVAILABLE in (exc.stderr or ""):
+            raise _PlanUnavailable(f"HTTP 403 plan-unavailable on {endpoint.split('?')[0]}") from None
         if denied:
             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
@@ -59,6 +61,14 @@ class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+
+# GitHub's exact refusal of a paid-plan feature (Rules API on a private free-plan repo).
+_PLAN_UNAVAILABLE = "Upgrade to GitHub Pro or make this repository public"
+
+
+class _PlanUnavailable(_GateAuthError):
+    """The login can read the repo, but this endpoint is not part of its plan."""
 
 
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
@@ -133,15 +143,20 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _PlanUnavailable:
+            # Only the Rules API is skipped; every other source stays mandatory.
+            rules = []
+            receipt["rules_api"] = "skipped: HTTP 403 plan-unavailable"
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
                     required.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
-        if not required:
+        if not required and "rules_api" not in receipt:
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
@@ -151,6 +166,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("Incomplete check-run pagination")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
+        if not required:
+            # Required checks are undeclarable without the Rules API: every non-skipped
+            # check-run/status on the exact head is required; none at all still refuses.
+            required = {(r["name"], r["app"]["id"]) for r in runs if r.get("conclusion") != "skipped"}
+            required |= {(s["context"], None) for s in statuses}
+            receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
+            if not required:
+                receipt["detail"] = "Rules API unavailable on this plan and the PR head has no non-skipped checks."
+                return receipt
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
