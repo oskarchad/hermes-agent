@@ -432,12 +432,22 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
     alive = _worker_alive(pid, fingerprint)
+    # Exact unit of THIS closed run (None without scope isolation); background
+    # children left in it otherwise pin the same-card handoff guard forever.
+    scope_unit = _kb._worker_scope_unit(conn, row["task_id"], run_id=row["id"])
     termination = None
     if alive:
         termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
-        if not termination["terminated"]:
+            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint,
+            scope_expected=scope_unit is not None, scope_unit=scope_unit)
+        if not _worker_cleanup_verified(termination):
             return  # still alive: try again next tick
+    elif scope_unit and not _kb._systemd_worker_scope_unloaded(scope_unit):
+        if not _kb._stop_kanban_worker_scope(scope_unit):
+            return  # keep the evidence: retry next tick
+        alive = True  # report it: the run's leftover descendants were ended
+        termination = {"scope_unit": scope_unit, "scope_stopped": True,
+                       "termination_target": "systemd_scope"}
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
