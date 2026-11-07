@@ -121,19 +121,19 @@ def test_multiplex_explicit_target_uses_only_selected_active_adapter(route_env, 
     assert job == before_job and dict(os.environ) == before_env
 
 
-@pytest.mark.parametrize('revoke_before_drain', [None, 'gate', 'mapping', 'adapter'])
+@pytest.mark.parametrize('revoke_before_drain', [None, 'gate', 'mapping', 'adapter', 'send'])
 def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
         route_env, monkeypatch, tmp_path, revoke_before_drain):
     import asyncio
 
     import os
     import threading
-    import time
+    from tests.waiting import wait_until
     from concurrent.futures import ThreadPoolExecutor
     from agent.secret_scope import is_multiplex_active, set_multiplex_active
     from cron import scheduler, delivery_queue, executions
     from cron.jobs import create_job, get_job, use_cron_store
-    from gateway.run_cron_delivery import _drain_restart_safe_cron_deliveries
+    from gateway.run_cron_delivery import drain_restart_safe_cron_deliveries as _drain_restart_safe_cron_deliveries
     from tools import process_registry
 
     home, otto, cfg, adapter = route_env
@@ -165,6 +165,8 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
 
     async def send(chat_id, text, metadata=None):
         sent.append((chat_id, text, metadata))
+        if revoke_before_drain == 'send':
+            return {'success': False, 'error': 'fixture transport failure'}
         return {'success': True, 'message_id': 'fixture-message'}
 
     adapter.send = send
@@ -183,18 +185,15 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
                              script='probe.py', no_agent=True, deliver='discord:123456789')
             before = get_job(job['id'])
             future = pool.submit(scheduler.run_one_job, job, adapters=view, loop=loop)
-            deadline = time.monotonic() + 30
-            queued = None
-            while time.monotonic() < deadline:
+            def pending_delivery():
                 execution = executions.latest_execution(job['id'])
-                if execution:
-                    queued = delivery_queue.get_status(execution['id'])
-                    if queued and queued['status'] == 'pending':
-                        break
+                queued = delivery_queue.get_status(execution['id']) if execution else None
+                if queued and queued['status'] == 'pending':
+                    return execution
                 if future.done():
                     pytest.fail(f'worker exited before queue: {future.result()}, {execution}')
-                time.sleep(0.05)
-            assert queued and queued['status'] == 'pending'
+                return None
+            execution = wait_until(pending_delivery, timeout=30, what="worker queued delivery")
             assert ran.read_text() == 'once', 'real worker preflight must accept dispatch evidence'
             if revoke_before_drain == 'gate':
                 runner.config.multiplex_profile_allowlist = []
@@ -206,7 +205,9 @@ def test_real_worker_handoff_preflight_queue_and_fresh_gateway_drain(
             _drain_restart_safe_cron_deliveries({Platform.DISCORD: fallback}, loop, runner)
             assert future.result(timeout=15) is True
             status = delivery_queue.get_status(execution['id'])['status']
-            if revoke_before_drain:
+            if revoke_before_drain == 'send':
+                assert status != 'delivered' and len(sent) == 1, 'must never retry through the owning bot'
+            elif revoke_before_drain:
                 assert status != 'delivered' and sent == []
             else:
                 assert status == 'delivered'
@@ -283,3 +284,51 @@ def test_attempt_route_snapshot_binds_presence_and_absence(snapshot, live_profil
     else:
         assert error is None
         assert result[2] is (secondary if live_profile else original)
+
+
+def test_ticker_delivery_allowlist_is_independent_from_cron_store_ownership(route_env, monkeypatch):
+    from cron import scheduler
+    from cron.delivery_routes import delivery_preflight_scope
+    from cron.scheduler_preflight import _preflight_check_delivery
+
+    home, otto, _cfg, adapter = route_env
+    views = []
+    monkeypatch.setattr(InProcessCronScheduler, 'recover_interrupted', lambda self: 0)
+    monkeypatch.setattr(scheduler, 'tick', lambda **kw: views.append(kw['adapters']))
+    InProcessCronScheduler().start(
+        OneTick(), profile_homes=[('default', home), ('otto', otto)],
+        profile_adapters={'otto': {Platform.DISCORD: adapter}}, adapters={},
+        default_profile='default', interval=0, delivery_allowed_profiles=lambda: set())
+    assert len(views) == 2, 'denied delivery must not stop ticking the profile store'
+    with delivery_preflight_scope(views[0]):
+        assert _preflight_check_delivery({'id': 'job', 'deliver': 'discord:123456789'})
+
+
+def test_canonical_firer_constrains_owner_admission_to_dispatch_binding(tmp_path, monkeypatch):
+    from cron.scheduler_authority import run_canonical_job
+    from cron.delivery_routes import delivery_route_digest
+    from gateway import session_cron
+    from hermes_cli import gateway_client
+
+    job = {'id': 'job', 'execution_id': 'fire', '_cron_delivery_route_bindings': [
+        {'platform': 'discord', 'chat_id': 'channel', 'adapter_profile': 'otto', 'available': True}]}
+    calls = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def rpc(self, name, **params):
+            calls.append((name, params))
+            if name == 'cron.submit':
+                return {'session_id': 's', 'admission_id': 'a'}
+            return {'status': 'terminal', 'result': [True, 'doc', 'answer', None]}
+
+    monkeypatch.setattr(session_cron, 'owner_for_home', lambda home: None)
+    monkeypatch.setattr(gateway_client, 'connect_gateway', Client)
+    assert run_canonical_job(job) == (True, 'doc', 'answer', None)
+    assert calls[0][1]['expected_delivery_route_digest'] == delivery_route_digest(job)
+    assert 'adapter_profile' not in calls[0][1]

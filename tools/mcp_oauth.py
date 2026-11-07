@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
 from agent.memory_provider import spawn_context_thread
+from tools.mcp_oauth_callback import _read_paste_line, latch_callback_result
 from hermes_constants import secure_parent_dir
 from utils import atomic_json_write
 from tools.mcp_dashboard_oauth import contextvar_set as _contextvar_set, get_dashboard_oauth_flow
@@ -234,14 +235,6 @@ def _get_token_dir(hermes_home: str | Path | None = None) -> Path:
     return Path(hermes_home if hermes_home is not None else get_hermes_home()) / "mcp-tokens"
 
 
-def _find_free_port() -> int:
-    """Find an available TCP port on localhost (probe only — see ``_bind_reserved`` for the
-    reservation that actually closes the select→bind TOCTOU window)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _safe_filename(name: str) -> str:
     """Sanitize a server name for use as a filename (no path separators)."""
     return re.sub(r"[^\w\-]", "_", name).strip("_")[:128] or "default"
@@ -338,17 +331,6 @@ def _stdin_is_console() -> bool:
         return bool(ctypes.windll.kernel32.GetConsoleMode(ctypes.c_void_p(handle), ctypes.byref(mode)))
     except Exception:
         return False
-
-
-def _paste_callback_available() -> bool:
-    """Return True only when stdin itself can accept paste-back input.
-
-    ``_is_interactive()`` is also true for a forced GUI-driven flow (the user is present but NOT on
-    stdin). Starting a paste reader there consumes another surface's stdin and — on a non-TTY — turns
-    an immediate EOF into a lost flow. The paste channel needs a real console, nothing less."""
-    if not _oauth_interactive_enabled.get():
-        return False
-    return _stdin_is_console()
 
 
 def _is_interactive() -> bool:
@@ -668,6 +650,18 @@ class HermesTokenStorage:
         """True if we have tokens on disk (may be expired)."""
         return self._tokens_path().exists()
 
+    def credential_stamp(self) -> tuple:
+        """``stat()`` of the token and client files: what any re-authorization rewrites. No bytes read."""
+        stamp = []
+        for path in (self._tokens_path(), self._client_info_path()):
+            try:
+                st = path.stat()
+            except OSError:
+                stamp.append(None)
+            else:
+                stamp.append((st.st_mtime_ns, st.st_size, st.st_ino))
+        return tuple(stamp)
+
 
 # Callback capture: the HTTP listener and the stdin paste reader share one result dict.
 def _authorization_code_result(code: str, state: str | None, iss: str | None = None):
@@ -687,62 +681,19 @@ def _parse_redirect_query(query: str) -> dict[str, Any]:
     return {k: params.get(k, [None])[0] for k in ("code", "state", "error", "iss")}
 
 
-_CALLBACK_REQUEST_TIMEOUT_SECONDS = 0.5
-_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
-_PASTE_READER_POLL_INTERVAL_SECONDS = 0.05
-_PASTE_READER_JOIN_TIMEOUT_SECONDS = 1.0
-
-
-def _try_set_callback_result(
-    result: dict[str, Any],
-    *,
-    code: str | None = None,
-    state: str | None = None,
-    error: str | None = None,
-    iss: str | None = None,
-) -> bool:
-    """Atomically latch the FIRST terminal callback result; later writes are dropped.
-
-    With a threaded listener the browser's follow-up requests (``/favicon.ico``, a reload) hit the
-    same handler and used to blank the code the real redirect had just delivered. One-attempt
-    ownership means the first terminal answer wins and nothing can un-win it."""
-    if code is None and error is None:
-        return False
-
-    lock = result.get("_lock")
-    if lock is None:
-        if result.get("auth_code") is not None or result.get("error") is not None:
-            return False
-        result.update(auth_code=code, state=state, error=error, iss=iss)
-        return True
-
-    with lock:
-        if result.get("auth_code") is not None or result.get("error") is not None:
-            return False
-        result.update(auth_code=code, state=state, error=error, iss=iss)
-        return True
-
-def _callback_result_is_terminal(result: dict[str, Any]) -> bool:
-    lock = result.get("_lock")
-    if lock is None:
-        return result.get("auth_code") is not None or result.get("error") is not None
-    with lock:
-        return result.get("auth_code") is not None or result.get("error") is not None
-
 def _result_taken(result: dict) -> bool:
-    return _callback_result_is_terminal(result)
+    return result.get("auth_code") is not None or result.get("error") is not None
 
 
 def _make_callback_handler() -> tuple[type, dict]:
     """Fresh ``(HandlerClass, result_dict)`` per flow so concurrent flows don't stomp on each other."""
-    result: dict[str, Any] = {"auth_code": None, "state": None, "error": None, "iss": None,
-                              "_lock": threading.Lock()}
+    result: dict[str, Any] = {"auth_code": None, "state": None, "error": None, "iss": None}
 
     class _Handler(BaseHTTPRequestHandler):
         def setup(self) -> None:
-            # A handshake queued before the listener's post-listen option inherited reuse disabled.
+            # A queued handshake may predate the listener's post-listen reuse option.
             self.request.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.request.settimeout(_CALLBACK_REQUEST_TIMEOUT_SECONDS)
+            self.request.settimeout(0.5)
             super().setup()
 
         def do_GET(self) -> None:
@@ -752,8 +703,8 @@ def _make_callback_handler() -> tuple[type, dict]:
                 # Browsers follow the real /callback with queryless fetches (/favicon.ico); an unconditional
                 # update here wrote four Nones over the code before the 500 ms waiter poll saw it (#116278).
                 status, body = 404, "<h2>Not Found</h2>"
-            elif not _try_set_callback_result(result, code=parsed["code"], state=parsed["state"],
-                                             error=parsed["error"], iss=parsed["iss"]):
+            elif not latch_callback_result(result, auth_code=parsed["code"], state=parsed["state"],
+                                            error=parsed["error"], iss=parsed["iss"]):
                 # First terminal result (HTTP or paste) wins; a duplicate or refreshed callback never replaces it.
                 body = "<h2>Authorization already received</h2><p>You can close this tab and return to Hermes.</p>"
             else:
@@ -773,72 +724,6 @@ def _make_callback_handler() -> tuple[type, dict]:
     return _Handler, result
 
 
-def _read_windows_paste_line(stop_event: threading.Event) -> str | None:
-    """Poll a Windows console for one line without an uncancellable blocking read."""
-    try:
-        import msvcrt as _msvcrt
-    except ImportError:
-        return None
-    msvcrt_mod: Any = _msvcrt
-
-    chars: list[str] = []
-    while not stop_event.wait(_PASTE_READER_POLL_INTERVAL_SECONDS):
-        while msvcrt_mod.kbhit():
-            if stop_event.is_set():
-                return None
-            char = msvcrt_mod.getwch()
-            if char in {"\r", "\n"}:
-                return "".join(chars) + "\n"
-            if char == "\x03":
-                raise KeyboardInterrupt
-            if char == "\x1a":  # Ctrl-Z = EOF
-                return ""
-            if char in {"\x00", "\xe0"}:  # function/arrow key: drop the scan code too
-                if msvcrt_mod.kbhit():
-                    msvcrt_mod.getwch()
-                continue
-            if char == "\b":
-                if chars:
-                    chars.pop()
-                continue
-            chars.append(char)
-    return None
-
-def _read_paste_line(stop_event: threading.Event) -> str | None:
-    """Wait for one TTY line while staying responsive to cancellation.
-
-    A bare ``sys.stdin.readline()`` cannot be cancelled: after the HTTP listener wins, the reader
-    thread stays parked on stdin and swallows the NEXT flow's (or the CLI's) input."""
-    if os.name == "nt":
-        return _read_windows_paste_line(stop_event)
-
-    try:
-        import select
-
-        stdin_fd = sys.stdin.fileno()
-    except (AttributeError, OSError, TypeError, ValueError):
-        return None
-
-    line = bytearray()
-    while not stop_event.is_set():
-        try:
-            readable, _, _ = select.select([stdin_fd], [], [], _PASTE_READER_POLL_INTERVAL_SECONDS)
-        except (OSError, TypeError, ValueError):
-            return None
-        if stop_event.is_set():
-            return None
-        if readable:
-            try:
-                char = os.read(stdin_fd, 1)
-            except OSError:
-                return None
-            if not char:
-                return ""  # EOF
-            line.extend(char)
-            if char in {b"\r", b"\n"}:
-                return line.decode(getattr(sys.stdin, "encoding", None) or "utf-8", errors="replace")
-    return None
-
 def _paste_callback_reader(result: dict, stop_event: threading.Event | None = None) -> None:
     """Read one stdin line as an OAuth redirect (full URL, bare query, or a ``_SKIP_TOKENS`` word that
     exits without auth) into *result*. Parse failures, EOF and interrupts are swallowed — best-effort
@@ -851,7 +736,7 @@ def _paste_callback_reader(result: dict, stop_event: threading.Event | None = No
     if not line or _result_taken(result):
         return  # EOF / blank, or the HTTP listener already won
     if line.lower() in _SKIP_TOKENS:
-        if not _try_set_callback_result(result, error=_USER_SKIPPED_SENTINEL):
+        if not latch_callback_result(result, error=_USER_SKIPPED_SENTINEL):
             return
         print(
             "  OAuth skipped. Run `hermes mcp login <server>` later to authenticate, "
@@ -868,9 +753,9 @@ def _paste_callback_reader(result: dict, stop_event: threading.Event | None = No
     if not parsed["code"] and not parsed["error"]:
         print("  Pasted input did not contain ``code=`` or ``error=`` — ignoring.", file=sys.stderr)
         return
-    if not _try_set_callback_result(
-            result, code=parsed["code"], state=parsed["state"], error=parsed["error"], iss=parsed["iss"]):
-        return  # the HTTP listener latched first
+    if not latch_callback_result(result, auth_code=parsed["code"], state=parsed["state"],
+                                 error=parsed["error"], iss=parsed["iss"]):
+        return
     if parsed["code"]:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 
@@ -1032,22 +917,20 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
         # left the port bound and the retry on the same pinned/cached port died with EADDRINUSE (#113771).
         server_thread = spawn_context_thread(
             target=server.serve_forever, kwargs={"poll_interval": 0.1},
-            name=f"mcp-oauth-callback-{port}", daemon=True,
-        )
+            name=f"mcp-oauth-callback-{port}", daemon=True)
         server_thread.start()
-        paste_thread: threading.Thread | None = None
         paste_stop = threading.Event()
+        paste_thread = None
         # Paste fallback races the HTTP listener; whichever fills result first wins (no stdin reader
         # under a dashboard flow — the gateway's stdin is not the user's).
-        if _paste_callback_available() and dashboard_flow is None:
+        if _oauth_interactive_enabled.get() and _stdin_is_console() and dashboard_flow is None:
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` portion) and press Enter. "
                 "Type ``skip`` + Enter to continue without this server:",
                 file=sys.stderr, flush=True)
             paste_thread = spawn_context_thread(
                 target=_paste_callback_reader, args=(result, paste_stop),
-                name=f"mcp-oauth-paste-{port}", daemon=True,
-            )
+                name=f"mcp-oauth-paste-{port}", daemon=True)
             paste_thread.start()
         elapsed = 0.0
         try:
@@ -1057,25 +940,16 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
         finally:
             paste_stop.set()
             if paste_thread is not None:
-                paste_thread.join(timeout=_PASTE_READER_JOIN_TIMEOUT_SECONDS)
+                paste_thread.join(timeout=1.0)
                 if paste_thread.is_alive():
                     logger.warning("OAuth paste reader did not stop promptly")
             server.shutdown()
             server.server_close()
-            server_thread.join(timeout=_CALLBACK_SERVER_JOIN_TIMEOUT_SECONDS)
-            if server_thread.is_alive():
-                logger.warning("OAuth callback listener did not stop promptly")
+            server_thread.join(timeout=1.0)
         return _callback_outcome(result, cimd_url)
 
     return _wait
 
-
-async def _wait_for_callback():
-    """Await the per-flow waiter on the legacy module-level port.
-
-    Kept as the single-argument entry point for callers (and tests) that drive a flow through
-    ``_configure_callback_port``'s legacy ``_oauth_port`` rather than holding their own port."""
-    return await _make_callback_waiter(_oauth_port or 0)()
 
 # Legacy build_oauth_auth provider class, built lazily (SDK) and cached here.
 HermesOAuthClientProvider: Any = None

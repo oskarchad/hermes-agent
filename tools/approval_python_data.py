@@ -163,3 +163,30 @@ def is_safe_python_data_code(code_str: str) -> bool:
                 return False
             has_read_or_parse |= verdict
     return has_read_or_parse
+
+
+def python_c_payload(args: list[str]) -> tuple[bool, str | None]:
+    """Find Python's executable -c operand, respecting bundled option ownership."""
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in {"--", "-"} or not token.startswith("-"):
+            return False, None
+        if token.startswith("--"):
+            name, equals, _ = token.partition("=")
+            index += 2 if name == "--check-hash-based-pycs" and not equals else 1
+            continue
+        chars = token[1:]
+        for offset, flag in enumerate(chars):
+            remainder = chars[offset + 1:]
+            if flag in {"W", "X"}:
+                index += 1 if remainder else 2
+                break
+            if flag == "c":
+                payload = remainder or (args[index + 1] if index + 1 < len(args) else None)
+                return True, payload
+            if flag == "m":
+                return False, None
+        else:
+            index += 1
+    return False, None

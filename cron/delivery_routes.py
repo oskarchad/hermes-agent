@@ -48,6 +48,15 @@ def route_for(target, routes):
                  and route["chat_id"] == str(target["chat_id"])), None)
 
 
+def route_binding_error(job, target, route):
+    if "_cron_delivery_route_bindings" not in job:
+        return None
+    expected = route_for(target, job["_cron_delivery_route_bindings"])
+    if (expected["adapter_profile"] if expected else None) != (route["adapter_profile"] if route else None):
+        return "explicit cron delivery route changed since dispatch"
+    return None
+
+
 class ExplicitRouteAdapters:
     """Target-aware overlay on the existing own/satellite-to-primary adapter view."""
 
@@ -55,18 +64,6 @@ class ExplicitRouteAdapters:
         self.legacy = legacy
         self.profiles = profile_adapters
         self.allowed_profiles = allowed_profiles
-
-    def get(self, platform, target=None, default=None):
-        from cron.scheduler_preflight import SharedRouteAdapters
-        if target is None:
-            return default
-        route = route_for(target, configured_routes())
-        if route is not None:
-            return self.get_explicit(platform, route, default)
-        if isinstance(self.legacy, SharedRouteAdapters):
-            return self.legacy.get(platform, target, default)
-        return (self.legacy or {}).get(platform, default)
-
 
     def get_explicit(self, platform, route, default=None):
         """Resolve exactly the caller-validated route; never reread config or use legacy."""
@@ -80,28 +77,33 @@ class ExplicitRouteAdapters:
         return adapter
 
 
-def adapters_for_profile(profile_name, *, primary, profiles, default_profile="default",
-                         allowed_profiles):
-    from cron.scheduler_preflight import SharedRouteAdapters, _primary_profile_routes_for_current_home
-
-    if profile_name is None or profile_name == default_profile:
-        legacy = primary
-    else:
-        legacy = (profiles or {}).get(profile_name) or {}
-        if not legacy and primary:
-            legacy = SharedRouteAdapters(primary, _primary_profile_routes_for_current_home())
+def overlay_adapters(legacy, profiles, allowed_profiles):
+    """Keep upstream own-bot/satellite selection unchanged when no binding is configured."""
     try:
         routes = configured_routes()
     except (ValueError, TypeError):
-        routes = True  # keep invalid config behind the fail-closed target gate
-    if not routes:
-        return legacy
-    return ExplicitRouteAdapters(legacy, profiles or {}, allowed_profiles)
+        routes = True  # invalid configuration must reach the mandatory fail-closed check
+    return ExplicitRouteAdapters(legacy, profiles or {}, allowed_profiles) if routes else legacy
 
 
 def bind_delivery_routes(job):
     """Keep dispatch intent only in this attempt/queue payload, never in the job registry."""
     return {**job, "_cron_delivery_route_bindings": list(_PREFLIGHT.get())}
+
+
+def delivery_route_digest(job):
+    """A caller can constrain admission to its dispatch intent, never supply an adapter grant."""
+    import hashlib
+    import json
+    routes = [{key: record[key] for key in ("platform", "chat_id", "adapter_profile")}
+              for record in job.get("_cron_delivery_route_bindings", [])]
+    routes.sort(key=lambda route: (route["platform"], route["chat_id"]))
+    return hashlib.sha256(json.dumps(routes, sort_keys=True).encode()).hexdigest()
+
+
+def ensure_delivery_bindings(job):
+    if "_cron_delivery_route_bindings" not in job:
+        job.update(bind_delivery_routes(job))
 
 
 def preflight_snapshot(adapters):
@@ -136,12 +138,15 @@ def check_explicit_delivery(job):
     from cron.scheduler_delivery import _resolve_delivery_targets
     try:
         routes = configured_routes()
-        if not routes:
+        if not routes and not job.get("_cron_delivery_route_bindings"):
             return None, set()
         targets = _resolve_delivery_targets(job) + _resolve_delivery_targets(job, for_failure=True)
         covered, uncovered = set(), set()
         for target in targets:
             route = route_for(target, routes)
+            changed = route_binding_error(job, target, route)
+            if changed:
+                return changed, set()
             if route is None:
                 uncovered.add(target["platform"])
                 continue

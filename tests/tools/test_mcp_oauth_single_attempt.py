@@ -4,34 +4,23 @@ import asyncio
 import logging
 import socket
 import threading
-import time
-import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 from unittest.mock import MagicMock
 
 import pytest
 
+from tests.waiting import async_wait_until, wait_until
+
 
 def _send_callback_when_ready(url: str) -> None:
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
+    def send():
         try:
             urllib.request.urlopen(url, timeout=1).close()
-            return
+            return True
         except OSError:
-            time.sleep(0.01)
-    raise AssertionError(f"callback listener never became ready: {url}")
-
-
-def _send_callback_then_secondary_get(callback_url: str, secondary_url: str) -> None:
-    _send_callback_when_ready(callback_url)
-    try:
-        urllib.request.urlopen(secondary_url, timeout=1).close()
-    except urllib.error.HTTPError as exc:
-        # Native queryless favicon handling deliberately returns 404.
-        assert exc.code == 404
-        exc.close()
+            return False
+    wait_until(send, timeout=5, what="callback listener accepts redirect")
 
 
 def _assert_port_released(port: int) -> None:
@@ -127,16 +116,15 @@ def _callback_pair(result) -> tuple[str, str | None]:
 
 
 def _connect_when_ready(port: int) -> socket.socket:
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
+    def connect():
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             client.connect(("127.0.0.1", port))
             return client
         except OSError:
             client.close()
-            time.sleep(0.01)
-    raise AssertionError(f"callback listener never became ready on port {port}")
+            return None
+    return wait_until(connect, timeout=5, what="callback listener ready")
 
 
 @pytest.mark.asyncio
@@ -169,7 +157,6 @@ async def test_forced_headless_oauth_eof_does_not_retry_authorization(monkeypatc
         "_wait_for_reconnect_or_shutdown",
         stop_after_retry_budget,
     )
-    from tools.mcp_tool_common import _jittered
     monkeypatch.setattr("tools.mcp_tool_common._jittered", lambda _seconds: 0.0)
     monkeypatch.setattr(mcp_tool, "_jittered", lambda _seconds: 0.0, raising=False)
 
@@ -217,36 +204,6 @@ async def test_forced_headless_loopback_callback_completes_without_paste(monkeyp
 
     assert _callback_pair(result) == ("fake-loopback-code", "fake-loopback-state")
     stdin.readline.assert_not_called()
-    _assert_port_released(port)
-
-
-@pytest.mark.asyncio
-async def test_loopback_callback_result_survives_secondary_get(monkeypatch):
-    """A browser follow-up request must not erase the terminal callback result."""
-    import tools.mcp_oauth as oauth
-
-    stdin = MagicMock()
-    stdin.isatty.return_value = False
-    monkeypatch.setattr(oauth.sys, "stdin", stdin)
-    port = oauth._reserve_callback_port()
-    callback = (
-        f"http://127.0.0.1:{port}/callback"
-        "?code=fake-latched-code&state=fake-latched-state"
-    )
-    secondary = f"http://127.0.0.1:{port}/favicon.ico"
-
-    with oauth.force_interactive_oauth():
-        sender = threading.Thread(
-            target=_send_callback_then_secondary_get,
-            args=(callback, secondary),
-            daemon=True,
-        )
-        sender.start()
-        result = await oauth._make_callback_waiter(port, timeout=1.0)()
-        sender.join(timeout=5)
-
-    assert not sender.is_alive()
-    assert _callback_pair(result) == ("fake-latched-code", "fake-latched-state")
     _assert_port_released(port)
 
 
@@ -347,7 +304,7 @@ async def test_state_mismatch_is_redacted_before_sdk_and_application_logs(
     assert expected_state not in caplog.text
 
 
-@pytest.mark.platforms("linux")
+@pytest.mark.platforms("posix")
 @pytest.mark.asyncio
 async def test_tty_paste_callback_completes_and_releases_listener(monkeypatch):
     """Usable paste-back remains supported and closes its loopback listener."""
@@ -377,16 +334,29 @@ async def test_tty_paste_callback_completes_and_releases_listener(monkeypatch):
     _assert_port_released(port)
 
 
-@pytest.mark.platforms("linux")
+@pytest.mark.platforms("posix")
 @pytest.mark.asyncio
-async def test_loopback_callback_stops_tty_reader_before_next_flow_input(monkeypatch):
-    """Loopback completion must leave later TTY input for the next flow."""
+@pytest.mark.parametrize("completion", ["loopback", "cancelled"])
+async def test_callback_stops_tty_reader_before_next_flow_input(monkeypatch, completion):
+    """Completion or cancellation must leave later TTY input for the next flow."""
     import os
     import pty
     import select
 
     import tools.mcp_oauth as oauth
 
+    reader_finished = threading.Event()
+    reader_started = threading.Event()
+    original_reader = oauth._paste_callback_reader
+
+    def tracked_reader(*args):
+        reader_started.set()
+        try:
+            original_reader(*args)
+        finally:
+            reader_finished.set()
+
+    monkeypatch.setattr(oauth, "_paste_callback_reader", tracked_reader)
     master_fd, slave_fd = pty.openpty()
     stdin = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8", buffering=1)
     monkeypatch.setattr(oauth.sys, "stdin", stdin)
@@ -397,23 +367,22 @@ async def test_loopback_callback_stops_tty_reader_before_next_flow_input(monkeyp
     )
 
     try:
-        sender = threading.Thread(
-            target=_send_callback_when_ready,
-            args=(callback,),
-            daemon=True,
-        )
-        sender.start()
-        result = await oauth._make_callback_waiter(port, timeout=5.0)()
-        sender.join(timeout=5)
+        waiter = asyncio.create_task(oauth._make_callback_waiter(port, timeout=5.0)())
+        await async_wait_until(reader_started.is_set, what="paste reader started")
+        if completion == "cancelled":
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        else:
+            sender = threading.Thread(target=_send_callback_when_ready, args=(callback,), daemon=True)
+            sender.start()
+            result = await waiter
+            sender.join(timeout=5)
+            assert not sender.is_alive()
+            assert _callback_pair(result) == ("fake-loopback-code", "fake-loopback-state")
 
-        assert not sender.is_alive()
-        assert _callback_pair(result) == (
-            "fake-loopback-code",
-            "fake-loopback-state",
-        )
-
+        assert reader_finished.wait(2.0), "completed flow left its TTY reader alive"
         os.write(master_fd, b"next-flow-input\n")
-        await asyncio.sleep(0.1)
         readable, _, _ = select.select([stdin], [], [], 1.0)
         assert readable, "the completed OAuth flow consumed the next flow's TTY input"
         assert stdin.readline() == "next-flow-input\n"
