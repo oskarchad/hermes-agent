@@ -1288,23 +1288,21 @@ class SessionSchemaMixin:
                     self._ensure_fts_cjk_schema(cursor)
 
             if base_triggers_missing:
-                # The authority covers the whole first-publication sequence, not merely the final rebuild.
-                # ``executescript`` commits DDL statement-by-statement, so acquiring after ensure exposed a
-                # partially initialized FTS family while another opener held the rebuild lock.
+                # Own admission and the transaction before publishing any sync triggers.
                 self._run_admitted_startup_rebuild(cursor, ensure_and_rebuild)
             else:
                 self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", base_sql)
                 if self._fts_enabled:
                     # Trigram is optional; without it CJK search falls back to LIKE.
-                    trigram_enabled = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
-                    self._trigram_available = trigram_enabled
-                    if trigram_enabled and trigram_triggers_missing:
-                        self._run_admitted_startup_rebuild(
-                            cursor,
-                            lambda: self._rebuild_fts_indexes(
-                                cursor, legacy=legacy_fts, include_trigram=trigram_enabled,
-                            ),
-                        )
+                    def ensure_trigram_and_rebuild() -> None:
+                        self._trigram_available = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
+                        if self._trigram_available:
+                            self._rebuild_fts_indexes(cursor, legacy=legacy_fts, include_trigram=True)
+
+                    if trigram_triggers_missing:
+                        self._run_admitted_startup_rebuild(cursor, ensure_trigram_and_rebuild)
+                    else:
+                        self._trigram_available = self._ensure_fts_schema(cursor, "messages_fts_trigram", trigram_sql)
             if self._fts_enabled and not legacy_fts and not base_triggers_missing:
                 # CJK-bigram index: strictly additive, gated on the loadable tokenizer.
                 self._ensure_fts_cjk_schema(cursor)
@@ -1325,7 +1323,16 @@ class SessionSchemaMixin:
         """
         with fts_rebuild_admission(self.db_path) as admitted:
             if admitted:
-                rebuild_fn()
+                # Admission excludes other rebuilders; the savepoint also makes DDL +
+                # population atomic for ordinary writers and interrupted startup.
+                cursor.execute("SAVEPOINT fts_startup_rebuild")
+                try:
+                    rebuild_fn()
+                    cursor.execute("RELEASE SAVEPOINT fts_startup_rebuild")
+                except BaseException:
+                    cursor.execute("ROLLBACK TO SAVEPOINT fts_startup_rebuild")
+                    cursor.execute("RELEASE SAVEPOINT fts_startup_rebuild")
+                    raise
                 return
         logger.warning(
             "Deferred startup FTS rebuild: another process holds the "
