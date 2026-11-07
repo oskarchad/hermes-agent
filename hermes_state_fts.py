@@ -394,7 +394,7 @@ class SessionFtsSetupMixin:
             self._fts_cjk_available = False
             return
         try:
-            cursor.executescript(FTS_CJK_TABLE_SQL)
+            self._execute_ddl_script_transactional(cursor, FTS_CJK_TABLE_SQL)
             if not cjk_present:
                 # An old stale breadcrumb refers to a table that no longer exists.
                 cursor.execute("DELETE FROM state_meta WHERE key = ?", (FTS_CJK_STALE_KEY,))
@@ -414,7 +414,7 @@ class SessionFtsSetupMixin:
                 # Gap of unknown extent: do NOT reinstall triggers (see module comment).
                 self._fts_cjk_available = False
                 return
-            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            self._execute_ddl_script_transactional(cursor, FTS_CJK_TRIGGER_SQL)
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
             ).fetchone()
@@ -440,7 +440,7 @@ class SessionFtsSetupMixin:
             return False
         try:
             # Run even when the table exists: recreates triggers a no-FTS5 runtime dropped.
-            cursor.executescript(ddl)
+            self._execute_ddl_script_transactional(cursor, ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
