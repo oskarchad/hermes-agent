@@ -394,3 +394,25 @@ def test_python_true_shell_sequence_only_executes_first_operand(tmp_path):
 def test_python_subprocess_positional_shell_modifier_is_execution(tmp_path):
     command = "python3 - <<'PY'\nsubprocess.Popen(['hermes gateway restart'], -1, None, None, None, None, None, True, True)\nPY"
     assert guard(command, cwd=str(tmp_path)) is True
+
+
+@pytest.mark.parametrize("callee", ["run", "Popen", "call", "check_call", "check_output"])
+@pytest.mark.parametrize("modifier", ["executable='/bin/sh'", "cwd='/remote'", "*process_options"])
+def test_python_process_overrides_are_refused_before_argv_masking(callee, modifier, tmp_path):
+    call = f"subprocess.{callee}(['printf', '-c', 'hermes gateway stop'], {modifier})"
+    command = "python3 - <<'PY'\nimport subprocess\n" + call + "\nPY"
+    assert guard(command, cwd=str(tmp_path)) is True
+
+
+@pytest.mark.parametrize("modifiers", [
+    "-1, '/bin/sh'",
+    "-1, None, None, None, None, None, True, False, '/remote'",
+])
+def test_python_positional_process_overrides_cannot_change_inspected_owner(modifiers, tmp_path):
+    call = f"subprocess.Popen(['printf', '-c', 'hermes gateway stop'], {modifiers})"
+    assert guard("python3 - <<'PY'\n" + call + "\nPY", cwd=str(tmp_path)) is True
+
+
+def test_python_none_process_overrides_preserve_literal_data(tmp_path):
+    call = "subprocess.run(['printf', '%s', 'hermes gateway stop'], executable=None, cwd=None)"
+    assert guard("python3 - <<'PY'\n" + call + "\nPY", cwd=str(tmp_path)) is False

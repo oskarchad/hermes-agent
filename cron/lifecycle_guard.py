@@ -1159,8 +1159,14 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 # --- recursive walk ---------------------------------------------------------------------------
 
 def _python_subprocess_shell_mode(node: ast.Call) -> Optional[bool]:
-    """Only a known shell modifier can assign literal operands to data/source."""
-    if any(keyword.arg is None for keyword in node.keywords):
+    """Own shell mode only when no unsupported modifier changes executable/path resolution."""
+    if (any(keyword.arg is None for keyword in node.keywords)
+            or any(isinstance(argument, ast.Starred) for argument in node.args)):
+        return None
+    overrides = [kw.value for kw in node.keywords if kw.arg in {"executable", "cwd"}]
+    # Popen (and forwarded popenargs) uses positional slots 3 and 10 for these.
+    overrides.extend(node.args[index] for index in (2, 9) if len(node.args) > index)
+    if any(not (isinstance(value, ast.Constant) and value.value is None) for value in overrides):
         return None
     modifiers = [keyword.value for keyword in node.keywords if keyword.arg == "shell"]
     # run/call/check_* forward popenargs; Popen's shell is positional argument 9.
