@@ -1320,12 +1320,8 @@ def create_task(
 
     now = int(time.time())
 
-    # Only persistent kinds inherit the board ``default_workdir``: a scratch
-    # task inheriting it would point cleanup at the user's source tree.
-    if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
-        board_default = _board_meta_for(board).get("default_workdir")
-        if board_default:
-            workspace_path = str(board_default)
+    if workspace_path is None and project_repo is None:
+        workspace_path = _board_default_workspace(workspace_kind, board)
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -4364,6 +4360,7 @@ from hermes_cli.kanban_db_connect import (
     write_txn,
 )
 from hermes_cli.kanban_db_workspace import (
+    _board_default_workspace,
     _cleanup_workspace,
     _is_managed_scratch_path,
     _managed_scratch_path_info,
