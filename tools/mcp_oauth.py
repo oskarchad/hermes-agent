@@ -37,11 +37,13 @@ try:
     import msvcrt
 except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
+from agent.memory_provider import spawn_context_thread
+from tools.mcp_oauth_callback import _read_paste_line, latch_callback_result
 from hermes_constants import secure_parent_dir
 from utils import atomic_json_write
 from tools.mcp_dashboard_oauth import contextvar_set as _contextvar_set, get_dashboard_oauth_flow
@@ -688,6 +690,12 @@ def _make_callback_handler() -> tuple[type, dict]:
     result: dict[str, Any] = {"auth_code": None, "state": None, "error": None, "iss": None}
 
     class _Handler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            # A queued handshake may predate the listener's post-listen reuse option.
+            self.request.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.request.settimeout(0.5)
+            super().setup()
+
         def do_GET(self) -> None:
             parsed = _parse_redirect_query(urlparse(self.path).query)
             status = 200
@@ -695,11 +703,11 @@ def _make_callback_handler() -> tuple[type, dict]:
                 # Browsers follow the real /callback with queryless fetches (/favicon.ico); an unconditional
                 # update here wrote four Nones over the code before the 500 ms waiter poll saw it (#116278).
                 status, body = 404, "<h2>Not Found</h2>"
-            elif _result_taken(result):
+            elif not latch_callback_result(result, auth_code=parsed["code"], state=parsed["state"],
+                                            error=parsed["error"], iss=parsed["iss"]):
                 # First terminal result (HTTP or paste) wins; a duplicate or refreshed callback never replaces it.
                 body = "<h2>Authorization already received</h2><p>You can close this tab and return to Hermes.</p>"
             else:
-                result.update(auth_code=parsed["code"], state=parsed["state"], error=parsed["error"], iss=parsed["iss"])
                 body = ("<h2>Authorization Successful</h2><p>You can close this tab and return to Hermes.</p>" if parsed["code"]
                         else f"<h2>Authorization Failed</h2><p>Error: {html.escape(parsed['error'] or 'unknown')}</p>")
             self.send_response(status)
@@ -711,24 +719,25 @@ def _make_callback_handler() -> tuple[type, dict]:
             logger.debug("OAuth callback: %s %s", self.command, urlparse(self.path).path)  # never the query (carries the code)
 
         def log_message(self, fmt: str, *args: Any) -> None:
-            logger.debug("OAuth callback: %s", fmt % args)
+            logger.debug("OAuth callback HTTP request handled")
 
     return _Handler, result
 
 
-def _paste_callback_reader(result: dict) -> None:
+def _paste_callback_reader(result: dict, stop_event: threading.Event | None = None) -> None:
     """Read one stdin line as an OAuth redirect (full URL, bare query, or a ``_SKIP_TOKENS`` word that
     exits without auth) into *result*. Parse failures, EOF and interrupts are swallowed — best-effort
     fallback racing the HTTP listener, which stays primary."""
     try:
-        line = sys.stdin.readline()
+        line = sys.stdin.readline() if stop_event is None else _read_paste_line(stop_event)
     except (KeyboardInterrupt, OSError, ValueError):
         return
     line = (line or "").strip()
     if not line or _result_taken(result):
         return  # EOF / blank, or the HTTP listener already won
     if line.lower() in _SKIP_TOKENS:
-        result["error"] = _USER_SKIPPED_SENTINEL
+        if not latch_callback_result(result, error=_USER_SKIPPED_SENTINEL):
+            return
         print(
             "  OAuth skipped. Run `hermes mcp login <server>` later to authenticate, "
             "or set ``enabled: false`` on that server in config.yaml to disable persistently.",
@@ -744,9 +753,9 @@ def _paste_callback_reader(result: dict) -> None:
     if not parsed["code"] and not parsed["error"]:
         print("  Pasted input did not contain ``code=`` or ``error=`` — ignoring.", file=sys.stderr)
         return
-    if _result_taken(result):  # one more race-check before writing
+    if not latch_callback_result(result, auth_code=parsed["code"], state=parsed["state"],
+                                 error=parsed["error"], iss=parsed["iss"]):
         return
-    result.update(auth_code=parsed["code"], state=parsed["state"], error=parsed["error"], iss=parsed["iss"])
     if parsed["code"]:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 
@@ -824,12 +833,16 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None, redirect_
     return _redirect_handler
 
 
-def _start_callback_server(port: int, handler_cls: type) -> HTTPServer:
+def _start_callback_server(port: int, handler_cls: type) -> ThreadingHTTPServer:
     """Bind the callback listener on *port*, adopting a parked reserved socket (closes the select→bind
-    TOCTOU window). ``allow_reuse_address`` is set BEFORE binding (a no-op afterwards) so a lingering
-    TIME_WAIT socket from a previous flow cannot block the next."""
+    TOCTOU window). Parked sockets remain exclusive through ``listen``; then apply the address-reuse
+    option normally set by ``server_bind`` so accepted TCP connections do not block the next flow
+    while in TIME_WAIT.
+
+    Threading: one stalled or slow client must not make the redirect that actually carries the code
+    wait behind it, nor hold the port past the flow's timeout."""
     try:
-        server = HTTPServer(("127.0.0.1", port), handler_cls, bind_and_activate=False)
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_cls, bind_and_activate=False)
         reserved = _reserved_sockets.pop(port, None)
         if reserved is not None:
             server.socket.close()
@@ -838,6 +851,8 @@ def _start_callback_server(port: int, handler_cls: type) -> HTTPServer:
             server.allow_reuse_address = True
             server.server_bind()
         server.server_activate()
+        if reserved is not None:
+            server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     except OSError as exc:  # genuinely in use (concurrent flow / leftover listener / colliding redirect_port): say so, not "timed out"
         raise OAuthNonInteractiveError(
             f"OAuth callback port {port} is already in use ({exc}). Close any other in-progress login, "
@@ -900,23 +915,37 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
         # select() keeps the listening socket alive past server_close() (the kernel holds the file for
         # the duration of the poll), so a cancelled flow — e.g. the handshake timeout firing mid-login —
         # left the port bound and the retry on the same pinned/cached port died with EADDRINUSE (#113771).
-        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25}, daemon=True).start()
+        server_thread = spawn_context_thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.1},
+            name=f"mcp-oauth-callback-{port}", daemon=True)
+        server_thread.start()
+        paste_stop = threading.Event()
+        paste_thread = None
         # Paste fallback races the HTTP listener; whichever fills result first wins (no stdin reader
         # under a dashboard flow — the gateway's stdin is not the user's).
-        if _is_interactive() and dashboard_flow is None:
+        if _oauth_interactive_enabled.get() and _stdin_is_console() and dashboard_flow is None:
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` portion) and press Enter. "
                 "Type ``skip`` + Enter to continue without this server:",
                 file=sys.stderr, flush=True)
-            threading.Thread(target=_paste_callback_reader, args=(result,), daemon=True).start()
+            paste_thread = spawn_context_thread(
+                target=_paste_callback_reader, args=(result, paste_stop),
+                name=f"mcp-oauth-paste-{port}", daemon=True)
+            paste_thread.start()
         elapsed = 0.0
         try:
             while elapsed < timeout and not _result_taken(result):
                 await asyncio.sleep(0.5)
                 elapsed += 0.5
         finally:
-            server.shutdown()  # returns once the serve loop exits (≤ poll_interval) — the port is free after close
+            paste_stop.set()
+            if paste_thread is not None:
+                paste_thread.join(timeout=1.0)
+                if paste_thread.is_alive():
+                    logger.warning("OAuth paste reader did not stop promptly")
+            server.shutdown()
             server.server_close()
+            server_thread.join(timeout=1.0)
         return _callback_outcome(result, cimd_url)
 
     return _wait

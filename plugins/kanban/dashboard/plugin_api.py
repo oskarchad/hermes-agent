@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterator, Optional
 from fastapi import (
     APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_workflow
@@ -411,7 +411,16 @@ def get_task(
 
 # --- POST /tasks ------------------------------------------------------------
 
-class CreateTaskBody(BaseModel):
+class _TaskMutationBody(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_legacy_toolset_writes(cls, data):
+        if isinstance(data, dict) and {'enabled_toolsets', 'clear_enabled_toolsets'} & data.keys():
+            raise ValueError("Legacy task toolset caps are read-only; this operation cannot change them")
+        return data
+
+
+class CreateTaskBody(_TaskMutationBody):
     title: str
     body: Optional[str] = None
     assignee: Optional[str] = None
@@ -530,7 +539,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 # --- PATCH /tasks/:id  and  POST /tasks/bulk ---------------------------------
 
-class UpdateTaskBody(BaseModel):
+class UpdateTaskBody(_TaskMutationBody):
     status: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
@@ -551,7 +560,7 @@ class UpdateTaskBody(BaseModel):
     clear_reasoning_effort: bool = False
 
 
-class BulkTaskBody(BaseModel):
+class BulkTaskBody(_TaskMutationBody):
     ids: list[str]
     status: Optional[str] = None
     assignee: Optional[str] = None  # "" or None = unassign

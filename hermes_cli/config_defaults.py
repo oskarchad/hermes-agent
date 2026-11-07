@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the existing configuration registry must declare the two retained fork settings; splitting its data for three lines would duplicate ownership.
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
@@ -1674,6 +1675,8 @@ DEFAULT_CONFIG = {
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
         "deny": [],
+        # Executable selectors distinguish operations from quoted argument data.
+        "deny_commands": [],
         # /reload-mcp confirms before rebuilding the MCP tool set (it invalidates the prompt cache,
         # so the next message re-sends full input). "Always Approve" → false.
         "mcp_reload_confirm": True,
@@ -1781,6 +1784,7 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        "delivery_routes": [],
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
         # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs

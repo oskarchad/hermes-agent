@@ -497,7 +497,8 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip(),
+                kanban_operation={"kanban_request_review": "request-review", "kanban_complete": "complete"}[tool_name])
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)

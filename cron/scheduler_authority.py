@@ -63,6 +63,9 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         request_id = job['execution_id'] = uuid.uuid4().hex
     params = {'job_id': job['id'], 'request_id': request_id,
               'extra_prompt': extra_prompt}
+    if "_cron_delivery_route_bindings" in job:
+        from cron.delivery_routes import delivery_route_digest
+        params["expected_delivery_route_digest"] = delivery_route_digest(job)
     root = get_hermes_home() / 'cron' / 'admissions'
     journal = journal_path(params['job_id'], params['request_id'])
     record = {'params': params, 'receipt': None}

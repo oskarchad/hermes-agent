@@ -101,6 +101,15 @@ def _actor(authority, actor):
     return SessionActor(CRON_PRINCIPAL_ID, authority.profile_id, actor.capabilities, actor.transport_id)
 
 
+def _valid_cron_params(params):
+    required = {'job_id', 'request_id', 'extra_prompt'}
+    if set(params) not in (required, required | {'expected_delivery_route_digest'}):
+        return False
+    digest = params.get('expected_delivery_route_digest')
+    return digest is None or (isinstance(digest, str) and len(digest) == 64
+                              and all(c in '0123456789abcdef' for c in digest))
+
+
 def _create(authority, actor, params):
     from cron.jobs import get_job
     from gateway.session_local_recovery import local_identity, restore_local_session
@@ -111,7 +120,7 @@ def _create(authority, actor, params):
     from gateway.session import SessionSource, SessionEntry
     from gateway.session_lifecycle import _now
 
-    if set(params) != {'job_id', 'request_id', 'extra_prompt'}:
+    if not _valid_cron_params(params):
         raise RuntimeStoreError('invalid_params')
     jid, request_id, extra = params['job_id'], params['request_id'], params['extra_prompt']
     if (not isinstance(jid, str) or not jid or not isinstance(request_id, str)
@@ -129,6 +138,14 @@ def _create(authority, actor, params):
     job = get_job(jid)
     if job is None or job.get('no_agent'):
         raise RuntimeStoreError('not_found')
+    from cron.delivery_routes import bind_delivery_routes, delivery_preflight_scope
+    from gateway.run_cron_delivery import owner_delivery_adapters
+    with delivery_preflight_scope(owner_delivery_adapters(authority.runner)):
+        job = bind_delivery_routes(job)
+    from cron.delivery_routes import delivery_route_digest
+    expected = params.get('expected_delivery_route_digest')
+    if expected is not None and expected != delivery_route_digest(job):
+        raise RuntimeStoreError('explicit cron delivery route changed since dispatch')
     config = _load_gateway_config()
     private = {}
     launch = {'source': 'cli', 'request_id': request_id, 'toolsets': []}
@@ -155,7 +172,7 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
 # Run-side verdicts run_job stamps on the job dict for the firing scheduler's bookkeeping tail
 # (cron/quota_hold.py parks past a closed usage window; cron/unreachable_retry.py re-runs a
 # never-reached model). They cross the authority boundary inside the cron result.
-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds')
+RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_cron_delivery_route_bindings')
 
 
 async def operation(authority, name, params, actor=None):
@@ -167,7 +184,7 @@ async def operation(authority, name, params, actor=None):
     # (CronExecutionUnknown pauses the job) on every restart that overlaps a cron run.
     if name == 'recover':
         from gateway.session_local_recovery import local_identity
-        if (set(params) != {'job_id', 'request_id', 'extra_prompt'}
+        if (not _valid_cron_params(params)
                 or any(not isinstance(params[k], str) or not params[k] for k in ('job_id', 'request_id'))
                 or (params['extra_prompt'] is not None and not isinstance(params['extra_prompt'], str))):
             raise RuntimeStoreError('invalid_params')
@@ -268,7 +285,13 @@ def _run_identified(run_job, job, execution_id, **kwargs):
     from cron.executions import get_execution
     token = enter_cron_execution(job, execution_id, get_execution(execution_id) or {})
     try:
-        return run_job(job, execution_id=execution_id, **kwargs)
+        from cron.delivery_routes import delivery_preflight_scope
+        from gateway.run_cron_delivery import owner_delivery_adapters
+        # Authority execution runs on another thread/process context; derive evidence
+        # from its admitted live registry, never from caller-supplied RPC fields.
+        authority = current_execution()[0]
+        with delivery_preflight_scope(owner_delivery_adapters(authority.runner)):
+            return run_job(job, execution_id=execution_id, **kwargs)
     finally:
         exit_cron_execution(token)
 

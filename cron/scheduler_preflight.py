@@ -253,6 +253,10 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     only if the gateway config loads AND reports it unconnected; config load failures fail OPEN.
     ``failure_deliver`` gets the same rules — a typo'd failure platform would otherwise only
     surface when a failure occurs (NS-788)."""
+    from cron.delivery_routes import check_explicit_delivery
+    route_error, covered = check_explicit_delivery(job)
+    if route_error:
+        return route_error
     deliver_value = _delivery._normalize_deliver_value(job.get("deliver", "local"))
     failure_deliver_value = _delivery._normalize_deliver_value(
         _delivery._delivery_lane_value(job, for_failure=True))
@@ -270,7 +274,9 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 continue
             if _delivery.parse_room_deliver_token(part) is not None:
                 continue  # Group Chat posts write the room store directly; no adapter needed.
-            platform_parts.append(part.split(":", 1)[0].strip())
+            platform_name = part.split(":", 1)[0].strip()
+            if platform_name.lower() not in covered:
+                platform_parts.append(platform_name)
     if not platform_parts:
         return None
 

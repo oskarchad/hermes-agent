@@ -8,6 +8,8 @@ read it there to retry a 503 or treat a ``ThrottlingException`` as a rate limit.
 
 from __future__ import annotations
 
+import re
+
 from typing import Any
 
 
@@ -52,3 +54,10 @@ def _is_statusless_structured_provider_error(exc: Exception) -> bool:
     if isinstance(err, str):
         return bool(err.strip())
     return isinstance(err, dict) and any(err.get(k) for k in ("type", "code", "message"))
+
+
+def _is_proxy_wrapped_limit(exc: Exception) -> bool:
+    """Some proxies mask explicit upstream throttling as a generic 5xx."""
+    status = _exc_http_status(exc)
+    return (isinstance(status, int) and 500 <= status < 600
+            and re.search(r"\[429\]|\brate_limit_error\b", str(exc).lower()) is not None)

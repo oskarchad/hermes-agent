@@ -14,6 +14,8 @@ import shlex
 import tempfile
 import unicodedata
 
+from tools.approval_python_data import is_safe_python_data_code, python_c_payload
+
 logger = logging.getLogger("tools.approval")
 
 # Sensitive write targets, matched via ~ / $HOME / $HERMES_HOME spellings. The resolved absolute
@@ -1242,7 +1244,14 @@ def _execution_flag_findings(command: str):
             if not tokens:
                 continue
             args = tokens[1:]
-            if family and _interpreter_exec_flag(family, args):
+            if family == "python":
+                c_found, code_payload = python_c_payload(args)
+                if c_found:
+                    if not code_payload or not is_safe_python_data_code(code_payload):
+                        yield ("script execution via -e/-c flag", None)
+                elif any(token.startswith("<<") for token in args):
+                    yield ("script execution via heredoc", None)
+            elif family and _interpreter_exec_flag(family, args):
                 yield ("script execution via -e/-c flag", None)
             elif family and any(token.startswith("<<") for token in args):
                 yield ("script execution via heredoc", None)

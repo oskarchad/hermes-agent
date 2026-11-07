@@ -34,7 +34,8 @@ from agent.error_classifier import (
     is_reasoning_required_rejection,
 )
 from agent.auxiliary_error_shapes import (
-    _botocore_error, _exc_http_status, _is_invalid_aux_response_error, _is_statusless_structured_provider_error,
+    _botocore_error, _exc_http_status, _is_invalid_aux_response_error, _is_proxy_wrapped_limit,
+    _is_statusless_structured_provider_error,
 )
 from agent.auxiliary_managed_local import _is_managed_local_endpoint
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
@@ -3197,10 +3198,11 @@ _PAYMENT_KEYWORDS = _BILLING_PATTERNS + (
 
 
 def _is_payment_error(exc: Exception) -> bool:
-    """Payment/credit/quota exhaustion: HTTP 402, or a billing/quota body on 403/404/429/no-status."""
+    """Payment/quota exhaustion: 402 or billing bodies, including proxy-wrapped limits."""
     status = getattr(exc, "status_code", None)
     return status == 402 or (
-        status in {403, 404, 429, None} and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
+        (status in {403, 404, 429, None} or _is_proxy_wrapped_limit(exc))
+        and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
     )
 
 
@@ -3231,11 +3233,10 @@ def _is_overloaded_error(exc: Exception) -> bool:
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
-    """429 rate limit (not billing/quota, which _is_payment_error owns).
-
-    OpenAI's RateLimitError may omit .status_code — matched by class name. A generic 429 without
-    billing keywords counts as a rate limit.
-    """
+    """429 or proxy-wrapped throttling; wrapped billing belongs to _is_payment_error.
+    OpenAI RateLimitError may omit status_code, so its class name also matches."""
+    if _is_proxy_wrapped_limit(exc):
+        return not _is_payment_error(exc)
     # (PR #8023 pattern)
     if type(exc).__name__ == "RateLimitError" or _botocore_error(exc)[1] == "ThrottlingException":
         return True
@@ -7295,7 +7296,7 @@ def _resolve_call_client(
             effective_provider, client, final_model = resolve_vision_provider_client(
                 provider="auto", model=resolved_model, async_mode=async_mode,
                 main_runtime=main_runtime)
-        if client is not None:
+        if client is not None and resolved_provider != "auto":
             resolved_provider = effective_provider or resolved_provider
     else:
         client, final_model = _get_cached_client(
@@ -7817,6 +7818,7 @@ def _aux_recovery_ladder(
     resolved_base_url: Optional[str], resolved_api_key: Optional[str],
     resolved_api_mode: Optional[str], final_model: Optional[str], max_tokens: Optional[int],
     main_runtime: Optional[dict[str, Any]], route_info: Optional[dict[str, str]],
+    request_provider: Optional[str] = None,
 ):
     """Ordered recovery rungs after the primary request failed (generator): parameter
     strips → Nous heal/refresh → credential refresh/pool rotation → provider fallback.
@@ -7835,19 +7837,17 @@ def _aux_recovery_ladder(
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
     if first_err is None:
         return resp
-    resp, first_err = yield from _ladder_credential_rungs(first_err, route, kwargs, client_is_nous)
+    # Vision recovers the concrete credential pool while fallback retains the auto policy.
+    credential_route = route._replace(resolved_provider=request_provider) if task == "vision" and request_provider else route
+    resp, first_err = yield from _ladder_credential_rungs(first_err, credential_route, kwargs, client_is_nous)
     if first_err is None:
         return resp
     resp = yield from _ladder_provider_fallback(first_err, route)
     if resp is not None:
         return resp
-    # Connection/timeout errors poison the cached client (closed transport, half-read
-    # stream); evict so the next aux call rebuilds a fresh one.
     # Reached only when no fallback answered, so the next auxiliary call rebuilds a fresh
     # client instead of reusing the dead one. ``first_err`` is the narrowed error from the
     # rungs above, not necessarily the original one. See issue #23432.
-    # Mirror the sync path: drop poisoned clients on connection/timeout so the next aux call rebuilds. See
-    # issue #23432.
     if _is_connection_error(first_err):
         try:
             _evict_cached_client_instance(client)
@@ -8034,7 +8034,7 @@ def _start_recovery_ladder(
         resolved_model=req.resolved_model, resolved_base_url=req.resolved_base_url,
         resolved_api_key=req.resolved_api_key, resolved_api_mode=req.resolved_api_mode,
         final_model=req.final_model, max_tokens=retry_kwargs["max_tokens"],
-        main_runtime=retry_kwargs["main_runtime"], route_info=route_info)
+        main_runtime=retry_kwargs["main_runtime"], route_info=route_info, request_provider=req.request_provider)
 
 
 def _call_llm_impl(

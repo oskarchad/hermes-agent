@@ -156,6 +156,13 @@ DEFAULT_EXCLUDES = [
     "Thumbs.db",
     # Logs
     "*.log",
+    # Mutable databases have their own backup lifecycle; never ingest them into Git.
+    "*.db",
+    "*.db-wal",
+    "*.db-shm",
+    "*.db-journal",
+    "*.sqlite",
+    "*.sqlite3",
     # Hermes browser profiles (CDP / agent-browser user-data dirs): locked SQLite files and
     # hundreds of MB of cache that are never project state.
     "chrome_cdp_profile/",

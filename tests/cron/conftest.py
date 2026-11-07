@@ -102,6 +102,7 @@ def owner_execution_runner():
         ref = SessionRef("test-profile", "cron-" + identity)
         db.create_session(ref.session_id, source="cron")
         authority = SimpleNamespace(
+            runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False), _profile_adapters={}),
             db=db, sessions={ref.session_id: SimpleNamespace(
                 source=SimpleNamespace(user_id="cron-owner"))}, pending_results={})
         request_id = execution_id or identity

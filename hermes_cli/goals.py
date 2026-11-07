@@ -900,6 +900,7 @@ def judge_goal(
     background_processes: Optional[list[dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    kanban_operation: Optional[str] = None,
 ) -> tuple[str, str, bool, Optional[dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -942,8 +943,13 @@ def judge_goal(
     else:
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
 
+    system_prompt = JUDGE_SYSTEM_PROMPT
+    if kanban_operation is not None:
+        from hermes_cli.kanban_goal_contract import handoff_judge_instructions
+
+        system_prompt += handoff_judge_instructions(kanban_operation)
     try:
-        raw = _call_goal_judge_llm(call_llm, JUDGE_SYSTEM_PROMPT, prompt, timeout)
+        raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
         # re-authenticate, not to context-length / model debugging (#42177). Still fails open.

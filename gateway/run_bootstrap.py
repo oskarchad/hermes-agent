@@ -418,6 +418,8 @@ def _start_gateway_start_cron_and_housekeeping(runner):
         # default's. Absent (no multiplexed adapters), delivery for a secondary profile falls
         # back to the primary's routed adapters or fails closed — the job still FIRES.
         cron_start_kwargs["profile_adapters"] = getattr(runner, "_profile_adapters", None)
+        from gateway.run_cron_delivery import allowed_delivery_profiles
+        cron_start_kwargs["delivery_allowed_profiles"] = lambda: allowed_delivery_profiles(runner)
         # A secondary bot that dropped is still that profile's own: never borrow meanwhile.
         cron_start_kwargs["profile_bot_platforms"] = getattr(runner, "_profile_bot_platforms", None)
         # runner.adapters belongs to the LAUNCH profile (``default``, or the ``--profile``

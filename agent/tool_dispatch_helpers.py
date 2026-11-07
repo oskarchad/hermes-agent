@@ -26,6 +26,10 @@ from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
 
+
+class _ToolDispatchCancelledResult(str):
+    """Preflight stopped before backend dispatch; the result publisher still owns its hook."""
+
 # Interactive / user-facing tools never run concurrently: any of these in a batch is a barrier.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections", "manage_catalog", "setup_beat", "set_theme"})
 
