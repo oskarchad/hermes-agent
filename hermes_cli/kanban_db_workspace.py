@@ -712,6 +712,28 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
     return target, branch_name
 
 
+def _board_default_workspace(workspace_kind: str, board: Optional[str]) -> Optional[str]:
+    """Create-time path for an unanchored task (no path, no project repo).
+
+    Only persistent kinds inherit the board ``default_workdir``: a scratch task
+    inheriting it would point cleanup at the user's source tree. A worktree with
+    no default can never spawn (see ``_resolve_worktree_workspace``), so it is
+    refused here instead of failing ``spawn_failed`` until the dispatcher gives up.
+    """
+    if workspace_kind not in {"dir", "worktree"}:
+        return None
+    board_default = _kb._board_meta_for(board).get("default_workdir")
+    if board_default:
+        return str(board_default)
+    if workspace_kind == "worktree":
+        raise ValueError(
+            "workspace_kind=worktree needs a workspace_path, a project, or a board "
+            "default_workdir. Set a board default workdir (a git repo) or create the "
+            "task with --workspace worktree:<absolute-repo-path>."
+        )
+    return None
+
+
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
