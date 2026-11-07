@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterator, Optional
 from fastapi import (
     APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_workflow
@@ -411,7 +411,16 @@ def get_task(
 
 # --- POST /tasks ------------------------------------------------------------
 
-class CreateTaskBody(BaseModel):
+class _TaskMutationBody(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_legacy_toolset_writes(cls, data):
+        if isinstance(data, dict) and {'enabled_toolsets', 'clear_enabled_toolsets'} & data.keys():
+            raise ValueError("Legacy task toolset caps are read-only; this operation cannot change them")
+        return data
+
+
+class CreateTaskBody(_TaskMutationBody):
     title: str
     body: Optional[str] = None
     assignee: Optional[str] = None
@@ -530,7 +539,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 # --- PATCH /tasks/:id  and  POST /tasks/bulk ---------------------------------
 
-class UpdateTaskBody(BaseModel):
+class UpdateTaskBody(_TaskMutationBody):
     status: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
@@ -551,7 +560,7 @@ class UpdateTaskBody(BaseModel):
     clear_reasoning_effort: bool = False
 
 
-class BulkTaskBody(BaseModel):
+class BulkTaskBody(_TaskMutationBody):
     ids: list[str]
     status: Optional[str] = None
     assignee: Optional[str] = None  # "" or None = unassign
@@ -739,27 +748,7 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
     return [{"id": r["id"], "title": r["title"], "status": r["status"]} for r in rows]
 
 
-class ResumeTaskBody(BaseModel):
-    actor: str = Field(min_length=1, max_length=200)
-    reason: str = Field(min_length=1, max_length=2000)
-
-
-@router.post("/tasks/{task_id}/resume")
-def resume_task(task_id: str, payload: ResumeTaskBody, board: Optional[str] = _BOARD_Q):
-    """Explicit operator continuation, protected by the dashboard's HTTP auth."""
-    if not payload.actor.strip() or not payload.reason.strip():
-        raise HTTPException(status_code=400, detail="actor and reason must be non-blank")
-    with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
-        if not _set_status_direct(conn, task_id, "ready", resume=payload):
-            raise _conflict("Resume requires an unclaimed ready/done task with satisfied parents")
-        return {"task": _task_dict(_require_task(conn, task_id))}
-
-
-def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str, *,
-    resume: Optional[ResumeTaskBody] = None,
-) -> bool:
+def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
@@ -771,10 +760,6 @@ def _set_status_direct(
             (task_id,)).fetchone()
         if prev is None:
             return False
-        if resume is not None:
-            if (prev["status"] not in {"ready", "done"} or prev["current_run_id"] is not None
-                    or prev["claim_lock"] is not None or prev["worker_pid"] is not None):
-                return False
         if prev["status"] == "running" and new_status == "ready":
             resume_status = kanban_db._retry_status_for_run(conn, task_id, prev["current_run_id"])
             if resume_status == "review":
@@ -803,17 +788,6 @@ def _set_status_direct(
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
-        if resume is not None:
-            # This endpoint, unlike an edit or automatic promotion, records an
-            # explicit continuation. Check the real consumer before committing:
-            # same-second PR ambiguity and all non-PR guards still fail closed.
-            kanban_db._append_event(conn, task_id, "promoted_manual", {
-                "actor": resume.actor.strip(), "reason": resume.reason.strip(),
-                "forced": False, "source": "dashboard_resume", "source_status": prev["status"],
-            })
-            guard = kbd.check_respawn_guard(conn, task_id)
-            if guard is not None:
-                raise _conflict(f"Resume refused: {guard}")
         if reopening_satisfied_parent:
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
             # back worker terminations to perform post-commit.

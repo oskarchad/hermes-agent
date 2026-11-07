@@ -83,6 +83,12 @@ def _cron_preflight_enabled(cfg: dict) -> bool:
     return not isinstance(cron_cfg, dict) or cron_cfg.get("preflight", True) is not False
 
 
+def cron_default_provider(cfg: dict) -> str:
+    """``cron.model_provider``: the provider every cron job without its own pin resolves through."""
+    cron = cfg.get("cron") if isinstance(cfg, dict) else None
+    return str(cron.get("model_provider") or "").strip() if isinstance(cron, dict) else ""
+
+
 def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     """READ-ONLY probe: would provider resolution fail for lack of a key? Mirrors run_job's
     requested-provider computation. Skipped when the job has a fallback chain — auth-fallback may
@@ -94,9 +100,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     except Exception:
         return None  # fail-open: never block on a preflight-internal error
 
-    _cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
-    requested = (
-        job.get("provider") or str((_cron_cfg or {}).get("model_provider") or "").strip() or None)
+    requested = job.get("provider") or cron_default_provider(cfg) or None
     model = job.get("model") or cron_env_setting("HERMES_MODEL") or ""
 
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
@@ -233,33 +237,14 @@ class SharedRouteAdapters:
         return default
 
 
-def _blocked_config_result(job_id, job_name, reason, *, mandatory=False):
-    """Shared persisted alert-once result for both optional preflight and mandatory route checks."""
-    logger.warning(
-        "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
-        job_name, job_id, reason)
-    already_alerted = False
-    try:
-        from cron.jobs import mark_preflight_alerted
-        already_alerted = mark_preflight_alerted(job_id)
-    except Exception:
-        logger.debug("Job '%s': could not persist preflight alert marker", job_id, exc_info=True)
-    marker = BLOCKED_CONFIG_SILENT_MARKER if already_alerted else BLOCKED_CONFIG_MARKER
-    blocked_doc = (
-        f"# Cron Job: {job_name}\n\n"
-        f"**Job ID:** {job_id}\n"
-        f"**Run Time:** {_sched._hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"**Status:** BLOCKED (configuration)\n\n"
-        "Pre-dispatch validation found a configuration problem and "
-        "the agent was NOT run (no tokens spent).\n\n"
-        f"**Reason:** {reason}\n\n"
-        "The job will stay blocked (without re-alerting) until the "
-        "configuration is fixed; the next healthy run clears this "
-        "state."
-        + (" This route safety check cannot be disabled by cron.preflight." if mandatory else
-           " Set `cron.preflight: false` in config.yaml to disable this validation.")
-    )
-    return False, blocked_doc, "", f"{marker} {reason}"
+def has_credential_platform(adapters, owned=None) -> bool:
+    """True when the profile has a bot of its own. Any local session (Desktop chat, CLI run, Kanban
+    worker) adds a ``LOCAL`` adapter, which holds no platform credential: a profile with only that is
+    still a credentialless satellite that may ride routed primary adapters. ``owned`` is the
+    profile's ``_profile_bot_platforms`` entry: a bot that dropped leaves the live map while it
+    disconnects and reconnects, and borrowing the primary meanwhile would send through the wrong bot."""
+    return bool(owned) or any(
+        getattr(platform, "value", platform) != "local" for platform in adapters or ())
 
 
 def _preflight_check_delivery(job: dict) -> Optional[str]:
@@ -287,10 +272,11 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
             if _delivery.parse_bot_chat_deliver_token(part) is not None:
                 continue
-            p = part.split(":", 1)[0].strip()
-            if p.lower() in covered:
-                continue
-            platform_parts.append(p)
+            if _delivery.parse_room_deliver_token(part) is not None:
+                continue  # Group Chat posts write the room store directly; no adapter needed.
+            platform_name = part.split(":", 1)[0].strip()
+            if platform_name.lower() not in covered:
+                platform_parts.append(platform_name)
     if not platform_parts:
         return None
 

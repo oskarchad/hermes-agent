@@ -438,12 +438,14 @@ class InProcessCronScheduler(CronScheduler):
     def start(
         self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None,
         profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
+        profile_bot_platforms=None, delivery_allowed_profiles=None,
     ):
         from cron.scheduler import CronTickYielded
         from cron.scheduler import tick as cron_tick
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
         from hermes_constants import get_process_hermes_home
+        from cron.dispatch_hold import note_dispatching, note_held
 
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
 
@@ -458,6 +460,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event, profile_homes=profile_homes, adapters=adapters, loop=loop,
                 interval=interval, can_dispatch=can_dispatch, profile_adapters=profile_adapters,
                 default_profile=default_profile, profile_gate=profile_gate,
+                profile_bot_platforms=profile_bot_platforms, delivery_allowed_profiles=delivery_allowed_profiles,
             )
             return
 
@@ -489,7 +492,9 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                    note_held()
                 else:
+                    note_dispatching()
                     cron_tick(
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
@@ -534,6 +539,7 @@ class InProcessCronScheduler(CronScheduler):
     def _start_multiplex(
         self, stop_event, *, profile_homes, adapters=None, loop=None, interval=60,
         can_dispatch=None, profile_adapters=None, default_profile=None, profile_gate=None,
+        profile_bot_platforms=None, delivery_allowed_profiles=None,
     ):
         """Tick every profile's store, each scoped via ``_profile_cron_scope``. ``profile_gate(name,
         home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
@@ -541,10 +547,11 @@ class InProcessCronScheduler(CronScheduler):
         from cron.scheduler import tick as cron_tick
         from cron.scheduler import CronTickYielded, _is_fd_exhaustion
         from cron.scheduler_preflight import (
-            SharedRouteAdapters, _primary_profile_routes_for_current_home,
+            SharedRouteAdapters, _primary_profile_routes_for_current_home, has_credential_platform,
         )
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
+        from cron.dispatch_hold import note_dispatching, note_held_profiles
 
         initial_homes = _existing_profile_homes(profile_homes)
         register_ticked_homes([_profile_entry(entry)[1] for entry in initial_homes])
@@ -555,17 +562,30 @@ class InProcessCronScheduler(CronScheduler):
             " (re-enumerated every cycle)" if callable(profile_homes) else "",
         )
 
+        def legacy_adapters_for(profile_name):
+            # Deliver via the profile's OWN adapters; NEVER fall back to the default profile's
+            # (wrong bot). A credentialless satellite may ride the PRIMARY adapter only for targets
+            # an exact enabled route maps here; else fail closed (delivery skipped this tick).
+            if profile_name is None or profile_name == default_profile:
+                return adapters
+            tick_adapters = (profile_adapters or {}).get(profile_name) or {}
+            owned = (profile_bot_platforms or {}).get(profile_name)
+            if not has_credential_platform(tick_adapters, owned) and adapters:
+                return SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
+            return tick_adapters
+
         def tick_adapters_for(profile_name):
-            from cron.delivery_routes import adapters_for_profile
+            from cron.delivery_routes import overlay_adapters
 
             def allowed_profiles():
+                if delivery_allowed_profiles is not None:
+                    return delivery_allowed_profiles()
                 return {name for name, home in (
                     _profile_entry(e) for e in _existing_profile_homes(profile_homes))
                     if profile_gate is None or profile_gate(name, home)}
 
-            return adapters_for_profile(
-                profile_name, primary=adapters, profiles=profile_adapters,
-                default_profile=default_profile, allowed_profiles=allowed_profiles)
+            return overlay_adapters(legacy_adapters_for(profile_name), profile_adapters,
+                                    allowed_profiles)
 
         # Recovery + heartbeat per profile; one broken store must not abort startup for the others.
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
@@ -616,10 +636,12 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                    note_held_profiles(cycle_homes)
                 else:
                     for _pname, home in cycle_homes:
                         try:
                             with _profile_cron_scope(home):
+                                note_dispatching()
                                 cron_tick(
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,

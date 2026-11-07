@@ -119,7 +119,7 @@ A worker that is blocked on `t_parent` and creates a support card for the missin
 
 **Use Kanban when** work crosses agent boundaries, needs to survive restarts, might need human input, might be picked up by a different role, or needs to be discoverable after the fact.
 
-They coexist: a kanban worker may call `delegate_task` internally during its run.
+They also coexist inside one run. A kanban task executes in an isolated managed worker under the profile's gateway, and its `delegate_task` children are reserved by that gateway under the worker's execution: each child gets its own session (listed as a subagent of the card's session), counts against `delegation.max_concurrent_children` and `delegation.max_spawn_depth`, returns its result inside the card's turn, and ends with the worker. If the gateway goes down mid-child, the child is retired, never resumed. Work that must outlive the gateway, or needs its own reviewer, still belongs in child cards (`kanban_create` with `parents`).
 
 ## Core concepts
 
@@ -516,7 +516,7 @@ The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `
 
 Three reasons:
 
-1. **Backend portability.** Workers whose terminal tool points at a remote backend (Docker / Modal / Singularity / SSH) would run `hermes kanban complete` *inside* the container, where `hermes` isn't installed and `~/.hermes/kanban.db` isn't mounted. The kanban tools run in the agent's own Python process and always reach `~/.hermes/kanban.db` regardless of terminal backend.
+1. **Backend portability.** Workers whose terminal tool points at a remote backend (Docker / Modal / SSH / a plugin sandbox) would run `hermes kanban complete` *inside* the container, where `hermes` isn't installed and `~/.hermes/kanban.db` isn't mounted. The kanban tools run in the agent's own Python process and always reach `~/.hermes/kanban.db` regardless of terminal backend.
 2. **No shell-quoting fragility.** Passing `--metadata '{"files": [...]}'` through shlex + argparse is a latent footgun. Structured tool args skip it entirely.
 3. **Better errors.** Tool results are structured JSON the model can reason about, not stderr strings it has to parse.
 
@@ -797,36 +797,6 @@ hermes dashboard        # "Kanban" tab appears in the nav, after "Skills"
 
 Visually the target is the familiar Linear / Fusion layout: dark theme, column headers with counts, coloured status dots, pill chips for priority and tenant. The plugin reads only theme CSS vars (`--color-*`, `--radius`, `--font-mono`, ...), so it reskins automatically with whichever dashboard theme is active.
 
-### Explicit continuation after a PR checkpoint
-
-For an unclaimed `ready` task (or an intentional `done` reopen), an authenticated
-operator/Captain can call the plugin backend:
-
-```http
-POST /api/plugins/kanban/tasks/{task_id}/resume?board=default
-Content-Type: application/json
-
-{"actor":"otto","reason":"Continue the approved brief on the existing branch and PR"}
-```
-
-Use the dashboard's normal authenticated session. `actor` is a required audit
-label, not a credential or a role override; `reason` must also be non-blank.
-The operation records `promoted_manual` with `source=dashboard_resume`, keeps
-PR comments and run history, and authorizes at most one subsequent claim under
-the existing dispatcher guard. It does not start a worker itself or change the
-assignee. Ordinary edits, comments, and automatic promotion do not grant this
-continuation. Existing review/unblock/specify operations remain unchanged.
-
-The status change and continuation event commit together. Unsatisfied parents,
-an existing claim/run/PID, prior-worker teardown, auth failures and rate-limit
-cooldown still prevent resume. Reopening `done` invalidates dependent tasks
-through the existing lifecycle, with worker termination only after commit.
-A `409` response commits no continuation; when a PR comment and the request
-share a timestamp second, wait until a later second before an explicit retry
-(the guard cannot establish ordering across those tables). Other `409` reasons
-require resolving the reported gate, not automatic retries. Unknown tasks or
-boards return `404`; invalid request fields return `400`/`422`.
-
 ### Auto vs Manual orchestration
 
 The kanban board has two ways to handle a task you drop into the Triage column:
@@ -956,7 +926,7 @@ Tasks in `~/.hermes/kanban.db` are profile-agnostic on purpose (that's the coord
 
 ### Extending it
 
-The plugin uses the standard Hermes dashboard plugin contract — see [Extending the Dashboard](./extending-the-dashboard) for the full manifest reference, shell slots, page-scoped slots, and the Plugin SDK. Extra columns, custom card chrome, tenant-filtered layouts, or full `tab.override` replacements are all expressible without forking this plugin.
+The plugin uses the standard Hermes dashboard plugin contract — see [Extending the Dashboard](./extending-the-dashboard) for the full manifest reference, shell slots, page-scoped slots, and the Plugin SDK. Extra columns, tenant-filtered layouts, or full `tab.override` replacements are all expressible without forking this plugin. The dashboard has no per-card slot; on the desktop board, plugins add per-card labels through the `KANBAN_CARD_AREAS.badges` contribution area (see [Desktop Plugin SDK](../../developer-guide/desktop-plugin-sdk.md#kanban-card-badges)).
 
 To disable without removing: add `dashboard.plugins.kanban.enabled: false` to `config.yaml` (or delete `plugins/kanban/dashboard/manifest.json`).
 
@@ -1370,6 +1340,31 @@ in the board DB. No relays, credential sharing, or extra dispatchers are
 needed — each profile gateway simply delivers through its own adapters.
 
 ## Runs — one row per attempt
+
+Canonical workers execute through the assigned profile's gateway owner. The local
+transport carries the dispatcher's exact board database path, including custom
+paths and shared boards assigned to another profile; it does not create a separate
+transcript writer. The owner validates the task/run/claim and freezes its policy.
+
+If the owner or managed worker disappears with an **unknown** admission while the
+interpreter the owner bound to the attempt (its `worker_bound` event) may still be
+running, the card keeps its run and claim: expired claims, stale heartbeats and
+runtime limits do not reexecute that ambiguous attempt, and an unavailable owner
+ledger also pauses reclaim. Once that bound interpreter is itself dead, nothing can
+still be running the attempt, so the crash sweep reclaims it like any dead worker:
+the run closes as crashed and the card returns to `ready` (or `review`) under the
+normal crash budget, which can re-execute effects the lost attempt already had.
+A run that never bound an interpreter is released the same way once its owner has
+settled the admission (a lost card attempt's admission settles `interrupted`):
+when every worker pid recorded for the run is dead, or, with none recorded, once
+its claim has expired, the run closes as crashed (reclaimed if its claim had already
+lapsed) and the card returns to `ready`
+under the same crash budget. Resolving an unknown admission explicitly
+(`prompt.resolve_unknown` with its admission ID and execution generation) settles
+it the same way, so it can lead to another attempt. To avoid that, inspect the
+effects and complete or block the card first; unblock a blocked card only when a
+new attempt is intended. Confirmed timeouts and provider rate-limit results retain their ordinary
+retry/failure-accounting behavior.
 
 A task is a logical unit of work; a **run** is one attempt to execute it. When the dispatcher claims a ready task it creates a row in `task_runs` and points `tasks.current_run_id` at it. When that attempt ends — completed, blocked, crashed, timed out, spawn-failed, reclaimed — the run row closes with an `outcome` and the task's pointer clears. A task that's been attempted three times has three `task_runs` rows.
 
