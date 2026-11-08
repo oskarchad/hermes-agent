@@ -44,6 +44,10 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # or missing grant), not a transient API failure. Persist only the status
         # code + endpoint, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
+        if (denied and denied[1] == "403"
+                and re.fullmatch(r"repos/[^/]+/[^/]+/rules/branches/[^?]+(?:\?.*)?", endpoint)
+                and "Upgrade to GitHub Pro or make this repository public" in (exc.stderr or "")):
+            raise _GatePlanUnavailable("Rules API is unavailable on this repository plan") from None
         if denied:
             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
@@ -53,6 +57,10 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
+
+
+class _GatePlanUnavailable(RuntimeError):
+    """Known Rules API plan restriction, not a credential failure."""
 
 
 class _GateAuthError(RuntimeError):
@@ -104,6 +112,67 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
         raise _GateAuthError(f"assignee profile {assignee!r} cannot be resolved") from None
 
 
+def _configured_checks(repo: str, branch: str) -> set[tuple[str, int]]:
+    """Shared Kanban-root policy, independent of the completing profile or its snapshot."""
+    from ruamel.yaml.error import YAMLError
+
+    from hermes_cli.config_backend import ConfigBackendUnavailable, read_config_doc
+    from hermes_cli.config_effective import _effective
+    from hermes_cli.kanban_db import kanban_home
+
+    try:
+        try:
+            raw = read_config_doc(kanban_home() / "config.yaml")
+        except FileNotFoundError:
+            raw = None
+        # A normal config read may cache a malformed root as {} or return the worker's
+        # frozen profile snapshot. Neither can erase shared acceptance requirements.
+        if raw is not None and not isinstance(raw, dict):
+            raise ValueError("PR acceptance configuration must be a mapping")
+        config = _effective(raw if raw is not None else {})
+    except (OSError, ValueError, YAMLError, ConfigBackendUnavailable):
+        raise ValueError("PR acceptance configuration is unavailable") from None
+    kanban = config.get("kanban", {})
+    if not isinstance(kanban, dict):
+        raise ValueError("Invalid kanban configuration")
+    policies = kanban.get("required_pr_checks", {})
+    if not isinstance(policies, dict) or not isinstance(policies.get(repo, {}), dict):
+        raise ValueError("Invalid required_pr_checks repository policy")
+    checks = policies.get(repo, {}).get(branch, [])
+    if not isinstance(checks, list):
+        raise ValueError("Invalid required_pr_checks branch policy")
+    required = set()
+    for check in checks:
+        if (not isinstance(check, dict) or not isinstance(check.get("context"), str)
+                or not check["context"].strip() or type(check.get("app_id")) is not int
+                or check["app_id"] <= 0):
+            raise ValueError("Each configured PR check needs a context and positive app_id")
+        required.add((check["context"], check["app_id"]))
+    return required
+
+
+def _required_checks(pr: dict, repo: str, branch: str, profile_home: str | None,
+                     receipt: dict) -> set[tuple[str, int | None]]:
+    protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
+    required = {(r["context"], (r.get("app") or {}).get("databaseId"))
+                for r in protection.get("requiredStatusChecks", [])}
+    try:
+        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                     paginate=True, profile_home=profile_home)
+        receipt["rules_api"] = "available"
+    except _GatePlanUnavailable:
+        rules = []
+        receipt["rules_api"] = "plan_unavailable"
+    for page in rules:
+        for rule in page:
+            if rule["type"] == "required_status_checks":
+                required.update((r["context"], r.get("integration_id"))
+                                for r in rule["parameters"]["required_status_checks"])
+    policy = _configured_checks(repo, branch)
+    receipt["policy_required"] = [{"context": c, "app_id": a} for c, a in sorted(policy)]
+    return required | policy
+
+
 def collect_acceptance(contract: str, published_pr: str | None,
                        assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
@@ -131,18 +200,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
         receipt["head_sha"] = sha
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
-        protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
-        required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
-        for page in rules:
-            for rule in page:
-                if rule["type"] == "required_status_checks":
-                    required.update((r["context"], r.get("integration_id"))
-                                    for r in rule["parameters"]["required_status_checks"])
+        required = _required_checks(pr, repo, branch, profile_home, receipt)
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            receipt["detail"] = "No repository-required checks or explicit kanban.required_pr_checks policy cover this repository and base branch."
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
