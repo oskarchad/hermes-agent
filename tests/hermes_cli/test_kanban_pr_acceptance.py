@@ -75,6 +75,7 @@ def github(tmp_path, monkeypatch):
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
     kb.init_db()
     try:
         yield state
@@ -302,3 +303,70 @@ def test_broken_explicit_policy_cannot_fall_back_to_success(github):
     receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
     assert receipt["classification"] == "infra"
     assert receipt["ok"] is False
+
+
+@pytest.mark.platforms("linux")
+def test_shared_board_policy_does_not_follow_completing_profile(github, tmp_path, monkeypatch):
+    from pathlib import Path
+    from hermes_cli.config import atomic_config_write
+
+    owner = Path(os.environ["HERMES_KANBAN_HOME"])
+    config = owner / "config.yaml"
+    atomic_config_write(config, {"kanban": {"required_pr_checks": {
+        "acme/repo": {"main": [{"context": "owner-required", "app_id": 1}]}}}})
+    callers = [owner, tmp_path / "other-profile"]
+    callers[1].mkdir()
+    atomic_config_write(callers[1] / "config.yaml", {"kanban": {"required_pr_checks": {}}})
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Shared policy", completion_contract="acme/repo")
+        for caller in callers:
+            monkeypatch.setenv("HERMES_HOME", str(caller))
+            assert not kb.complete_task(conn, tid, result="done",
+                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            assert kb.get_task(conn, tid).status != "done"
+            receipt = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' ORDER BY rowid DESC",
+                (tid,)).fetchone()[0])
+            assert receipt["policy_required"] == [{"context": "owner-required", "app_id": 1}]
+        # Updating the shared policy is visible from the other profile immediately.
+        atomic_config_write(config, {"kanban": {"required_pr_checks": {
+            "acme/repo": {"main": [{"context": "required", "app_id": 1}]}}}})
+        assert kb.complete_task(conn, tid, result="done",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("root", ["broken", "[]", "false", "42"])
+def test_malformed_policy_root_blocks_even_after_effective_cache_read(github, root):
+    from pathlib import Path
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    path = Path(os.environ["HERMES_KANBAN_HOME"]) / "config.yaml"
+    path.write_text(root, encoding="utf-8")
+    # General config consumers normalize invalid roots and cache the empty mapping.
+    assert load_user_config_effective(path, fail_closed=True) == {}
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "infra"
+    assert receipt["ok"] is False
+
+
+@pytest.mark.platforms("linux")
+def test_frozen_worker_config_cannot_replace_shared_pr_policy(github):
+    import subprocess
+    from pathlib import Path
+    from hermes_cli.config import atomic_config_write
+
+    atomic_config_write(Path(os.environ["HERMES_KANBAN_HOME"]) / "config.yaml",
+        {"kanban": {"required_pr_checks": {"acme/repo": {
+            "main": [{"context": "owner-required", "app_id": 1}]}}}})
+    # A fresh real worker binds before imports; its weaker snapshot must not govern completion.
+    code = """from agent.safe_worker_policy import _bind_worker_config
+_bind_worker_config({"kanban": {"required_pr_checks": {}}})
+from hermes_cli.kanban_pr_acceptance import collect_acceptance
+r = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+assert not r["ok"] and r["classification"] == "missing", r
+assert r["policy_required"] == [{"context": "owner-required", "app_id": 1}], r
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr

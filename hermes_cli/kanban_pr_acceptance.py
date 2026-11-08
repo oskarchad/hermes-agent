@@ -113,14 +113,23 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
 
 
 def _configured_checks(repo: str, branch: str) -> set[tuple[str, int]]:
-    """Explicit owner-profile policy, additive to GitHub rules and pinned to an app."""
+    """Shared Kanban-root policy, independent of the completing profile or its snapshot."""
     from ruamel.yaml.error import YAMLError
 
-    from hermes_cli.config_backend import ConfigBackendUnavailable
-    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli.config_backend import ConfigBackendUnavailable, read_config_doc
+    from hermes_cli.config_effective import _effective
+    from hermes_cli.kanban_db import kanban_home
 
     try:
-        config = load_user_config_effective(fail_closed=True)
+        try:
+            raw = read_config_doc(kanban_home() / "config.yaml")
+        except FileNotFoundError:
+            raw = None
+        # A normal config read may cache a malformed root as {} or return the worker's
+        # frozen profile snapshot. Neither can erase shared acceptance requirements.
+        if raw is not None and not isinstance(raw, dict):
+            raise ValueError("PR acceptance configuration must be a mapping")
+        config = _effective(raw if raw is not None else {})
     except (OSError, ValueError, YAMLError, ConfigBackendUnavailable):
         raise ValueError("PR acceptance configuration is unavailable") from None
     kanban = config.get("kanban", {})

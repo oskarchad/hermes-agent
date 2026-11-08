@@ -1871,7 +1871,7 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
-        # Additional app-pinned PR checks by repository and base branch. Also supplies explicit
+        # Shared Kanban-root config: additional app-pinned PR checks by repo/base. Supplies explicit
         # requirements when GitHub Rules API is unavailable on the repository plan; never inferred
         # from currently visible runs. Example: {"owner/repo": {"main": [{"context": "Quality gate", "app_id": 15368}]}}.
         "required_pr_checks": {},
