@@ -22,13 +22,19 @@ def github(tmp_path, monkeypatch):
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": state.get("required", [
+                        {"context": "required", "app": {"databaseId": 1}}])}}}}}}
             elif "/rules/branches/" in self.path:
+                if state.get("rules_error"):
+                    code, message = state["rules_error"]
+                    self.send_response(code)
+                    self.end_headers()
+                    self.wfile.write(message.encode())
+                    return
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
-                       "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+                       "app": {"id": state.get("app_id", 1)}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
@@ -60,9 +66,12 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n"
+                  " print(f'gh: {e.read().decode()} (HTTP {e.code})', file=sys.stderr)\n"
+                  " sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -230,3 +239,66 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("fault, expected", [
+    ("none", "success"), ("no_plan_error", "success"), ("pending", "pending"),
+    ("failure", "failure"), ("missing", "missing"), ("stale", "stale"),
+    ("head_change", "stale"), ("wrong_app", "missing"), ("auth403", "auth"),
+    ("auth401", "auth"), ("no_policy", "missing"), ("wrong_repo", "missing"),
+    ("wrong_branch", "missing"), ("repository_extra", "missing"),
+    ("bad_policy", "infra"), ("skipped", "infra"),
+])
+def test_explicit_pr_policy_survives_plan_limits_without_weakening_evidence(github, fault, expected):
+    from pathlib import Path
+    from hermes_cli.config import atomic_config_write
+
+    policy = {"acme/repo": {"main": [{"context": "required", "app_id": 1}]}}
+    github.update(required=[], rules_error=(403, "Upgrade to GitHub Pro or make this repository public"))
+    if fault == "no_plan_error":
+        github.pop("rules_error")
+    elif fault in {"pending", "failure", "skipped"}:
+        github["conclusion"] = fault
+    elif fault in {"missing", "stale", "head_change"}:
+        github[fault] = True
+    elif fault == "wrong_app":
+        github["app_id"] = 2
+    elif fault.startswith("auth"):
+        github["rules_error"] = (int(fault[4:]), "Resource not accessible by integration")
+    elif fault == "no_policy":
+        policy = {}
+    elif fault == "wrong_repo":
+        policy = {"other/repo": policy["acme/repo"]}
+    elif fault == "wrong_branch":
+        policy = {"acme/repo": {"release": policy["acme/repo"]["main"]}}
+    elif fault == "repository_extra":
+        github["required"] = [{"context": "repository-required", "app": {"databaseId": 1}}]
+    elif fault == "bad_policy":
+        policy["acme/repo"]["main"][0]["app_id"] = "untrusted"
+    atomic_config_write(Path(os.environ["HERMES_HOME"]) / "config.yaml",
+                        {"kanban": {"required_pr_checks": policy}})
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Explicit PR policy", completion_contract="acme/repo")
+        ok = kb.complete_task(conn, tid, result="done",
+                             metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["classification"] == expected
+        assert ok is (expected == "success")
+        assert (kb.get_task(conn, tid).status == "done") is ok
+        if fault == "none":
+            assert receipt["rules_api"] == "plan_unavailable"
+            assert receipt["policy_required"] == [{"context": "required", "app_id": 1}]
+
+
+@pytest.mark.platforms("linux")
+def test_broken_explicit_policy_cannot_fall_back_to_success(github):
+    from pathlib import Path
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    # Native required check is green, but an unreadable owner policy must still block.
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text("kanban: [broken: [", encoding="utf-8")
+    receipt = collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "infra"
+    assert receipt["ok"] is False
