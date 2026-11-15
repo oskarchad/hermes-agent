@@ -206,6 +206,9 @@ def reconcile_pending(*, allow_connect=True):
                     journal.unlink(missing_ok=True)
                     continue
                 error = 'Cron admission missing: the owner never admitted this fire'
+                if row is not None and row.get('error'):
+                    # Keep the cause the firer recorded when it gave up (e.g. a refused submit).
+                    error = f"{error}; firer recorded: {row['error']}"
                 state = {'status': 'terminal', 'job': current,
                          'result': [False, f'# Cron Job: {params["job_id"]} (FAILED)\n\n{error}\n', '', error]}
             if state['status'] != 'terminal':

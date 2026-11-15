@@ -383,6 +383,9 @@ class CronRunParams(Params):
     job_id: str
     request_id: str
     extra_prompt: str | None
+    # SHA-256 of the firer's bound delivery routes (``cron.delivery_routes.delivery_route_digest``);
+    # the owner refuses the admission when its own binding differs.
+    expected_delivery_route_digest: str | None = None
 
 
 class CronSubmitResult(Result):
