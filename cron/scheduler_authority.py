@@ -207,8 +207,12 @@ def reconcile_pending(*, allow_connect=True):
                     continue
                 error = 'Cron admission missing: the owner never admitted this fire'
                 if row is not None and row.get('error'):
-                    # Keep the cause the firer recorded when it gave up (e.g. a refused submit).
-                    error = f"{error}; firer recorded: {row['error']}"
+                    # Keep the cause the firer recorded when it gave up (e.g. a refused submit),
+                    # minus its per-fire journal path so one recurring failure stays one incident.
+                    cause = row['error']
+                    if cause.startswith('Cron execution unverified; reconcile '):
+                        cause = cause.partition('.json: ')[2] or cause
+                    error = f"{error}; firer recorded: {cause}"
                 state = {'status': 'terminal', 'job': current,
                          'result': [False, f'# Cron Job: {params["job_id"]} (FAILED)\n\n{error}\n', '', error]}
             if state['status'] != 'terminal':

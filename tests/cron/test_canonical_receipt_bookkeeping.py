@@ -84,6 +84,8 @@ def test_missing_admission_keeps_the_cause_the_firer_recorded(tmp_path, monkeypa
         row = executions.get_execution(execution['id'])
         assert row['status'] == 'failed'
         assert 'invalid_params' in row['error']
+        # The per-fire journal path would split one recurring failure into a new incident per fire.
+        assert journal.stem not in row['error']
         assert 'invalid_params' in jobs.get_job(job['id'])['last_error']
         assert not journal.exists()
 
