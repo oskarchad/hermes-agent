@@ -16452,6 +16452,18 @@
               }
             ],
             "title": "Extra Prompt"
+          },
+          "expected_delivery_route_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expected Delivery Route Digest"
           }
         },
         "required": [

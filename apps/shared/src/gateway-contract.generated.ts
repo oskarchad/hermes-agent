@@ -4954,6 +4954,7 @@ export interface CronRunParams {
   job_id: string
   request_id: string
   extra_prompt: string | null
+  expected_delivery_route_digest?: string | null
 }
 export interface CronSubmitResult {
   session_id: string

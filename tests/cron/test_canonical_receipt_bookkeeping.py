@@ -63,6 +63,33 @@ def test_definite_refusal_is_booked_and_journal_retired(tmp_path, monkeypatch):
         assert not scheduler_authority.journal_path(job['id'], execution['id']).exists()
 
 
+def test_missing_admission_keeps_the_cause_the_firer_recorded(tmp_path, monkeypatch):
+    """A restart-safe worker whose submit was refused gives the fire up (``unknown``) with the
+    refusal as its reason and exits; the owner's later ``missing`` verdict must book the run
+    failed WITH that reason, not replace it with a bare 'never admitted'."""
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        execution = executions.create_execution(job['id'], source='test')
+        executions.mark_execution_running(execution['id'])
+        params = {'job_id': job['id'], 'request_id': execution['id'], 'extra_prompt': None}
+        journal = scheduler_authority.journal_path(job['id'], execution['id'])
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text(json.dumps({'params': params, 'receipt': None}))
+        cause = f'Cron execution unverified; reconcile {journal}: invalid_params'
+        assert executions.give_up_execution(execution['id'], reason=cause)
+        with executions._transaction() as conn:
+            conn.execute('UPDATE executions SET process_id=?,pid=? WHERE id=?', ('old-owner', 999999, execution['id']))
+        peer(monkeypatch, lambda method, params: {'status': 'missing', 'result': None})
+        scheduler_authority.reconcile_pending()
+        row = executions.get_execution(execution['id'])
+        assert row['status'] == 'failed'
+        assert 'invalid_params' in row['error']
+        # The per-fire journal path would split one recurring failure into a new incident per fire.
+        assert journal.stem not in row['error']
+        assert 'invalid_params' in jobs.get_job(job['id'])['last_error']
+        assert not journal.exists()
+
+
 def test_in_process_firer_keeps_its_row_journal_and_output(tmp_path, monkeypatch):
     """The in-gateway ticker fires on pool threads: a tick must not act for a firer still in flight
     in THIS process (770b5924a61's "never this process" fence), nor redo its side effects."""
