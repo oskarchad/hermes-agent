@@ -191,6 +191,33 @@ def _cron_referenced_skills() -> set[str]:
         return set()
 
 
+def _kanban_referenced_skills() -> set[str]:
+    """Skill names required by this profile's open (not done/archived) Kanban cards on any live
+    board: the dispatcher force-loads them when it spawns the card's worker, so they are in use
+    exactly like a cron job's. ``category:name`` / ``category/name`` refs also protect ``name``.
+    Best-effort: an unreadable board yields an empty set, never a crash; a missing DB is not created."""
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_boards import list_boards
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli.profiles import current_profile_name
+        profile = current_profile_name()
+        if not profile:
+            return set()
+        refs: set[str] = set()
+        for db_path in {Path(b["db_path"]) for b in list_boards(include_archived=False)}:
+            if not db_path.exists():
+                continue
+            with connect_closing(db_path) as conn:
+                for task in kb.list_tasks(conn, assignee=profile):
+                    if task.status != "done":
+                        refs.update(task.skills or ())
+        return refs | {re.split(r"[:/]", r)[-1] for r in refs}
+    except Exception as e:
+        logger.debug("Curator could not read Kanban skill references: %s", e, exc_info=True)
+        return set()
+
+
 def _archive_as_curator(_u, name: str) -> bool:
     """Archive via skill_usage with the ledger actor tagged 'curator', so the ledger entry reads as an autonomous transition, not a foreground call."""
     try:
@@ -216,8 +243,9 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> dict[str, int
     stale_cutoff = now - timedelta(days=get_stale_after_days())
     archive_cutoff = now - timedelta(days=get_archive_after_days())
     # Cron-referenced skills are in use by definition (usage only bumps when a
-    # job fires, so paused/rare jobs would age them out). Treat as pinned.
-    protected = _cron_referenced_skills()
+    # job fires, so paused/rare jobs would age them out). Treat as pinned; the
+    # same holds for skills this profile's open Kanban cards force-load.
+    protected = _cron_referenced_skills() | _kanban_referenced_skills()
     counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
 
     def _set(name: str, state: str, key: str) -> None:
