@@ -3254,6 +3254,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
                               python=python_path, home=hermes_home)
     stop_mark = installation_command(project_root, module="gateway.systemd_stop_mark",
                                 python=python_path, home=hermes_home)
+    # OOMPolicy=continue: agent turns and their foreground commands share this cgroup, so the
+    # default (stop) lets one OOM-killed render take down every platform, Kanban and cron.
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
@@ -3275,6 +3277,7 @@ SuccessExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
 KillMode=mixed
 KillSignal=SIGTERM
+OOMPolicy=continue
 ExecReload=/bin/kill -USR1 $MAINPID
 ExecStop=-{_systemd_command(stop_mark)}
 ExecStopPost=-{_systemd_command(cleanup)}
